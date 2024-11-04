@@ -51,6 +51,7 @@ enum class ImplMetatypeRepresentation {
 enum class ImplCoroutineKind {
   None,
   YieldOnce,
+  YieldOnce2,
   YieldMany,
 };
 
@@ -183,6 +184,14 @@ public:
     return {};
   }
 
+  static OptionsType getSending() {
+    OptionsType result;
+
+    result |= ImplParameterInfoFlags::Sending;
+
+    return result;
+  }
+
   ImplFunctionParam(BuiltType type, ImplParameterConvention convention,
                     OptionsType options)
       : Type(type), Convention(convention), Options(options) {}
@@ -254,6 +263,12 @@ public:
     }
 
     return {};
+  }
+
+  static OptionsType getSending() {
+    OptionsType result;
+    result |= ImplResultInfoFlags::IsSending;
+    return result;
   }
 
   ImplFunctionResult(BuiltType type, ImplResultConvention convention,
@@ -440,7 +455,8 @@ void decodeRequirement(
     BuilderType &Builder) {
   for (auto &child : *node) {
     if (child->getKind() == Demangle::Node::Kind::DependentGenericParamCount ||
-        child->getKind() == Demangle::Node::Kind::DependentGenericParamPackMarker)
+        child->getKind() == Demangle::Node::Kind::DependentGenericParamPackMarker ||
+        child->getKind() == Demangle::Node::Kind::DependentGenericParamValueMarker)
       continue;
 
     if (child->getNumChildren() != 2)
@@ -863,7 +879,9 @@ protected:
     case NodeKind::DependentGenericParamType: {
       auto depth = Node->getChild(0)->getIndex();
       auto index = Node->getChild(1)->getIndex();
-      return Builder.createGenericTypeParameterType(depth, index);
+      return TypeLookupErrorOr<BuiltType>(
+          Builder.createGenericTypeParameterType(depth, index),
+          /*ignoreValueCheck*/ true);
     }
     case NodeKind::EscapingObjCBlock:
     case NodeKind::ObjCBlock:
@@ -1081,6 +1099,8 @@ protected:
             return MAKE_NODE_TYPE_ERROR0(child, "expected text");
           if (child->getText() == "yield_once") {
             coroutineKind = ImplCoroutineKind::YieldOnce;
+          } else if (child->getText() == "yield_once_2") {
+            coroutineKind = ImplCoroutineKind::YieldOnce2;
           } else if (child->getText() == "yield_many") {
             coroutineKind = ImplCoroutineKind::YieldMany;
           } else
@@ -1459,7 +1479,9 @@ protected:
       if (base.isError())
         return base;
 
-      return Builder.createParenType(base.getType());
+      // ParenType has been removed, return the base type for backwards
+      // compatibility.
+      return base.getType();
     }
     case NodeKind::OpaqueType: {
       if (Node->getNumChildren() < 3)
@@ -1501,6 +1523,32 @@ protected:
       
       return Builder.resolveOpaqueType(descriptor, genericArgs, ordinal);
     }
+
+    case NodeKind::Integer: {
+      return Builder.createIntegerType((intptr_t)Node->getIndex());
+    }
+
+    case NodeKind::NegativeInteger: {
+      return Builder.createNegativeIntegerType((intptr_t)Node->getIndex());
+    }
+
+    case NodeKind::BuiltinFixedArray: {
+      if (Node->getNumChildren() < 2)
+        return MAKE_NODE_TYPE_ERROR(Node,
+                                    "fewer children (%zu) than required (2)",
+                                    Node->getNumChildren());
+
+      auto size = decodeMangledType(Node->getChild(0), depth + 1);
+      if (size.isError())
+        return size;
+
+      auto element = decodeMangledType(Node->getChild(1), depth + 1);
+      if (element.isError())
+        return element;
+
+      return Builder.createBuiltinFixedArrayType(size.getType(), element.getType());
+    }
+
     // TODO: Handle OpaqueReturnType, when we're in the middle of reconstructing
     // the defining decl
     default:
@@ -1594,8 +1642,9 @@ private:
     if (depth > TypeDecoder::MaxDepth)
       return true;
 
-    // Children: `convention, differentiability?, type`
-    if (node->getNumChildren() != 2 && node->getNumChildren() != 3)
+    // Children: `convention, differentiability?, sending?, type`
+    if (node->getNumChildren() != 2 && node->getNumChildren() != 3 &&
+        node->getNumChildren() != 4)
       return true;
 
     auto *conventionNode = node->getChild(0);
@@ -1613,7 +1662,7 @@ private:
       return true;
 
     typename T::OptionsType options;
-    if (node->getNumChildren() == 3) {
+    if (node->getNumChildren() == 3 || node->getNumChildren() == 4) {
       auto diffKindNode = node->getChild(1);
       if (diffKindNode->getKind() !=
           Node::Kind::ImplParameterResultDifferentiability)
@@ -1623,6 +1672,13 @@ private:
       if (!optDiffOptions)
         return true;
       options |= *optDiffOptions;
+    }
+
+    if (node->getNumChildren() == 4) {
+      auto sendingKindNode = node->getChild(2);
+      if (sendingKindNode->getKind() != Node::Kind::ImplParameterSending)
+        return true;
+      options |= T::getSending();
     }
 
     results.emplace_back(result.getType(), *convention, options);

@@ -26,6 +26,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SILGenRequests.h"
 #include "swift/AST/TBDGenRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/IRGen/IRGenPublic.h"
@@ -331,6 +332,11 @@ int swift::RunImmediately(CompilerInstance &CI, const ProcessCmdLine &CmdLine,
   }
 
   auto Result = (*JIT)->runMain(CmdLine);
+
+  // It is not safe to unmap memory that has been registered with the swift or
+  // objc runtime. Currently the best way to avoid that is to leak the JIT.
+  // FIXME: Replace with "detach" llvm/llvm-project#56714.
+  (void)JIT->release();
 
   if (!Result) {
     logError(Result.takeError());

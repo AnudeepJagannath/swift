@@ -15,6 +15,7 @@
 #include "swift/SILOptimizer/Utils/SILInliner.h"
 #include "swift/AST/Builtins.h"
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/PrettyStackTrace.h"
@@ -28,7 +29,7 @@
 
 using namespace swift;
 
-static bool canInlineBeginApply(BeginApplyInst *BA) {
+bool SILInliner::canInlineBeginApply(BeginApplyInst *BA) {
   // Don't inline if we have multiple resumption sites (i.e. end_apply or
   // abort_apply instructions).  The current implementation clones a single
   // copy of the end_apply and abort_apply paths, so it can't handle values
@@ -264,6 +265,13 @@ public:
     for (auto *EndBorrow : EndBorrows)
       EndBorrow->eraseFromParent();
 
+    if (auto allocation = BeginApply->getCalleeAllocationResult()) {
+      for (auto *user : allocation->getUsers()) {
+        auto *dsi = cast<DeallocStackInst>(user);
+        dsi->eraseFromParent();
+      }
+    }
+
     assert(!BeginApply->hasUsesOfAnyResult());
   }
 };
@@ -460,6 +468,7 @@ void SILInlineCloner::cloneInline(ArrayRef<SILValue> AppliedArgs) {
   auto calleeConv = getCalleeFunction()->getConventions();
   SmallBitVector borrowedArgs(AppliedArgs.size());
   SmallBitVector copiedArgs(AppliedArgs.size());
+  SmallBitVector inCxxArgs(AppliedArgs.size());
   if (!Apply->getFunction()->hasOwnership()) {
 
     for (auto p : llvm::enumerate(AppliedArgs)) {
@@ -499,17 +508,20 @@ void SILInlineCloner::cloneInline(ArrayRef<SILValue> AppliedArgs) {
             asi->setIsLexical();
         } else {
           // Insert begin/end borrow for guaranteed arguments.
-          if (paramInfo.isGuaranteed()) {
+          if (paramInfo.isGuaranteedInCaller()) {
             if (SILValue newValue = borrowFunctionArgument(callArg, idx)) {
               callArg = newValue;
               borrowedArgs[idx] = true;
             }
-          } else if (paramInfo.isConsumed()) {
+          } else if (paramInfo.isConsumedInCaller()) {
             if (SILValue newValue = moveFunctionArgument(callArg, idx)) {
               callArg = newValue;
             }
           }
         }
+
+        if (paramInfo.getConvention() == ParameterConvention::Indirect_In_CXX)
+          inCxxArgs[idx] = true;
       }
     }
   }
@@ -565,6 +577,20 @@ void SILInlineCloner::cloneInline(ArrayRef<SILValue> AppliedArgs) {
       for (auto *insertPt : endBorrowInsertPts) {
         SILBuilderWithScope returnBuilder(insertPt, getBuilder());
         returnBuilder.createEndBorrow(Apply.getLoc(), entryArgs[i]);
+      }
+    }
+  }
+
+  if (inCxxArgs.any()) {
+    for (unsigned i : indices(AppliedArgs)) {
+      if (!inCxxArgs.test(i)) {
+        continue;
+      }
+
+      for (auto *insertPt : endBorrowInsertPts) {
+        SILBuilderWithScope returnBuilder(insertPt->getParent()->begin(),
+                                          getBuilder());
+        returnBuilder.emitDestroyOperation(Apply.getLoc(), entryArgs[i]);
       }
     }
   }
@@ -851,6 +877,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::BeginBorrowInst:
   case SILInstructionKind::BorrowedFromInst:
   case SILInstructionKind::MarkDependenceInst:
+  case SILInstructionKind::MergeIsolationRegionInst:
   case SILInstructionKind::PreviousDynamicFunctionRefInst:
   case SILInstructionKind::DynamicFunctionRefInst:
   case SILInstructionKind::FunctionRefInst:
@@ -858,6 +885,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::GlobalAddrInst:
   case SILInstructionKind::BaseAddrForOffsetInst:
   case SILInstructionKind::EndLifetimeInst:
+  case SILInstructionKind::ExtendLifetimeInst:
   case SILInstructionKind::UncheckedOwnershipConversionInst:
   case SILInstructionKind::BindMemoryInst:
   case SILInstructionKind::RebindMemoryInst:
@@ -886,8 +914,10 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::TuplePackElementAddrInst:
     return InlineCost::Expensive;
 
-  // pack_length is just a few adds, which is close enough to free.
+  // pack_length and type_value is just a few adds, which is close enough to
+  // free.
   case SILInstructionKind::PackLengthInst:
+  case SILInstructionKind::TypeValueInst:
     return InlineCost::Free;
 
   // dynamic_pack_index is free.  The other pack-indexing instructions
@@ -1078,6 +1108,7 @@ InlineCost swift::instructionInlineCost(SILInstruction &I) {
   case SILInstructionKind::OpenExistentialValueInst:
   case SILInstructionKind::OpenPackElementInst:
   case SILInstructionKind::PartialApplyInst:
+  case SILInstructionKind::ThunkInst:
   case SILInstructionKind::ExistentialMetatypeInst:
   case SILInstructionKind::RefElementAddrInst:
   case SILInstructionKind::RefTailAddrInst:

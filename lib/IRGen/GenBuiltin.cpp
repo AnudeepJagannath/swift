@@ -22,6 +22,7 @@
 #include "llvm/ADT/StringSwitch.h"
 #include "swift/AST/Builtins.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/SILInstruction.h"
 #include "swift/SIL/SILModule.h"
 #include "clang/AST/ASTContext.h"
@@ -294,20 +295,14 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
 
   if (Builtin.ID == BuiltinValueKind::CreateTaskGroup) {
     llvm::Value *groupFlags = nullptr;
-    // Claim metadata pointer.
-    (void)args.claimAll();
+    assert(args.size() == 0);
     out.add(emitCreateTaskGroup(IGF, substitutions, groupFlags));
     return;
   }
 
   if (Builtin.ID == BuiltinValueKind::CreateTaskGroupWithFlags) {
     auto groupFlags = args.claimNext();
-    // Claim the remaining metadata pointer.
-    if (args.size() == 1) {
-      (void)args.claimNext();
-    } else if (args.size() > 1) {
-      llvm_unreachable("createTaskGroupWithFlags expects 1 or 2 arguments");
-    }
+    assert(args.size() == 0);
     out.add(emitCreateTaskGroup(IGF, substitutions, groupFlags));
     return;
   }
@@ -1389,7 +1384,34 @@ void irgen::emitBuiltinCall(IRGenFunction &IGF, const BuiltinInfo &Builtin,
     out.add(result);
     return;
   }
-  
+
+  if (Builtin.ID == BuiltinValueKind::TargetVariantOSVersionAtLeast) {
+    auto major = args.claimNext();
+    auto minor = args.claimNext();
+    auto patch = args.claimNext();
+    auto result = IGF.emitTargetVariantOSVersionAtLeastCall(major, minor,
+                                                            patch);
+    out.add(result);
+    return;
+  }
+
+  if (Builtin.ID ==
+          BuiltinValueKind::TargetOSVersionOrVariantOSVersionAtLeast) {
+    auto major1 = args.claimNext();
+    auto minor1 = args.claimNext();
+    auto patch1 = args.claimNext();
+
+    auto major2 = args.claimNext();
+    auto minor2 = args.claimNext();
+    auto patch2 = args.claimNext();
+
+    auto result = IGF.emitTargetOSVersionOrVariantOSVersionAtLeastCall(major1,
+        minor1, patch1, major2, minor2, patch2);
+
+    out.add(result);
+    return;
+  }
+
   if (Builtin.ID == BuiltinValueKind::TypePtrAuthDiscriminator) {
     (void)args.claimAll();
     Type valueTy = substitutions.getReplacementTypes()[0];

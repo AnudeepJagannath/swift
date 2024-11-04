@@ -66,6 +66,8 @@ struct TemplateInstantiationNamePrinter
   std::string VisitRecordType(const clang::RecordType *type) {
     auto tagDecl = type->getAsTagDecl();
     if (auto namedArg = dyn_cast_or_null<clang::NamedDecl>(tagDecl)) {
+      if (auto typeDefDecl = tagDecl->getTypedefNameForAnonDecl())
+        namedArg = typeDefDecl;
       llvm::SmallString<128> storage;
       llvm::raw_svector_ostream buffer(storage);
       nameImporter->importName(namedArg, version, clang::DeclarationName())
@@ -129,6 +131,23 @@ struct TemplateInstantiationNamePrinter
 
     return buffer.str().str();
   }
+
+  std::string VisitVectorType(const clang::VectorType *type) {
+    return (Twine("SIMD") + std::to_string(type->getNumElements()) + "<" +
+            Visit(type->getElementType().getTypePtr()) + ">")
+        .str();
+  }
+
+  std::string VisitArrayType(const clang::ArrayType *type) {
+    return (Twine("[") + Visit(type->getElementType().getTypePtr()) + "]")
+        .str();
+  }
+
+  std::string VisitConstantArrayType(const clang::ConstantArrayType *type) {
+    return (Twine("Vector<") + Visit(type->getElementType().getTypePtr()) +
+            ", " + std::to_string(type->getSExtSize()) + ">")
+        .str();
+  }
 };
 
 std::string swift::importer::printClassTemplateSpecializationName(
@@ -148,8 +167,11 @@ std::string swift::importer::printClassTemplateSpecializationName(
         // Use import name here so builtin types such as "int" map to their
         // Swift equivalent ("CInt").
         if (arg.getKind() == clang::TemplateArgument::Type) {
-          auto ty = arg.getAsType().getTypePtr();
-          buffer << templateNamePrinter.Visit(ty);
+          auto ty = arg.getAsType();
+          buffer << templateNamePrinter.Visit(ty.getTypePtr());
+          if (ty.isConstQualified()) {
+            buffer << "_const";
+          }
           return;
         } else if (arg.getKind() == clang::TemplateArgument::Integral) {
           buffer << "_";

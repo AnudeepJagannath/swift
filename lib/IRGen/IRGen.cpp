@@ -27,6 +27,7 @@
 #include "swift/AST/SILGenRequests.h"
 #include "swift/AST/SILOptimizerRequests.h"
 #include "swift/AST/TBDGenRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/MD5Stream.h"
 #include "swift/Basic/Platform.h"
@@ -199,17 +200,52 @@ static void align(llvm::Module *Module) {
     }
 }
 
+static void populatePGOOptions(std::optional<PGOOptions> &Out,
+                               const IRGenOptions &Opts) {
+  if (!Opts.UseSampleProfile.empty()) {
+    Out = PGOOptions(
+      /*ProfileFile=*/ Opts.UseSampleProfile,
+      /*CSProfileGenFile=*/ "",
+      /*ProfileRemappingFile=*/ "",
+      /*MemoryProfile=*/ "",
+      /*FS=*/ llvm::vfs::getRealFileSystem(), // TODO: is this fine?
+      /*Action=*/ PGOOptions::SampleUse,
+      /*CSPGOAction=*/ PGOOptions::NoCSAction,
+      /*ColdType=*/ PGOOptions::ColdFuncOpt::Default,
+      /*DebugInfoForProfiling=*/ Opts.DebugInfoForProfiling
+    );
+    return;
+  }
+
+  if (Opts.DebugInfoForProfiling) {
+    Out = PGOOptions(
+        /*ProfileFile=*/ "",
+        /*CSProfileGenFile=*/ "",
+        /*ProfileRemappingFile=*/ "",
+        /*MemoryProfile=*/ "",
+        /*FS=*/ nullptr,
+        /*Action=*/ PGOOptions::NoAction,
+        /*CSPGOAction=*/ PGOOptions::NoCSAction,
+        /*ColdType=*/ PGOOptions::ColdFuncOpt::Default,
+        /*DebugInfoForProfiling=*/ true
+    );
+    return;
+  }
+}
+
 void swift::performLLVMOptimizations(const IRGenOptions &Opts,
                                      llvm::Module *Module,
                                      llvm::TargetMachine *TargetMachine,
                                      llvm::raw_pwrite_stream *out) {
   std::optional<PGOOptions> PGOOpt;
+  populatePGOOptions(PGOOpt, Opts);
 
   PipelineTuningOptions PTO;
 
   bool RunSwiftSpecificLLVMOptzns =
       !Opts.DisableSwiftSpecificLLVMOptzns && !Opts.DisableLLVMOptzns;
 
+  bool DoHotColdSplit = false;
   PTO.CallGraphProfile = false;
 
   llvm::OptimizationLevel level = llvm::OptimizationLevel::O0;
@@ -220,6 +256,8 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
     PTO.LoopVectorization = true;
     PTO.SLPVectorization = true;
     PTO.MergeFunctions = true;
+    // Splitting trades code size to enhance memory locality, avoid in -Osize.
+    DoHotColdSplit = Opts.EnableHotColdSplit && !Opts.optimizeForSize();
     level = llvm::OptimizationLevel::Os;
   } else {
     level = llvm::OptimizationLevel::O0;
@@ -258,18 +296,22 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
   ModulePassManager MPM;
 
+  PB.setEnableHotColdSplitting(DoHotColdSplit);
+
   if (RunSwiftSpecificLLVMOptzns) {
     PB.registerScalarOptimizerLateEPCallback(
         [](FunctionPassManager &FPM, OptimizationLevel Level) {
           if (Level != OptimizationLevel::O0)
             FPM.addPass(SwiftARCOptPass());
         });
-    PB.registerOptimizerLastEPCallback([](ModulePassManager &MPM,
+    PB.registerOptimizerLastEPCallback([&](ModulePassManager &MPM,
                                           OptimizationLevel Level) {
       if (Level != OptimizationLevel::O0)
         MPM.addPass(createModuleToFunctionPassAdaptor(SwiftARCContractPass()));
       if (Level == OptimizationLevel::O0)
         MPM.addPass(AlwaysInlinerPass());
+      if (Opts.EmitAsyncFramePushPopMetadata)
+        MPM.addPass(AsyncEntryReturnMetadataPass());
     });
   }
 
@@ -330,7 +372,7 @@ void swift::performLLVMOptimizations(const IRGenOptions &Opts,
     options.Atomic = bool(Opts.Sanitizers & SanitizerKind::Thread);
     PB.registerPipelineStartEPCallback(
         [options](ModulePassManager &MPM, OptimizationLevel level) {
-          MPM.addPass(InstrProfiling(options, false));
+           MPM.addPass(InstrProfilingLoweringPass(options, false));
         });
   }
   if (Opts.shouldOptimize()) {
@@ -662,8 +704,8 @@ bool swift::compileAndWriteLLVM(
     legacy::PassManager EmitPasses;
     CodeGenFileType FileType;
     FileType =
-        (opts.OutputKind == IRGenOutputKind::NativeAssembly ? CGFT_AssemblyFile
-                                                            : CGFT_ObjectFile);
+        (opts.OutputKind == IRGenOutputKind::NativeAssembly ? CodeGenFileType::AssemblyFile
+                                                            : CodeGenFileType::ObjectFile);
     EmitPasses.add(createTargetTransformInfoWrapperPass(
         targetMachine->getTargetIRAnalysis()));
 
@@ -727,6 +769,9 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
     PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Decl);
   opts.ValueWitnesses =
     PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Decl);
+  opts.ValueWitnessTable =
+    PointerAuthSchema(dataKey, /*address*/ true, Discrimination::Constant,
+                      SpecialPointerAuthDiscriminators::ValueWitnessTable);
   opts.ProtocolWitnesses =
     PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Decl);
   opts.ProtocolAssociatedTypeAccessFunctions =
@@ -785,6 +830,8 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
   opts.YieldManyResumeFunctions =
       PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Type);
   opts.YieldOnceResumeFunctions =
+      PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Type);
+  opts.YieldOnce2ResumeFunctions =
       PointerAuthSchema(codeKey, /*address*/ true, Discrimination::Type);
 
   opts.ResilientClassStubInitCallbacks =
@@ -861,9 +908,9 @@ static void setPointerAuthOptions(PointerAuthOptions &opts,
 
 std::unique_ptr<llvm::TargetMachine>
 swift::createTargetMachine(const IRGenOptions &Opts, ASTContext &Ctx) {
-  CodeGenOpt::Level OptLevel = Opts.shouldOptimize()
-                                   ? CodeGenOpt::Default // -Os
-                                   : CodeGenOpt::None;
+  CodeGenOptLevel OptLevel = Opts.shouldOptimize()
+                                   ? CodeGenOptLevel::Default // -Os
+                                   : CodeGenOptLevel::None;
 
   // Set up TargetOptions and create the target features string.
   TargetOptions TargetOpts;
@@ -1024,6 +1071,22 @@ static void initLLVMModule(const IRGenModule &IGM, SILModule &SIL) {
       Module->setSDKVersion(*IGM.Context.LangOpts.SDKVersion);
     else
       assert(Module->getSDKVersion() == *IGM.Context.LangOpts.SDKVersion);
+  }
+
+  if (!IGM.VariantTriple.str().empty()) {
+    if (Module->getDarwinTargetVariantTriple().empty()) {
+      Module->setDarwinTargetVariantTriple(IGM.VariantTriple.str());
+    } else {
+      assert(Module->getDarwinTargetVariantTriple() == IGM.VariantTriple.str());
+    }
+  }
+
+  if (IGM.Context.LangOpts.VariantSDKVersion) {
+    if (Module->getDarwinTargetVariantSDKVersion().empty())
+      Module->setDarwinTargetVariantSDKVersion(*IGM.Context.LangOpts.VariantSDKVersion);
+    else
+      assert(Module->getDarwinTargetVariantSDKVersion() ==
+               *IGM.Context.LangOpts.VariantSDKVersion);
   }
 
   // Set the module's string representation.
@@ -1188,12 +1251,10 @@ GeneratedModule IRGenRequest::evaluate(Evaluator &evaluator,
         if (auto *synthSFU = file->getSynthesizedFile()) {
           IGM.emitSynthesizedFileUnit(*synthSFU);
         }
-      } else {
-        file->collectLinkLibraries([&IGM](LinkLibrary LinkLib) {
-          IGM.addLinkLibrary(LinkLib);
-        });
       }
     }
+
+    IGM.addLinkLibraries();
 
     // Okay, emit any definitions that we suddenly need.
     irgen.emitLazyDefinitions();
@@ -1409,7 +1470,6 @@ static void performParallelIRGeneration(IRGenDescriptor desc) {
     IRGenModule *IGM = new IRGenModule(
         irgen, std::move(targetMachine), nextSF, desc.ModuleName, *OutputIter++,
         nextSF->getFilename(), nextSF->getPrivateDiscriminator().str());
-    IGMcreated = true;
 
     initLLVMModule(*IGM, *SILMod);
     if (!DidRunSILCodeGenPreparePasses) {
@@ -1420,128 +1480,133 @@ static void performParallelIRGeneration(IRGenDescriptor desc) {
     }
 
     (void)layoutStringsEnabled(*IGM, /*diagnose*/ true);
+
+    // Only need to do this once.
+    if (!IGMcreated)
+      IGM->addLinkLibraries();
+    IGMcreated = true;
   }
-  
+
   if (!IGMcreated) {
     // TODO: Check this already at argument parsing.
     Ctx.Diags.diagnose(SourceLoc(), diag::no_input_files_for_mt);
     return;
   }
 
-  // Emit the module contents.
-  irgen.emitGlobalTopLevel(desc.getLinkerDirectives());
+  {
+    FrontendStatsTracer tracer(Ctx.Stats, "IRGen");
 
-  for (auto *File : M->getFiles()) {
-    if (auto *SF = dyn_cast<SourceFile>(File)) {
-      {
-        CurrentIGMPtr IGM = irgen.getGenModule(SF);
-        IGM->emitSourceFile(*SF);
+    // Emit the module contents.
+    irgen.emitGlobalTopLevel(desc.getLinkerDirectives());
+
+    for (auto *File : M->getFiles()) {
+      if (auto *SF = dyn_cast<SourceFile>(File)) {
+        {
+          CurrentIGMPtr IGM = irgen.getGenModule(SF);
+          IGM->emitSourceFile(*SF);
+        }
+
+        if (auto *synthSFU = File->getSynthesizedFile()) {
+          CurrentIGMPtr IGM = irgen.getGenModule(synthSFU);
+          IGM->emitSynthesizedFileUnit(*synthSFU);
+        }
       }
-      
-      if (auto *synthSFU = File->getSynthesizedFile()) {
-        CurrentIGMPtr IGM = irgen.getGenModule(synthSFU);
-        IGM->emitSynthesizedFileUnit(*synthSFU);
-      }
-    } else {
-      File->collectLinkLibraries([&](LinkLibrary LinkLib) {
-        irgen.getPrimaryIGM()->addLinkLibrary(LinkLib);
-      });
     }
-  }
-  
-  // Okay, emit any definitions that we suddenly need.
-  irgen.emitLazyDefinitions();
 
-  irgen.emitSwiftProtocols();
+    // Okay, emit any definitions that we suddenly need.
+    irgen.emitLazyDefinitions();
 
-  irgen.emitDynamicReplacements();
+    irgen.emitSwiftProtocols();
 
-  irgen.emitProtocolConformances();
+    irgen.emitDynamicReplacements();
 
-  irgen.emitTypeMetadataRecords();
+    irgen.emitProtocolConformances();
 
-  irgen.emitAccessibleFunctions();
+    irgen.emitTypeMetadataRecords();
 
-  irgen.emitReflectionMetadataVersion();
+    irgen.emitAccessibleFunctions();
 
-  irgen.emitEagerClassInitialization();
-  irgen.emitObjCActorsNeedingSuperclassSwizzle();
+    irgen.emitReflectionMetadataVersion();
 
-  // Emit reflection metadata for builtin and imported types.
-  irgen.emitBuiltinReflectionMetadata();
+    irgen.emitEagerClassInitialization();
+    irgen.emitObjCActorsNeedingSuperclassSwizzle();
 
-  // Emit coverage mapping info. This needs to happen after we've emitted
-  // any lazy definitions, as we need to know whether or not we emitted a
-  // profiler increment for a given coverage map.
-  irgen.emitCoverageMapping();
+    // Emit reflection metadata for builtin and imported types.
+    irgen.emitBuiltinReflectionMetadata();
 
-  IRGenModule *PrimaryGM = irgen.getPrimaryIGM();
+    // Emit coverage mapping info. This needs to happen after we've emitted
+    // any lazy definitions, as we need to know whether or not we emitted a
+    // profiler increment for a given coverage map.
+    irgen.emitCoverageMapping();
 
-  // Emit symbols for eliminated dead methods.
-  PrimaryGM->emitVTableStubs();
+    IRGenModule *PrimaryGM = irgen.getPrimaryIGM();
+
+    // Emit symbols for eliminated dead methods.
+    PrimaryGM->emitVTableStubs();
+
+    // Verify type layout if we were asked to.
+    if (!Opts.VerifyTypeLayoutNames.empty())
+      PrimaryGM->emitTypeVerifier();
     
-  // Verify type layout if we were asked to.
-  if (!Opts.VerifyTypeLayoutNames.empty())
-    PrimaryGM->emitTypeVerifier();
-  
-  std::for_each(Opts.LinkLibraries.begin(), Opts.LinkLibraries.end(),
-                [&](LinkLibrary linkLib) {
-                  PrimaryGM->addLinkLibrary(linkLib);
-                });
-  
-  llvm::DenseSet<StringRef> referencedGlobals;
+    std::for_each(Opts.LinkLibraries.begin(), Opts.LinkLibraries.end(),
+                  [&](LinkLibrary linkLib) {
+                    PrimaryGM->addLinkLibrary(linkLib);
+                  });
 
-  for (auto it = irgen.begin(); it != irgen.end(); ++it) {
-    IRGenModule *IGM = it->second;
-    llvm::Module *M = IGM->getModule();
-    auto collectReference = [&](llvm::GlobalValue &G) {
-      if (G.isDeclaration()
-          && (G.getLinkage() == GlobalValue::LinkOnceODRLinkage ||
-              G.getLinkage() == GlobalValue::ExternalLinkage)) {
-        referencedGlobals.insert(G.getName());
-        G.setLinkage(GlobalValue::ExternalLinkage);
+    llvm::DenseSet<StringRef> referencedGlobals;
+
+    for (auto it = irgen.begin(); it != irgen.end(); ++it) {
+      IRGenModule *IGM = it->second;
+      llvm::Module *M = IGM->getModule();
+      auto collectReference = [&](llvm::GlobalValue &G) {
+        if (G.isDeclaration()
+            && (G.getLinkage() == GlobalValue::LinkOnceODRLinkage ||
+                G.getLinkage() == GlobalValue::ExternalLinkage)) {
+          referencedGlobals.insert(G.getName());
+          G.setLinkage(GlobalValue::ExternalLinkage);
+        }
+      };
+      for (llvm::GlobalVariable &G : M->globals()) {
+        collectReference(G);
       }
-    };
-    for (llvm::GlobalVariable &G : M->globals()) {
-      collectReference(G);
-    }
-    for (llvm::Function &F : M->getFunctionList()) {
-      collectReference(F);
-    }
-    for (llvm::GlobalAlias &A : M->aliases()) {
-      collectReference(A);
-    }
-  }
-
-  for (auto it = irgen.begin(); it != irgen.end(); ++it) {
-    IRGenModule *IGM = it->second;
-    llvm::Module *M = IGM->getModule();
-    
-    // Update the linkage of shared functions/globals.
-    // If a shared function/global is referenced from another file it must have
-    // weak instead of linkonce linkage. Otherwise LLVM would remove the
-    // definition (if it's not referenced in the same file).
-    auto updateLinkage = [&](llvm::GlobalValue &G) {
-      if (!G.isDeclaration()
-          && G.getLinkage() == GlobalValue::LinkOnceODRLinkage
-          && referencedGlobals.count(G.getName()) != 0) {
-        G.setLinkage(GlobalValue::WeakODRLinkage);
+      for (llvm::Function &F : M->getFunctionList()) {
+        collectReference(F);
       }
-    };
-    for (llvm::GlobalVariable &G : M->globals()) {
-      updateLinkage(G);
-    }
-    for (llvm::Function &F : M->getFunctionList()) {
-      updateLinkage(F);
-    }
-    for (llvm::GlobalAlias &A : M->aliases()) {
-      updateLinkage(A);
+      for (llvm::GlobalAlias &A : M->aliases()) {
+        collectReference(A);
+      }
     }
 
-    if (!IGM->finalize())
-      return;
+    for (auto it = irgen.begin(); it != irgen.end(); ++it) {
+      IRGenModule *IGM = it->second;
+      llvm::Module *M = IGM->getModule();
 
-    setModuleFlags(*IGM);
+      // Update the linkage of shared functions/globals.
+      // If a shared function/global is referenced from another file it must have
+      // weak instead of linkonce linkage. Otherwise LLVM would remove the
+      // definition (if it's not referenced in the same file).
+      auto updateLinkage = [&](llvm::GlobalValue &G) {
+        if (!G.isDeclaration()
+            && G.getLinkage() == GlobalValue::LinkOnceODRLinkage
+            && referencedGlobals.count(G.getName()) != 0) {
+          G.setLinkage(GlobalValue::WeakODRLinkage);
+        }
+      };
+      for (llvm::GlobalVariable &G : M->globals()) {
+        updateLinkage(G);
+      }
+      for (llvm::Function &F : M->getFunctionList()) {
+        updateLinkage(F);
+      }
+      for (llvm::GlobalAlias &A : M->aliases()) {
+        updateLinkage(A);
+      }
+
+      if (!IGM->finalize())
+        return;
+
+      setModuleFlags(*IGM);
+    }
   }
 
   // Bail out if there are any errors.

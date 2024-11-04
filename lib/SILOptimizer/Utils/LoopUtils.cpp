@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-loop-utils"
+#include "swift/Basic/Assertions.h"
 #include "swift/SILOptimizer/Utils/LoopUtils.h"
 #include "swift/SILOptimizer/Utils/BasicBlockOptUtils.h"
 #include "swift/SIL/BasicBlockUtils.h"
@@ -230,8 +231,8 @@ bool swift::canDuplicateLoopInstruction(SILLoop *L, SILInstruction *I) {
 
   // The deallocation of a stack allocation must be in the loop, otherwise the
   // deallocation will be fed by a phi node of two allocations.
-  if (I->isAllocatingStack()) {
-    for (auto *UI : cast<SingleValueInstruction>(I)->getUses()) {
+  if (auto allocation = I->getStackAllocation()) {
+    for (auto *UI : allocation->getUses()) {
       if (UI->getUser()->isDeallocatingStack()) {
         if (!L->contains(UI->getUser()->getParent()))
           return false;
@@ -245,6 +246,8 @@ bool swift::canDuplicateLoopInstruction(SILLoop *L, SILInstruction *I) {
       SILValue address = dealloc->getOperand();
       if (isa<AllocStackInst>(address) || isa<PartialApplyInst>(address))
         alloc = cast<SingleValueInstruction>(address);
+      else if (isaResultOf<BeginApplyInst>(address))
+        alloc = cast<MultipleValueInstructionResult>(address)->getParent();
     }
     if (auto *dealloc = dyn_cast<DeallocStackRefInst>(I))
       alloc = dealloc->getAllocRef();
@@ -279,9 +282,9 @@ bool swift::canDuplicateLoopInstruction(SILLoop *L, SILInstruction *I) {
 
   // We can't have a phi of two openexistential instructions of different UUID.
   if (isa<OpenExistentialAddrInst>(I) || isa<OpenExistentialRefInst>(I) ||
-      isa<OpenExistentialMetatypeInst>(I) ||
-      isa<OpenExistentialValueInst>(I) || isa<OpenExistentialBoxInst>(I) ||
-      isa<OpenExistentialBoxValueInst>(I)) {
+      isa<OpenExistentialMetatypeInst>(I) || isa<OpenExistentialValueInst>(I) ||
+      isa<OpenExistentialBoxInst>(I) || isa<OpenExistentialBoxValueInst>(I) ||
+      isa<OpenPackElementInst>(I)) {
     SingleValueInstruction *OI = cast<SingleValueInstruction>(I);
     for (auto *UI : OI->getUses())
       if (!L->contains(UI->getUser()))

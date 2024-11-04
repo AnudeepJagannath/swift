@@ -1,6 +1,6 @@
-// RUN: %target-swift-frontend  -disable-availability-checking %s -parse-as-library -parse-stdlib -emit-sil -o - | %FileCheck %s -check-prefix=CHECK-SIL
+// RUN: %target-swift-frontend  -target %target-swift-5.7-abi-triple %s -parse-as-library -parse-stdlib -emit-sil -o - | %FileCheck %s -check-prefix=CHECK-SIL
 
-// RUN: %target-swift-frontend  -disable-availability-checking %s -parse-as-library -parse-stdlib -emit-ir -o - | %FileCheck %s -check-prefix=CHECK-IR
+// RUN: %target-swift-frontend  -target %target-swift-5.7-abi-triple %s -parse-as-library -parse-stdlib -emit-ir -o - | %FileCheck %s -check-prefix=CHECK-IR
 
 // UNSUPPORTED: back_deploy_concurrency
 // REQUIRES: concurrency
@@ -43,7 +43,7 @@ distributed actor WorkerPool<Worker, ActorSystem: DistributedActorSystem>: Async
     self.actorSystem = system
     self.level = 0
 
-    // CHECK-SIL: sil private @$s021distributed_actor_to_B010WorkerPoolC0B6SystemACyxq_Gq__tYaKcfcyyYaYbcfU_ : $@convention(thin) @Sendable @async <Worker, ActorSystem where ActorSystem : DistributedActorSystem> (@guaranteed Optional<any Actor>, @sil_isolated @guaranteed WorkerPool<Worker, ActorSystem>) -> @out
+    // CHECK-SIL: sil private @$s021distributed_actor_to_B010WorkerPoolC0B6SystemACyxq_Gq__tYaKcfcyyYacfU_ : $@convention(thin) @Sendable @async <Worker, ActorSystem where ActorSystem : DistributedActorSystem> (@guaranteed Optional<any Actor>, @sil_isolated @guaranteed WorkerPool<Worker, ActorSystem>) -> @out () {
     // CHECK-SIL: hop_to_executor {{%.*}} : $WorkerPool<Worker, ActorSystem>
     _ = Task {
       for await x in self {
@@ -55,8 +55,3 @@ distributed actor WorkerPool<Worker, ActorSystem: DistributedActorSystem>: Async
   nonisolated func makeAsyncIterator() -> WorkerPool { self }
   nonisolated func next() async -> Int? { nil }
 }
-
-// CHECK-SIL-LABEL: sil_witness_table shared <Self where Self : DistributedActor> T: Actor module Distributed {
-// CHECK-SIL-NEXT: method #Actor.unownedExecutor!getter: <Self where Self : Actor> (Self) -> () -> UnownedSerialExecutor : @$sxScA11DistributedScA15unownedExecutorScevgTW
-// CHECK-SIL-NEXT: conditional_conformance (Self: DistributedActor): dependent
-// CHECK-SIL-NEXT: }

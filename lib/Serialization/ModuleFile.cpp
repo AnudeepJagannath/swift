@@ -11,23 +11,25 @@
 //===----------------------------------------------------------------------===//
 
 #include "ModuleFile.h"
-#include "ModuleFileCoreTableInfo.h"
 #include "BCReadingExtras.h"
 #include "DeserializationErrors.h"
+#include "ModuleFileCoreTableInfo.h"
 #include "ModuleFormat.h"
-#include "swift/Serialization/SerializationOptions.h"
-#include "swift/Subsystems.h"
-#include "swift/AST/DiagnosticsSema.h"
+#include "SerializationFormat.h"
 #include "swift/AST/ASTContext.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/ModuleLoader.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/USRGeneration.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 #include "swift/ClangImporter/ClangImporter.h"
+#include "swift/Serialization/SerializationOptions.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
+#include "swift/Subsystems.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/Support/Chrono.h"
 #include "llvm/Support/MemoryBuffer.h"
@@ -91,19 +93,6 @@ static bool isTargetTooNew(const llvm::Triple &moduleTarget,
   return ctxTarget.isOSVersionLT(moduleTarget);
 }
 
-std::string ModuleFile::resolveModuleDefiningFilename(const ASTContext &ctx) {
-  if (!Core->ModuleInterfacePath.empty()) {
-    std::string interfacePath = Core->ModuleInterfacePath.str();
-    if (llvm::sys::path::is_relative(interfacePath)) {
-      SmallString<128> absoluteInterfacePath(ctx.SearchPathOpts.getSDKPath());
-      llvm::sys::path::append(absoluteInterfacePath, interfacePath);
-      return absoluteInterfacePath.str().str();
-    } else
-      return interfacePath;
-  } else
-    return getModuleLoadedFilename().str();
-}
-
 namespace swift {
 namespace serialization {
 bool areCompatible(const llvm::Triple &moduleTarget,
@@ -126,6 +115,8 @@ ModuleFile::ModuleFile(std::shared_ptr<const ModuleFileSharedCore> core)
   for (const auto &coreDep : core->Dependencies) {
     Dependencies.emplace_back(coreDep);
   }
+
+  MacroModuleNames = core->MacroModuleNames;
 
   // `ModuleFileSharedCore` has immutable data, we copy these into `ModuleFile`
   // so we can mutate the arrays and replace the offsets with AST object
@@ -271,7 +262,8 @@ Status ModuleFile::associateWithFileContext(FileUnit *file, SourceLoc diagLoc,
 
   ASTContext &ctx = getContext();
   // Resolve potentially-SDK-relative module-defining .swiftinterface path
-  ResolvedModuleDefiningFilename = resolveModuleDefiningFilename(ctx);
+  ResolvedModuleDefiningFilename =
+       Core->resolveModuleDefiningFilePath(ctx.SearchPathOpts.getSDKPath());
 
   llvm::Triple moduleTarget(llvm::Triple::normalize(Core->TargetTriple));
   if (!areCompatible(moduleTarget, ctx.LangOpts.Target)) {
@@ -320,11 +312,9 @@ ModuleFile::getTransitiveLoadingBehavior(const Dependency &dependency,
   // as a partial module.
   auto isPartialModule = mod->isMainModule();
 
-  return Core->getTransitiveLoadingBehavior(dependency.Core,
-                                            ctx.LangOpts.DebuggerSupport,
-                                            isPartialModule,
-                                            ctx.LangOpts.PackageName,
-                                            forTestable);
+  return Core->getTransitiveLoadingBehavior(
+      dependency.Core, ctx.LangOpts.ImportNonPublicDependencies,
+      isPartialModule, ctx.LangOpts.PackageName, forTestable);
 }
 
 bool ModuleFile::mayHaveDiagnosticsPointingAtBuffer() const {
@@ -544,6 +534,11 @@ void ModuleFile::getImportedModules(SmallVectorImpl<ImportedModule> &results,
     assert(dep.isLoaded());
     results.push_back(*(dep.Import));
   }
+}
+
+void ModuleFile::getExternalMacros(
+    SmallVectorImpl<ExternalMacroPlugin> &macros) {
+  macros = MacroModuleNames;
 }
 
 void ModuleFile::getImportDecls(SmallVectorImpl<Decl *> &Results) {
@@ -1120,7 +1115,7 @@ void ModuleFile::collectBasicSourceFileInfo(
   auto *End = Core->SourceFileListData.bytes_end();
   while (Cursor < End) {
     // FilePath (byte offset in 'SourceLocsTextData').
-    auto fileID = endian::readNext<uint32_t, little, unaligned>(Cursor);
+    auto fileID = readNext<uint32_t>(Cursor);
 
     // InterfaceHashIncludingTypeMembers (fixed length string).
     auto fpStrIncludingTypeMembers = StringRef{reinterpret_cast<const char *>(Cursor),
@@ -1133,9 +1128,9 @@ void ModuleFile::collectBasicSourceFileInfo(
     Cursor += Fingerprint::DIGEST_LENGTH;
 
     // LastModified (nanoseconds since epoch).
-    auto timestamp = endian::readNext<uint64_t, little, unaligned>(Cursor);
+    auto timestamp = readNext<uint64_t>(Cursor);
     // FileSize (num of bytes).
-    auto fileSize = endian::readNext<uint64_t, little, unaligned>(Cursor);
+    auto fileSize = readNext<uint64_t>(Cursor);
 
     assert(fileID < Core->SourceLocsTextData.size());
     auto filePath = Core->SourceLocsTextData.substr(fileID);
@@ -1165,8 +1160,7 @@ void ModuleFile::collectBasicSourceFileInfo(
 }
 
 static StringRef readLocString(const char *&Data, StringRef StringData) {
-  auto Str =
-      StringData.substr(endian::readNext<uint32_t, little, unaligned>(Data));
+  auto Str = StringData.substr(readNext<uint32_t>(Data));
   size_t TerminatorOffset = Str.find('\0');
   assert(TerminatorOffset != StringRef::npos && "unterminated string data");
   return Str.slice(0, TerminatorOffset);
@@ -1174,13 +1168,13 @@ static StringRef readLocString(const char *&Data, StringRef StringData) {
 
 static void readRawLoc(ExternalSourceLocs::RawLoc &Loc, const char *&Data,
                        StringRef StringData) {
-  Loc.Offset = endian::readNext<uint32_t, little, unaligned>(Data);
-  Loc.Line = endian::readNext<uint32_t, little, unaligned>(Data);
-  Loc.Column = endian::readNext<uint32_t, little, unaligned>(Data);
+  Loc.Offset = readNext<uint32_t>(Data);
+  Loc.Line = readNext<uint32_t>(Data);
+  Loc.Column = readNext<uint32_t>(Data);
 
-  Loc.Directive.Offset = endian::readNext<uint32_t, little, unaligned>(Data);
-  Loc.Directive.LineOffset = endian::readNext<int32_t, little, unaligned>(Data);
-  Loc.Directive.Length = endian::readNext<uint32_t, little, unaligned>(Data);
+  Loc.Directive.Offset = readNext<uint32_t>(Data);
+  Loc.Directive.LineOffset = readNext<int32_t>(Data);
+  Loc.Directive.Length = readNext<uint32_t>(Data);
   Loc.Directive.Name = readLocString(Data, StringData);
 }
 
@@ -1225,19 +1219,18 @@ ModuleFile::getExternalRawLocsForDecl(const Decl *D) const {
   ExternalSourceLocs::RawLocs Result;
   Result.SourceFilePath = readLocString(Record, Core->SourceLocsTextData);
 
-  const auto DocRangesOffset =
-      endian::readNext<uint32_t, little, unaligned>(Record);
+  const auto DocRangesOffset = readNext<uint32_t>(Record);
   if (DocRangesOffset) {
     assert(!Core->DocRangesData.empty());
     const auto *Data = Core->DocRangesData.data() + DocRangesOffset;
-    const auto NumLocs = endian::readNext<uint32_t, little, unaligned>(Data);
+    const auto NumLocs = readNext<uint32_t>(Data);
     assert(NumLocs);
 
     for (uint32_t I = 0; I < NumLocs; ++I) {
       auto &Range =
           Result.DocRanges.emplace_back(ExternalSourceLocs::RawLoc(), 0);
       readRawLoc(Range.first, Data, Core->SourceLocsTextData);
-      Range.second = endian::readNext<uint32_t, little, unaligned>(Data);
+      Range.second = readNext<uint32_t>(Data);
     }
   }
 
@@ -1410,4 +1403,12 @@ StringRef SerializedASTFile::getExportedModuleName() const {
   if (!name.empty())
     return name;
   return FileUnit::getExportedModuleName();
+}
+
+StringRef SerializedASTFile::getPublicModuleName() const {
+  return File.getPublicModuleName();
+}
+
+llvm::VersionTuple SerializedASTFile::getSwiftInterfaceCompilerVersion() const {
+  return File.getSwiftInterfaceCompilerVersion();
 }

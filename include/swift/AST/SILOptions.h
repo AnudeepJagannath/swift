@@ -118,6 +118,13 @@ public:
   /// Controls whether to run async demotion pass.
   bool EnableAsyncDemotion = false;
 
+  /// Controls whether to always assume that functions rarely throw an Error
+  /// within the optimizer. This influences static branch prediction.
+  bool EnableThrowsPrediction = false;
+
+  /// Controls whether to say that blocks ending in an 'unreachable' are cold.
+  bool EnableNoReturnCold = false;
+
   /// Should we run any SIL performance optimizations
   ///
   /// Useful when you want to enable -O LLVM opts but not -O SIL opts.
@@ -126,12 +133,10 @@ public:
   /// Controls whether cross module optimization is enabled.
   CrossModuleOptimizationMode CMOMode = CrossModuleOptimizationMode::Off;
 
-  /// Optimization to perform default CMO within a package boundary.
-  /// Unlike the existing CMO, package CMO can be built with
-  /// -enable-library-evolution since package modules are required
-  /// to be built in the same project. To enable this optimization, the
-  /// module also needs to opt in to allow non-resilient access with
-  /// -experimental-allow-non-resilient-access.
+  /// Optimization to perform default mode CMO within a package boundary.
+  /// Package CMO can be performed for resiliently built modules as package
+  /// modules are required to be built together in the same project. To enable
+  /// this optimization, the module also needs -allow-non-resilient-access.
   bool EnableSerializePackage = false;
 
   /// Enables the emission of stack protectors in functions.
@@ -147,6 +152,10 @@ public:
 
   /// Enables SIL-level diagnostics for NonescapableTypes.
   bool EnableLifetimeDependenceDiagnostics = true;
+
+  /// Enables SIL-level performance diagnostics (for @noLocks, @noAllocation
+  /// annotations and for Embedded Swift).
+  bool EnablePerformanceDiagnostics = true;
 
   /// Controls whether or not paranoid verification checks are run.
   bool VerifyAll = false;
@@ -179,13 +188,17 @@ public:
   /// If this is disabled we do not serialize in OSSA form when optimizing.
   bool EnableOSSAModules = false;
 
+  /// Allow recompilation of a non-OSSA module to an OSSA module when imported
+  /// from another OSSA module.
+  bool EnableRecompilationToOSSAModule = false;
+
   /// If set to true, compile with the SIL Opaque Values enabled.
   bool EnableSILOpaqueValues = false;
 
-  /// Require linear OSSA lifetimes after SILGen
-  bool OSSACompleteLifetimes = false;
+  /// Introduce linear OSSA lifetimes after SILGen
+  bool OSSACompleteLifetimes = true;
 
-  /// Verify linear OSSA lifetimes after SILGen
+  /// Verify linear OSSA lifetimes throughout OSSA pipeline.
   bool OSSAVerifyComplete = false;
 
   /// Enable pack metadata stack "promotion".
@@ -308,6 +321,10 @@ public:
   /// Are there any options that indicate that functions should not be preserved
   /// for the debugger?
   bool ShouldFunctionsBePreservedToDebugger = true;
+
+  /// Block expanding and register promotion more aggressively throughout the
+  /// optimizer.
+  bool UseAggressiveReg2MemForCodeSize = false;
 
   SILOptions() {}
 

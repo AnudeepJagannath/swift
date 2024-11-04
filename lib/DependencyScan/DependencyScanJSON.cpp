@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 #include "swift/DependencyScan/DependencyScanJSON.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/DependencyScan/DependencyScanImpl.h"
 #include "swift/DependencyScan/StringUtils.h"
@@ -202,6 +203,89 @@ static void writeDependencies(llvm::raw_ostream &out,
   out << "\n";
 }
 
+void writeLinkLibraries(llvm::raw_ostream &out,
+                        const swiftscan_link_library_set_t *link_libraries,
+                        unsigned indentLevel, bool trailingComma) {
+  out.indent(indentLevel * 2);
+  out << "\"linkLibraries\": ";
+  out << "[\n";
+
+  for (size_t i = 0; i < link_libraries->count; ++i) {
+    const auto &llInfo = *link_libraries->link_libraries[i];
+    out.indent((indentLevel + 1) * 2);
+    out << "{\n";
+    auto entryIndentLevel = ((indentLevel + 2) * 2);
+    out.indent(entryIndentLevel);
+    out << "\"linkName\": ";
+    writeJSONValue(out, llInfo.name, indentLevel);
+    out << ",\n";
+    out.indent(entryIndentLevel);
+    out << "\"isFramework\": ";
+    writeJSONValue(out, llInfo.isFramework, entryIndentLevel);
+    out << ",\n";
+    out.indent(entryIndentLevel);
+    out << "\"shouldForceLoad\": ";
+    writeJSONValue(out, llInfo.forceLoad, entryIndentLevel);
+    out << "\n";
+    out.indent((indentLevel + 1) * 2);
+    out << "}";
+    if (i != link_libraries->count - 1) {
+      out << ",";
+    }
+    out << "\n";
+  }
+
+  out.indent(indentLevel * 2);
+  out << "]";
+
+  if (trailingComma)
+    out << ",";
+  out << "\n";
+}
+
+static void
+writeMacroDependencies(llvm::raw_ostream &out,
+                       const swiftscan_macro_dependency_set_t *macro_deps,
+                       unsigned indentLevel, bool trailingComma) {
+  if (!macro_deps)
+    return;
+
+  out.indent(indentLevel * 2);
+  out << "\"macroDependencies\": ";
+  out << "[\n";
+  for (size_t i = 0; i < macro_deps->count; ++i) {
+    const auto &macroInfo = *macro_deps->macro_dependencies[i];
+    out.indent((indentLevel + 1) * 2);
+    out << "{\n";
+    auto entryIndentLevel = ((indentLevel + 2) * 2);
+    out.indent(entryIndentLevel);
+    out << "\"moduleName\": ";
+    writeJSONValue(out, macroInfo.moduleName, indentLevel);
+    out << ",\n";
+    out.indent(entryIndentLevel);
+    out << "\"libraryPath\": ";
+    writeJSONValue(out, macroInfo.libraryPath, entryIndentLevel);
+    out << ",\n";
+    out.indent(entryIndentLevel);
+    out << "\"executablePath\": ";
+    writeJSONValue(out, macroInfo.executablePath, entryIndentLevel);
+    out << "\n";
+    out.indent((indentLevel + 1) * 2);
+    out << "}";
+    if (i != macro_deps->count - 1) {
+      out << ",";
+    }
+    out << "\n";
+  }
+
+  out.indent(indentLevel * 2);
+  out << "]";
+
+  if (trailingComma)
+    out << ",";
+  out << "\n";
+}
+
 static const swiftscan_swift_textual_details_t *
 getAsTextualDependencyModule(swiftscan_module_details_t details) {
   if (details->kind == SWIFTSCAN_DEPENDENCY_INFO_SWIFT_TEXTUAL)
@@ -295,10 +379,13 @@ void writeJSON(llvm::raw_ostream &out,
     }
 
     // Direct dependencies.
-    if (swiftTextualDeps || swiftBinaryDeps || clangDeps)
+    if (swiftTextualDeps || swiftBinaryDeps || clangDeps) {
       writeDependencies(out, directDependencies,
                         "directDependencies", 3,
                         /*trailingComma=*/true);
+      writeLinkLibraries(out, moduleInfo.link_libraries,
+                         3, /*trailingComma=*/true);
+    }
     // Swift and Clang-specific details.
     out.indent(3 * 2);
     out << "\"details\": {\n";
@@ -369,6 +456,11 @@ void writeJSON(llvm::raw_ostream &out,
                              swiftTextualDeps->module_cache_key, 5,
                              /*trailingComma=*/true);
       }
+      writeJSONSingleField(out, "userModuleVersion",
+                           swiftTextualDeps->user_module_version, 5,
+                           /*trailingComma=*/true);
+      writeMacroDependencies(out, swiftTextualDeps->macro_dependencies, 5,
+                             /*trailingComma=*/true);
       writeJSONSingleField(out, "isFramework", swiftTextualDeps->is_framework,
                            5, commaAfterFramework);
       if (swiftTextualDeps->extra_pcm_args->count != 0) {
@@ -461,6 +553,10 @@ void writeJSON(llvm::raw_ostream &out,
                            swiftBinaryDeps->compiled_module_path,
                            /*indentLevel=*/5,
                            /*trailingComma=*/true);
+      writeJSONSingleField(out, "userModuleVersion",
+                           swiftBinaryDeps->user_module_version,
+                           /*indentLevel=*/5,
+                           /*trailingComma=*/true);
       // Module doc file
       if (swiftBinaryDeps->module_doc_path.data &&
           get_C_string(swiftBinaryDeps->module_doc_path)[0] != '\0')
@@ -505,6 +601,8 @@ void writeJSON(llvm::raw_ostream &out,
                           /*trailingComma=*/true);
       }
 
+      writeMacroDependencies(out, swiftBinaryDeps->macro_dependencies, 5,
+                             /*trailingComma=*/true);
       writeJSONSingleField(out, "isFramework", swiftBinaryDeps->is_framework,
                            5, /*trailingComma=*/false);
     } else {

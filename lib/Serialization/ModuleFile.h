@@ -127,6 +127,9 @@ private:
   /// All modules this module depends on.
   SmallVector<Dependency, 8> Dependencies;
 
+  /// External macro modules.
+  SmallVector<ExternalMacroPlugin, 4> MacroModuleNames;
+
 public:
   template <typename T>
   class Serialized {
@@ -284,10 +287,6 @@ private:
   createLazyConformanceLoaderToken(ArrayRef<uint64_t> ids);
   ArrayRef<ProtocolConformanceID>
   claimLazyConformanceLoaderToken(uint64_t token);
-
-  /// If the module-defining `.swiftinterface` file is an SDK-relative path,
-  /// resolve it to be absolute to the context's SDK.
-  std::string resolveModuleDefiningFilename(const ASTContext &ctx);
 
   /// Represents an identifier that may or may not have been deserialized yet.
   ///
@@ -502,7 +501,7 @@ private:
   /// Recursively reads a pattern from \c DeclTypeCursor.
   llvm::Expected<Pattern *> readPattern(DeclContext *owningDC);
 
-  ParameterList *readParameterList();
+  llvm::Expected<ParameterList *> readParameterList();
   
   /// Reads a generic param list from \c DeclTypeCursor.
   ///
@@ -591,6 +590,10 @@ public:
     return Core->ModuleExportAsName;
   }
 
+  StringRef getPublicModuleName() const {
+    return Core->PublicModuleName;
+  }
+
   /// The ABI name of the module.
   StringRef getModuleABIName() const {
     return Core->ModuleABIName;
@@ -598,6 +601,10 @@ public:
 
   llvm::VersionTuple getUserModuleVersion() const {
     return Core->UserModuleVersion;
+  }
+
+  llvm::VersionTuple getSwiftInterfaceCompilerVersion() const {
+    return Core->SwiftInterfaceCompilerVersion;
   }
 
   ArrayRef<StringRef> getAllowableClientNames() const {
@@ -644,6 +651,11 @@ public:
   /// Whether this module was built with C++ interoperability enabled.
   bool hasCxxInteroperability() const {
     return Core->Bits.HasCxxInteroperability;
+  }
+
+  /// The kind of the C++ stdlib that this module was built with.
+  CXXStdlibKind getCXXStdlibKind() const {
+    return static_cast<CXXStdlibKind>(Core->Bits.CXXStdlibKind);
   }
 
   /// Whether the module is resilient. ('-enable-library-evolution')
@@ -778,6 +790,8 @@ public:
   /// Adds any imported modules to the given vector.
   void getImportedModules(SmallVectorImpl<ImportedModule> &results,
                           ModuleDecl::ImportFilter filter);
+
+  void getExternalMacros(SmallVectorImpl<ExternalMacroPlugin> &macros);
 
   void getImportDecls(SmallVectorImpl<Decl *> &Results);
 
@@ -1076,12 +1090,11 @@ public:
 
   // Reads lifetime dependence info from type if present.
   std::optional<LifetimeDependenceInfo>
-  maybeReadLifetimeDependenceInfo(unsigned numParams);
+  maybeReadLifetimeDependence(unsigned numParams);
 
   // Reads lifetime dependence specifier from decl if present
-  bool maybeReadLifetimeDependenceSpecifier(
-      SmallVectorImpl<LifetimeDependenceSpecifier> &specifierList,
-      unsigned numDeclParams, bool hasSelf);
+  bool maybeReadLifetimeEntry(SmallVectorImpl<LifetimeEntry> &specifierList,
+                              unsigned numDeclParams, bool hasSelf);
 
   /// Reads inlinable body text from \c DeclTypeCursor, if present.
   std::optional<StringRef> maybeReadInlinableBodyText();

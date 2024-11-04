@@ -19,6 +19,7 @@
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/FileSystem.h"
 #include "swift/AST/Module.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Frontend/ModuleInterfaceSupport.h"
@@ -104,6 +105,12 @@ bool ExplicitModuleInterfaceBuilder::collectDepsForSerialization(
   path::native(SDKPath);
   SmallString<128> ResourcePath(Opts.RuntimeResourcePath);
   path::native(ResourcePath);
+  // When compiling with a relative resource dir, the clang
+  // importer will track inputs with absolute paths. To avoid
+  // serializing resource dir inputs we need to check for
+  // relative _and_ absolute prefixes.
+  SmallString<128> AbsResourcePath(ResourcePath);
+  llvm::sys::fs::make_absolute(AbsResourcePath);
 
   auto DTDeps = Instance.getDependencyTracker()->getDependencies();
   SmallVector<std::string, 16> InitialDepNames(DTDeps.begin(), DTDeps.end());
@@ -145,7 +152,7 @@ bool ExplicitModuleInterfaceBuilder::collectDepsForSerialization(
     }
 
     // Don't serialize compiler-relative deps so the cache is relocatable.
-    if (DepName.starts_with(ResourcePath))
+    if (DepName.starts_with(ResourcePath) || DepName.starts_with(AbsResourcePath))
       continue;
 
     auto Status = fs.status(DepName);
@@ -276,6 +283,8 @@ std::error_code ExplicitModuleInterfaceBuilder::buildSwiftModuleFromInterface(
   SerializationOpts.ModuleLinkName = FEOpts.ModuleLinkName;
   SerializationOpts.AutolinkForceLoad =
       !Invocation.getIRGenOptions().ForceLoadSymbolName.empty();
+  SerializationOpts.PublicDependentLibraries =
+      Invocation.getIRGenOptions().PublicLinkLibraries;
   SerializationOpts.UserModuleVersion = FEOpts.UserModuleVersion;
   SerializationOpts.AllowableClients = FEOpts.AllowableClients;
   StringRef SDKPath = Instance.getASTContext().SearchPathOpts.getSDKPath();

@@ -20,6 +20,7 @@
 #include "swift/AST/PluginLoader.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Basic/PrettyStackTrace.h"
@@ -199,7 +200,6 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
     return false;
 
   auto *oldSF = CachedCI->getIDEInspectionFile();
-  assert(oldSF->getBufferID());
 
   auto *oldState = oldSF->getDelayedParserState();
   assert(oldState->hasIDEInspectionDelayedDeclState());
@@ -207,7 +207,7 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
 
   auto &SM = CachedCI->getSourceMgr();
   auto bufferName = ideInspectionTargetBuffer->getBufferIdentifier();
-  if (SM.getIdentifierForBuffer(*oldSF->getBufferID()) != bufferName)
+  if (SM.getIdentifierForBuffer(oldSF->getBufferID()) != bufferName)
     return false;
 
   if (shouldCheckDependencies()) {
@@ -222,7 +222,7 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
     }
 
     if (areAnyDependentFilesInvalidated(
-            *CachedCI, *FileSystem, *oldSF->getBufferID(),
+            *CachedCI, *FileSystem, oldSF->getBufferID(),
             DependencyCheckedTimestamp, InMemoryDependencyHash))
       return false;
     DependencyCheckedTimestamp = std::chrono::system_clock::now();
@@ -241,9 +241,11 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
   ClangImporterOptions clangOpts;
   symbolgraphgen::SymbolGraphOptions symbolOpts;
   CASOptions casOpts;
+  SerializationOptions serializationOpts =
+      CachedCI->getASTContext().SerializationOpts;
   std::unique_ptr<ASTContext> tmpCtx(
       ASTContext::get(langOpts, typeckOpts, silOpts, searchPathOpts, clangOpts,
-                      symbolOpts, casOpts, tmpSM, tmpDiags));
+                      symbolOpts, casOpts, serializationOpts, tmpSM, tmpDiags));
   tmpCtx->CancellationFlag = CancellationFlag;
   registerParseRequestFunctions(tmpCtx->evaluator);
   registerIDERequestFunctions(tmpCtx->evaluator);
@@ -254,7 +256,6 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
   ModuleDecl *tmpM = ModuleDecl::create(Identifier(), *tmpCtx);
   SourceFile *tmpSF = new (*tmpCtx)
       SourceFile(*tmpM, oldSF->Kind, tmpBufferID, oldSF->getParsingOptions());
-  tmpM->addAuxiliaryFile(*tmpSF);
 
   // FIXME: Since we don't setup module loaders on the temporary AST context,
   // 'canImport()' conditional compilation directive always fails. That causes
@@ -355,6 +356,7 @@ bool IDEInspectionInstance::performCachedOperationIfPossible(
           nullptr
         }
     );
+    SM.recordSourceFile(newBufferID, AFD->getParentSourceFile());
 
     AFD->setBodyToBeReparsed(newBodyRange);
     oldSF->clearScope();

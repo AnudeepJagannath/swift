@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -disable-availability-checking
+// RUN: %target-typecheck-verify-swift -target %target-swift-5.9-abi-triple
 
 //===----------------------------------------------------------------------===//
 // Use of protocols with Self or associated type requirements
@@ -923,8 +923,9 @@ do {
 
 class BadConformanceClass: CompositionBrokenClassConformance_a {}
 // expected-error@-1 {{type 'BadConformanceClass' does not conform to protocol 'CompositionBrokenClassConformance_a'}}
+// expected-note@-2 {{add stubs for conformance}}
 protocol CompositionBrokenClassConformance_a {
-  associatedtype A // expected-note {{protocol requires nested type 'A'; add nested type 'A' for conformance}}
+  associatedtype A // expected-note {{protocol requires nested type 'A'}}
 }
 protocol CompositionBrokenClassConformance_b: CompositionBrokenClassConformance_a {
   func method(_: A)
@@ -1022,4 +1023,50 @@ do {
   let _: any CovariantAssocTypeErasureDerived.Type = exist.method10()
   let _: Array<any Class2Base & CovariantAssocTypeErasureDerived> = exist.method11()
   let _: Dictionary<String, any Class2Base & CovariantAssocTypeErasureDerived> = exist.method12()
+}
+
+///
+/// Interactions between opening and parameter packs
+///
+
+// Same-shape requirements
+protocol HasSameShape {
+  func foo<each T, each U>(t: repeat each T, u: repeat each U) -> (repeat (each T, each U))
+}
+
+func bar(a: any HasSameShape) -> (Int, String) {
+  a.foo(t: 1, u: "hi")
+}
+
+// Make sure we look through a pack type when evaluating the variance of the result
+struct Variadic<each A> {}
+
+protocol VariadicResult {
+  associatedtype A
+  func foo() -> Variadic<A>
+}
+
+func variadicResult(a: any VariadicResult) {
+  a.foo()
+  // expected-error@-1 {{member 'foo' cannot be used on value of type 'any VariadicResult'; consider using a generic constraint instead}}
+}
+
+// Pack expansions are invariant
+struct Pair<X, Y> {}
+
+protocol PackExpansionResult {
+  associatedtype A
+  func foo<each T>(t: repeat each T) -> (repeat Pair<each T, A>)
+}
+
+func packExpansionResult(p: any PackExpansionResult) {
+  p.foo(t: 1, "hi")
+  // expected-error@-1 {{member 'foo' cannot be used on value of type 'any PackExpansionResult'; consider using a generic constraint instead}}
+}
+
+// rdar://135974645 - invalid error: heterogeneous collection literal could only be inferred to '[Any]'
+extension StringProtocol {
+  func test(target: any StringProtocol, idx: Int) {
+    let _ = [target.prefix(idx), target.suffix(idx)] // Ok
+  }
 }

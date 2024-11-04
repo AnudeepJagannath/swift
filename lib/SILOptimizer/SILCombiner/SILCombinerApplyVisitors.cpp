@@ -18,6 +18,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/SemanticAttrs.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Range.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/DynamicCasts.h"
@@ -689,6 +690,7 @@ bool SILCombiner::eraseApply(FullApplySite FAS, const UserListTy &Users) {
         case ParameterConvention::Indirect_In_Guaranteed:
         case ParameterConvention::Indirect_Inout:
         case ParameterConvention::Indirect_InoutAliasable:
+        case ParameterConvention::Indirect_In_CXX:
         case ParameterConvention::Direct_Unowned:
         case ParameterConvention::Direct_Guaranteed:
         case ParameterConvention::Pack_Guaranteed:
@@ -945,7 +947,9 @@ static bool canReplaceCopiedArg(FullApplySite Apply, SILValue Arg,
 static bool applyInvolvesOpenedArchetypeWithRoot(FullApplySite Apply,
                                                  OpenedArchetypeType *RootOA,
                                                  unsigned SkipArgIdx) {
-  if (Apply.getType().getASTType()->hasOpenedExistentialWithRoot(RootOA)) {
+  auto *env = RootOA->getGenericEnvironment();
+
+  if (Apply.getType().getASTType()->hasLocalArchetypeFromEnvironment(env)) {
     return true;
   }
 
@@ -956,7 +960,7 @@ static bool applyInvolvesOpenedArchetypeWithRoot(FullApplySite Apply,
     if (Apply.getArgument(Idx)
             ->getType()
             .getASTType()
-            ->hasOpenedExistentialWithRoot(RootOA)) {
+            ->hasLocalArchetypeFromEnvironment(env)) {
       return true;
     }
   }
@@ -1031,7 +1035,7 @@ struct ConcreteArgumentCopy {
     assert(!paramInfo.isIndirectMutating()
            && "A mutated opened existential value can't be replaced");
 
-    if (!paramInfo.isConsumed())
+    if (!paramInfo.isConsumedInCaller())
       return std::nullopt;
 
     SILValue origArg = apply.getArgument(argIdx);
@@ -1130,8 +1134,6 @@ SILInstruction *SILCombiner::createApplyWithConcreteType(
     FullApplySite Apply,
     const llvm::SmallDenseMap<unsigned, ConcreteOpenedExistentialInfo> &COAIs,
     SILBuilderContext &BuilderCtx) {
-  // Ensure that the callee is polymorphic.
-  assert(Apply.getOrigCalleeType()->isPolymorphic());
 
   // Create the new set of arguments to apply including their substitutions.
   SubstitutionMap NewCallSubs = Apply.getSubstitutionMap();
@@ -1180,7 +1182,7 @@ SILInstruction *SILCombiner::createApplyWithConcreteType(
                 return CEI.lookupExistentialConformance(proto);
               }
               return ProtocolConformanceRef(proto);
-            });
+            }, SubstFlags::SubstituteLocalArchetypes);
         continue;
       }
       // Otherwise, use the original argument.
@@ -1218,7 +1220,7 @@ SILInstruction *SILCombiner::createApplyWithConcreteType(
             return CEI.lookupExistentialConformance(proto);
           }
           return ProtocolConformanceRef(proto);
-        });
+        }, SubstFlags::SubstituteLocalArchetypes);
   }
 
   // We need to make sure that we can a) update Apply to use the new args and b)

@@ -24,6 +24,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/PropertyWrappers.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/Generators.h"
 #include "swift/SIL/SILArgument.h"
@@ -189,7 +190,7 @@ static RValue emitImplicitValueConstructorArg(SILGenFunction &SGF,
   auto argType = loweredParamTypes.claimNext();
 
   auto *arg = SGF.F.begin()->createFunctionArgument(argType, VD);
-  bool argIsConsumed = origParamInfo.isConsumed();
+  bool argIsConsumed = origParamInfo.isConsumedInCallee();
 
   // If the lowered parameter is a pack expansion, copy/move the pack
   // into the initialization, which we assume is there.
@@ -321,7 +322,7 @@ static SubstitutionMap getSubstitutionsForPropertyInitializer(
     return SubstitutionMap::get(
       nominal->getGenericSignatureOfContext(),
       QuerySubstitutionMap{genericEnv->getForwardingSubstitutionMap()},
-      LookUpConformanceInModule(dc->getParentModule()));
+      LookUpConformanceInModule());
   }
 
   return SubstitutionMap();
@@ -577,21 +578,10 @@ static void emitImplicitValueConstructor(SILGenFunction &SGF,
   return;
 }
 
-// FIXME: the callers of ctorHopsInjectedByDefiniteInit is not correct (rdar://87485045)
-// we must still set the SGF.ExpectedExecutor field to say that we must
-// hop to the executor after every apply in the constructor. This seems to
-// happen for the main actor isolated async inits, but not for the plain ones,
-// where 'self' is not going to directly be the instance. We have to extend the
-// ExecutorBreadcrumb class to detect whether it needs to do a load or not
-// in it's emit method.
-//
-// So, the big problem right now is that for a delegating async actor init,
-// after calling an async function, no hop-back is being emitted.
-
 /// Returns true if the given async constructor will have its
 /// required actor hops injected later by definite initialization.
 static bool ctorHopsInjectedByDefiniteInit(ConstructorDecl *ctor,
-                                           ActorIsolation const& isolation) {
+                                           ActorIsolation isolation) {
   // must be async, but we can assume that.
   assert(ctor->hasAsync());
 
@@ -602,10 +592,10 @@ static bool ctorHopsInjectedByDefiniteInit(ConstructorDecl *ctor,
   if (!selfClassDecl || !selfClassDecl->isAnyActor())
     return false;
 
-  // must be instance isolated
+  // must be self-isolated
   switch (isolation) {
     case ActorIsolation::ActorInstance:
-      return true;
+      return isolation.getActorInstanceParameter() == 0;
 
     case ActorIsolation::Erased:
       llvm_unreachable("constructor cannot have erased isolation");
@@ -685,12 +675,9 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
   // Make sure we've hopped to the right global actor, if any.
   if (ctor->hasAsync()) {
     auto isolation = getActorIsolation(ctor);
-    // if it's not injected by definite init, we do it in the prologue now.
-    if (!ctorHopsInjectedByDefiniteInit(ctor, isolation)) {
-      SILLocation prologueLoc(selfDecl);
-      prologueLoc.markAsPrologue();
-      emitConstructorPrologActorHop(prologueLoc, isolation);
-    }
+    SILLocation prologueLoc(selfDecl);
+    prologueLoc.markAsPrologue();
+    emitConstructorPrologActorHop(prologueLoc, isolation);
   }
 
   // Create a basic block to jump to for the implicit 'self' return.
@@ -754,8 +741,6 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
     // lifetime checker doesn't seem to process trivial locations. But empty
     // move only structs are non-trivial, so we need to handle this here.
     if (nominal->getAttrs().hasAttribute<RawLayoutAttr>()) {
-      auto *module = ctor->getParentModule();
-
       // Raw memory is not directly decomposable, but we still want to mark
       // it as initialized. Use a zero initializer.
       auto &C = ctor->getASTContext();
@@ -765,7 +750,7 @@ void SILGenFunction::emitValueConstructor(ConstructorDecl *ctor) {
                       SubstitutionMap::get(zeroInit->getInnermostDeclContext()
                                                ->getGenericSignatureOfContext(),
                                            {selfDecl->getTypeInContext()},
-                                           LookUpConformanceInModule(module)),
+                                           LookUpConformanceInModule()),
                       selfLV.getLValueAddress());
     } else if (isa<StructDecl>(nominal)
                && lowering.getLoweredType().isMoveOnly()
@@ -1151,12 +1136,9 @@ void SILGenFunction::emitClassConstructorInitializer(ConstructorDecl *ctor) {
   // Make sure we've hopped to the right global actor, if any.
   if (ctor->hasAsync()) {
     auto isolation = getActorIsolation(ctor);
-    // if it's not injected by definite init, we do it in the prologue now.
-    if (!ctorHopsInjectedByDefiniteInit(ctor, isolation)) {
-      SILLocation prologueLoc(selfDecl);
-      prologueLoc.markAsPrologue();
-      emitConstructorPrologActorHop(prologueLoc, isolation);
-    }
+    SILLocation prologueLoc(selfDecl);
+    prologueLoc.markAsPrologue();
+    emitConstructorPrologActorHop(prologueLoc, isolation);
   }
 
   if (!NeedsBoxForSelf) {

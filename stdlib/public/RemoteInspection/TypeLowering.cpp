@@ -251,7 +251,7 @@ BuiltinTypeInfo::BuiltinTypeInfo(unsigned Size, unsigned Alignment,
 
 // Builtin.Int<N> is mangled as 'Bi' N '_'
 // Returns 0 if this isn't an Int
-static unsigned isIntType(std::string name) {
+static unsigned intTypeBitSize(std::string name) {
   llvm::StringRef nameRef(name);
   if (nameRef.starts_with("Bi") && nameRef.ends_with("_")) {
     llvm::StringRef naturalRef = nameRef.drop_front(2).drop_back();
@@ -272,8 +272,22 @@ bool BuiltinTypeInfo::readExtraInhabitantIndex(
     *extraInhabitantIndex = -1;
     return true;
   }
-  unsigned intSize = isIntType(Name);
-  if (intSize > 0 && intSize < 64 && getSize() <= 8 && intSize < getSize() * 8) {
+  // If it has extra inhabitants, it could be an integer type with extra
+  // inhabitants (such as a bool) or a pointer.
+  unsigned intSize = intTypeBitSize(Name);
+  if (intSize > 0) {
+    // This is an integer type
+
+    // If extra inhabitants are impossible, return early...
+    // (assert in debug builds)
+    assert(intSize < getSize() * 8
+	   && "Standard-sized int cannot have extra inhabitants");
+    if (intSize > 64 || getSize() > 8 || intSize >= getSize() * 8) {
+      *extraInhabitantIndex = -1;
+      return true;
+    }
+
+    // Compute range of extra inhabitants
     uint64_t maxValidValue =  (((uint64_t)1) << intSize) - 1;
     uint64_t maxAvailableValue = (((uint64_t)1) << (getSize() * 8)) - 1;
     uint64_t computedExtraInhabitants = maxAvailableValue - maxValidValue;
@@ -281,14 +295,13 @@ bool BuiltinTypeInfo::readExtraInhabitantIndex(
       computedExtraInhabitants = ValueWitnessFlags::MaxNumExtraInhabitants;
     }
     assert(getNumExtraInhabitants() == computedExtraInhabitants &&
-           "Unexpected number of extra inhabitants in an odd-sized integer");
-
-    uint64_t rawValue;
-    if (!reader.readInteger(address, getSize(), &rawValue))
-      return false;
+	   "Unexpected number of extra inhabitants in an odd-sized integer");
 
     // Example:  maxValidValue is 1 for a 1-bit bool, so any larger value
     // is an extra inhabitant.
+    uint64_t rawValue;
+    if (!reader.readInteger(address, getSize(), &rawValue))
+      return false;
     if (maxValidValue < rawValue) {
       *extraInhabitantIndex = rawValue - maxValidValue - 1;
     } else {
@@ -307,15 +320,14 @@ bool BuiltinTypeInfo::readExtraInhabitantIndex(
 }
 
 BitMask BuiltinTypeInfo::getSpareBits(TypeConverter &TC, bool &hasAddrOnly) const {
-  unsigned intSize = isIntType(Name);
+  unsigned intSize = intTypeBitSize(Name);
   if (intSize > 0) {
     // Odd-sized integers export spare bits
     // In particular: bool fields are Int1 and export 7 spare bits
     auto mask = BitMask::oneMask(getSize());
     mask.keepOnlyMostSignificantBits(getSize() * 8 - intSize);
     return mask;
-  } else if (
-    Name == "yyXf" // 'yyXf' =  @thin () -> Void function
+  } else if (Name == "ypXp" // Any.Type
   ) {
     // Builtin types that expose pointer spare bits
     auto mpePointerSpareBits = TC.getBuilder().getMultiPayloadEnumPointerMask();
@@ -399,15 +411,22 @@ bool RecordTypeInfo::readExtraInhabitantIndex(remote::MemoryReader &reader,
 }
 
 BitMask RecordTypeInfo::getSpareBits(TypeConverter &TC, bool &hasAddrOnly) const {
+  // Start with all spare bits; we'll mask them out as we go...
   auto mask = BitMask::oneMask(getSize());
   switch (SubKind) {
   case RecordKind::Invalid:
-    return mask;    // FIXME: Should invalid have all spare bits?  Or none?  Does it matter?
+    // FIXME: Should invalid have all spare bits?  Or none?  Does it matter?
+    return mask;
   case RecordKind::Tuple:
   case RecordKind::Struct:
+    // Regular aggregates inherit spare bits from their fields
     break;
   case RecordKind::ThickFunction:
-    break;
+    // Thick functions have two fields:
+    // * Code pointer that might be signed and/or misaligned
+    // * Context that could be a tagged pointer
+    mask.makeZero(); // No spare bits
+    return mask;
   case RecordKind::OpaqueExistential: {
     // Existential storage isn't recorded as a field,
     // so we handle it specially here...
@@ -415,12 +434,31 @@ BitMask RecordTypeInfo::getSpareBits(TypeConverter &TC, bool &hasAddrOnly) const
     BitMask submask = BitMask::zeroMask(pointerSize * 3);
     mask.andMask(submask, 0);
     hasAddrOnly = true;
+    // Mask the rest of the fields as usual...
     break;
   }
-  case RecordKind::ClassExistential:
-    break;
-  case RecordKind::ExistentialMetatype:
-    break; // Field 0 is metadata pointer, a Builtin of type 'yyXf'
+  case RecordKind::ClassExistential: {
+    // First pointer in a Class Existential is the class pointer
+    // itself, which can be tagged or have other mysteries on 64-bit, so
+    // it exposes no spare bits from the first word there...
+    auto pointerBytes = TC.targetPointerSize();
+    if (pointerBytes == 8) {
+      auto zeroPointerSizedMask = BitMask::zeroMask(pointerBytes);
+      mask.andMask(zeroPointerSizedMask, 0);
+    }
+    // Otherwise, it's the same as an Existential Metatype
+    SWIFT_FALLTHROUGH;
+  }
+  case RecordKind::ExistentialMetatype: {
+    // All the pointers in an Existential Metatype expose spare bits...
+    auto pointerBytes = TC.targetPointerSize();
+    auto mpePointerSpareBits = TC.getBuilder().getMultiPayloadEnumPointerMask();
+    auto mpePointerSpareBitMask = BitMask(pointerBytes, mpePointerSpareBits);
+    for (int offset = 0; offset < (int)getSize(); offset += pointerBytes) {
+      mask.andMask(mpePointerSpareBitMask, offset);
+    }
+    return mask;
+  }
   case RecordKind::ErrorExistential:
     break;
   case RecordKind::ClassInstance:
@@ -578,7 +616,9 @@ public:
   }
 
   BitMask getSpareBits(TypeConverter &TC, bool &hasAddrOnly) const override {
-    return BitMask::zeroMask(getSize());
+    auto mask = BitMask(getSize(), maskForCount(getNumCases()));
+    mask.complement();
+    return mask;
   }
 
   bool projectEnumValue(remote::MemoryReader &reader,
@@ -648,7 +688,17 @@ public:
   }
 
   BitMask getSpareBits(TypeConverter &TC, bool &hasAddrOnly) const override {
-    return BitMask::zeroMask(getSize());
+    FieldInfo PayloadCase = getCases()[0];
+    size_t payloadSize = PayloadCase.TI.getSize();
+    if (getSize() <= payloadSize) {
+      return BitMask::zeroMask(getSize());
+    }
+    size_t tagSize = getSize() - payloadSize;
+    auto mask = BitMask::oneMask(getSize());
+    mask.keepOnlyMostSignificantBits(tagSize * 8); // Clear payload bits
+    auto tagMaskUsedBits = BitMask(getSize(), maskForCount(getNumCases()));
+    mask.andNotMask(tagMaskUsedBits, payloadSize); // Clear used tag bits
+    return mask;
   }
 
   // Think of a single-payload enum as being encoded in "pages".
@@ -1045,7 +1095,20 @@ public:
   BitMask getMultiPayloadTagBitsMask() const {
     auto payloadTagValues = NumEffectivePayloadCases - 1;
     if (getNumCases() > NumEffectivePayloadCases) {
-      payloadTagValues += 1;
+      // How many payload bits are there?
+      auto payloadBits = spareBitsMask;
+      payloadBits.complement(); // Non-spare bits are payload bits
+      auto numPayloadBits = payloadBits.countSetBits();
+
+      if (numPayloadBits >= 32) {
+	// Lots of payload bits!!  We only need one extra tag value
+	payloadTagValues += 1;
+      } else {
+	// We may need multiple tag values to cover all the non-payload cases
+	auto numNonPayloadCasesPerTag = 1ULL << numPayloadBits;
+	auto numNonPayloadCases = getNumCases() - NumEffectivePayloadCases;
+	payloadTagValues += (numNonPayloadCases + numNonPayloadCasesPerTag - 1) / numNonPayloadCasesPerTag;
+      }
     }
     int payloadTagBits = 0;
     while (payloadTagValues > 0) {
@@ -1551,6 +1614,12 @@ const TypeInfo *TypeConverter::getDefaultActorStorageTypeInfo() {
   return DefaultActorStorageTI;
 }
 
+const TypeInfo *TypeConverter::getRawUnsafeContinuationTypeInfo() {
+  // An UnsafeContinuation is (essentially) a strong pointer to heap data
+  return getReferenceTypeInfo(ReferenceKind::Strong,
+				 ReferenceCounting::Native);
+}
+
 const TypeInfo *TypeConverter::getEmptyTypeInfo() {
   if (EmptyTI != nullptr)
     return EmptyTI;
@@ -1961,6 +2030,15 @@ public:
     default: Kind = EnumKind::MultiPayloadEnum; break;
     }
 
+    // Sanity:  Ignore any enum that claims to have a size more than 1MiB
+    // This avoids allocating lots of memory for spare bit mask calculations
+    // when clients try to interpret random chunks of memory as type descriptions.
+    if (Size > (1024ULL * 1024)) {
+      unsigned Stride = ((Size + Alignment - 1) & ~(Alignment - 1));
+      return TC.makeTypeInfo<UnsupportedEnumTypeInfo>(
+	Size, Alignment, Stride, NumExtraInhabitants, BitwiseTakable, Kind, Cases);
+    }
+
     if (Cases.size() == 1) {
       if (EffectivePayloadCases == 0) {
         // Zero-sized enum with only one empty case
@@ -2046,11 +2124,10 @@ public:
     //
 
     // Do we have a fixed layout?
-    // TODO: Test whether a missing FixedDescriptor is actually relevant.
     auto FixedDescriptor = TC.getBuilder().getBuiltinTypeDescriptor(TR);
     if (!FixedDescriptor || GenericPayloadCases > 0) {
       // This is a "dynamic multi-payload enum".  For example,
-      // this occurs with:
+      // this occurs with generics such as:
       // ```
       // class ClassWithEnum<T> {
       //   enum E {
@@ -2060,6 +2137,12 @@ public:
       //   var e: E?
       // }
       // ```
+      // and when we have a resilient inner enum, such as:
+      // ```
+      // enum E2 {
+      //   case y(E1_resilient)
+      //   case z(Int)
+      // }
       auto tagCounts = getEnumTagCounts(Size, EffectiveNoPayloadCases,
                                         EffectivePayloadCases);
       Size += tagCounts.numTagBytes;
@@ -2091,7 +2174,6 @@ public:
     unsigned Stride = ((Size + Alignment - 1) & ~(Alignment - 1));
     if (Stride == 0)
       Stride = 1;
-    auto PayloadSize = EnumTypeInfo::getPayloadSizeForCases(Cases);
 
     // Compute the spare bit mask and determine if we have any address-only fields
     auto localSpareBitMask = BitMask::oneMask(Size);
@@ -2103,44 +2185,11 @@ public:
       }
     }
 
-    // See if we have MPE bit mask information from the compiler...
-    // TODO: drop this?
-
-    // Uncomment the following line to dump the MPE section every time we come through here...
-    //TC.getBuilder().dumpMultiPayloadEnumSection(std::cerr); // DEBUG helper
-
-    auto MPEDescriptor = TC.getBuilder().getMultiPayloadEnumDescriptor(TR);
-    if (MPEDescriptor && MPEDescriptor->usesPayloadSpareBits()) {
-      // We found compiler-provided spare bit data...
-      auto PayloadSpareBitMaskByteCount = MPEDescriptor->getPayloadSpareBitMaskByteCount();
-      auto PayloadSpareBitMaskByteOffset = MPEDescriptor->getPayloadSpareBitMaskByteOffset();
-      auto SpareBitMask = MPEDescriptor->getPayloadSpareBits();
-      BitMask compilerSpareBitMask(PayloadSize, SpareBitMask,
-                            PayloadSpareBitMaskByteCount, PayloadSpareBitMaskByteOffset);
-      
-      if (compilerSpareBitMask.isZero() || hasAddrOnly) {
-        // If there are no spare bits, use the "simple" tag-only implementation.
-        return TC.makeTypeInfo<TaggedMultiPayloadEnumTypeInfo>(
-          Size, Alignment, Stride, NumExtraInhabitants,
-          BitwiseTakable, Cases, EffectivePayloadCases);
-      }
-
-#if 0  // TODO: This should be !defined(NDEBUG)
-      // Verify that compiler provided and local spare bit info agree...
-      // TODO: If we could make this actually work, then we wouldn't need the
-      // bulky compiler-provided info, would we?
-      assert(localSpareBitMask == compilerSpareBitMask);
-#endif
-
-      // Use compiler-provided spare bit information
-      return TC.makeTypeInfo<MultiPayloadEnumTypeInfo>(
-        Size, Alignment, Stride, NumExtraInhabitants,
-        BitwiseTakable, Cases, compilerSpareBitMask,
-        EffectivePayloadCases);
-    }
-
     if (localSpareBitMask.isZero() || hasAddrOnly) {
-      // Simple case that does not use spare bits
+      // Simple tag-only layout does not use spare bits.
+      // Either:
+      // * There are no spare bits, or
+      // * We can't copy it to strip spare bits.
       return TC.makeTypeInfo<TaggedMultiPayloadEnumTypeInfo>(
         Size, Alignment, Stride, NumExtraInhabitants,
         BitwiseTakable, Cases, EffectivePayloadCases);
@@ -2158,6 +2207,34 @@ class LowerType
   : public TypeRefVisitor<LowerType, const TypeInfo *> {
   TypeConverter &TC;
   remote::TypeInfoProvider *ExternalTypeInfo;
+
+  const TypeInfo *CFRefTypeInfo(const TypeRef *TR) {
+    if (auto N = dyn_cast<NominalTypeRef>(TR)) {
+      Demangler Dem;
+      auto Node = N->getDemangling(Dem);
+      if (Node->getKind() == Node::Kind::Type && Node->getNumChildren() == 1) {
+	auto Alias = Node->getChild(0);
+	if (Alias->getKind() == Node::Kind::TypeAlias && Alias->getNumChildren() == 2) {
+	  auto Module = Alias->getChild(0);
+	  auto Name = Alias->getChild(1);
+	  if (Module->getKind() == Node::Kind::Module
+	      && Module->hasText()
+	      && Module->getText() == "__C"
+	      && Name->getKind() == Node::Kind::Identifier
+	      && Name->hasText()) {
+	    auto CName = Name->getText();
+	    // Heuristic: Hopefully good enough.
+	    if (CName.starts_with("CF") && CName.ends_with("Ref")) {
+	      // A CF reference is essentially the same as a Strong ObjC reference
+	      return TC.getReferenceTypeInfo(ReferenceKind::Strong,
+					     ReferenceCounting::Unknown);
+	    }
+	  }
+	}
+      }
+    }
+    return nullptr;
+  }
 
 public:
   using TypeRefVisitor<LowerType, const TypeInfo *>::visit;
@@ -2177,6 +2254,8 @@ public:
                                      ReferenceCounting::Unknown);
     } else if (B->getMangledName() == "BD") {
       return TC.getDefaultActorStorageTypeInfo();
+    } else if (B->getMangledName() == "Bc") {
+      return TC.getRawUnsafeContinuationTypeInfo();
     }
 
     /// Otherwise, get the fixed layout information from reflection
@@ -2225,6 +2304,11 @@ public:
         // If we still have no type info ask the external provider.
         if (auto External = QueryExternalTypeInfoProvider())
           return External;
+
+	// CoreFoundation types require some special handling
+	if (auto CFTypeInfo = CFRefTypeInfo(TR))
+	  return CFTypeInfo;
+
 
         // If the external provider also fails we're out of luck.
         DEBUG_LOG(fprintf(stderr, "No TypeInfo for nominal type: "); TR->dump());

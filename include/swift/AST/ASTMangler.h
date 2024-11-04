@@ -15,6 +15,7 @@
 
 #include "swift/AST/Decl.h"
 #include "swift/AST/FreestandingMacroExpansion.h"
+#include "swift/AST/SILThunkKind.h"
 #include "swift/AST/Types.h"
 #include "swift/Basic/Mangler.h"
 #include "swift/Basic/TaggedUnion.h"
@@ -33,6 +34,12 @@ class MacroExpansionExpr;
 class RootProtocolConformance;
 
 namespace Mangle {
+
+enum class DestructorKind {
+  NonDeallocating,
+  Deallocating,
+  IsolatedDeallocating
+};
 
 /// The mangler for AST declarations.
 class ASTMangler : public Mangler {
@@ -74,6 +81,22 @@ protected:
 
   /// If enabled, inverses will not be mangled into generic signatures.
   bool AllowInverses = true;
+
+  /// If enabled, @isolated(any) can be encoded in the mangled name.
+  /// Suppressing type attributes this way is generally questionable ---
+  /// for example, it does not interact properly with substitutions ---
+  /// and should only be done in situations where it is just going to be
+  /// interpreted as a type and the exact string value does not play
+  /// a critical role.
+  bool AllowIsolatedAny = true;
+
+  /// If enabled, typed throws can be encoded in the mangled name.
+  /// Suppressing type attributes this way is generally questionable ---
+  /// for example, it does not interact properly with substitutions ---
+  /// and should only be done in situations where it is just going to be
+  /// interpreted as a type and the exact string value does not play
+  /// a critical role.
+  bool AllowTypedThrows = true;
 
   /// If enabled, declarations annotated with @_originallyDefinedIn are mangled
   /// as if they're part of their original module. Disabled for debug mangling,
@@ -186,7 +209,7 @@ public:
                            SymbolKind SKind = SymbolKind::Default);
 
   std::string mangleDestructorEntity(const DestructorDecl *decl,
-                                     bool isDeallocating,
+                                     DestructorKind kind,
                                      SymbolKind SKind = SymbolKind::Default);
 
   std::string mangleConstructorEntity(const ConstructorDecl *ctor,
@@ -200,9 +223,6 @@ public:
                                    const AbstractStorageDecl *decl,
                                    bool isStatic,
                                    SymbolKind SKind);
-
-  std::string mangleGlobalGetterEntity(const ValueDecl *decl,
-                                       SymbolKind SKind = SymbolKind::Default);
 
   std::string mangleDefaultArgumentEntity(const DeclContext *func,
                                           unsigned index,
@@ -223,7 +243,7 @@ public:
                                            const ConstructorDecl *Derived,
                                            bool isAllocating);
 
-  std::string mangleWitnessTable(const RootProtocolConformance *C);
+  std::string mangleWitnessTable(const ProtocolConformance *C);
 
   std::string mangleWitnessThunk(const ProtocolConformance *Conformance,
                                  const ValueDecl *Requirement);
@@ -294,6 +314,9 @@ public:
   std::string mangleSILDifferentiabilityWitness(StringRef originalName,
                                                 DifferentiabilityKind kind,
                                                 const AutoDiffConfig &config);
+
+  std::string mangleSILThunkKind(StringRef originalName,
+                                 SILThunkKind thunkKind);
 
   /// Mangle the AutoDiff generated declaration for the given:
   /// - Generated declaration kind: linear map struct or branching trace enum.
@@ -445,7 +468,8 @@ protected:
   void appendRetroactiveConformances(SubstitutionMap subMap,
                                      GenericSignature sig);
   void appendImplFunctionType(SILFunctionType *fn, GenericSignature sig,
-                              const ValueDecl *forDecl = nullptr);
+                              const ValueDecl *forDecl = nullptr,
+                              bool isInRecursion = true);
   void appendOpaqueTypeArchetype(ArchetypeType *archetype,
                                  OpaqueTypeDecl *opaqueDecl,
                                  SubstitutionMap subs,
@@ -521,28 +545,33 @@ protected:
     FunctionMangling,
   };
 
-  void appendFunction(AnyFunctionType *fn, GenericSignature sig,
-                    FunctionManglingKind functionMangling = NoFunctionMangling,
-                    const ValueDecl *forDecl = nullptr);
+  void
+  appendFunction(AnyFunctionType *fn, GenericSignature sig,
+                 FunctionManglingKind functionMangling = NoFunctionMangling,
+                 const ValueDecl *forDecl = nullptr,
+                 bool isRecursedInto = true);
   void appendFunctionType(AnyFunctionType *fn, GenericSignature sig,
                           bool isAutoClosure = false,
-                          const ValueDecl *forDecl = nullptr);
+                          const ValueDecl *forDecl = nullptr,
+                          bool isRecursedInto = true);
   void appendClangType(AnyFunctionType *fn);
   template <typename FnType>
   void appendClangType(FnType *fn, llvm::raw_svector_ostream &os);
 
-  void appendFunctionSignature(AnyFunctionType *fn,
-                               GenericSignature sig,
+  void appendFunctionSignature(AnyFunctionType *fn, GenericSignature sig,
                                const ValueDecl *forDecl,
-                               FunctionManglingKind functionMangling);
+                               FunctionManglingKind functionMangling,
+                               bool isRecursedInto = true);
 
-  void appendFunctionInputType(ArrayRef<AnyFunctionType::Param> params,
-                               LifetimeDependenceInfo lifetimeDependenceInfo,
+  void appendFunctionInputType(AnyFunctionType *fnType,
+                               ArrayRef<AnyFunctionType::Param> params,
                                GenericSignature sig,
-                               const ValueDecl *forDecl = nullptr);
-  void appendFunctionResultType(Type resultType,
-                                GenericSignature sig,
-                                const ValueDecl *forDecl = nullptr);
+                               const ValueDecl *forDecl = nullptr,
+                               bool isRecursedInto = true);
+  void appendFunctionResultType(
+      Type resultType, GenericSignature sig,
+      std::optional<LifetimeDependenceInfo> lifetimeDependence,
+      const ValueDecl *forDecl = nullptr);
 
   void appendTypeList(Type listTy, GenericSignature sig,
                       const ValueDecl *forDecl = nullptr);
@@ -552,7 +581,7 @@ protected:
                              const ValueDecl *forDecl = nullptr);
   void appendParameterTypeListElement(
       Identifier name, Type elementType, ParameterTypeFlags flags,
-      std::optional<LifetimeDependenceKind> lifetimeDependenceKind,
+      std::optional<LifetimeDependenceInfo> lifetimeDependence,
       GenericSignature sig, const ValueDecl *forDecl = nullptr);
   void appendTupleTypeListElement(Identifier name, Type elementType,
                                   GenericSignature sig,
@@ -655,7 +684,7 @@ protected:
   
   void appendClosureEntity(const AbstractClosureExpr *closure);
 
-  void appendClosureComponents(Type Ty, unsigned discriminator, bool isImplicit,
+  void appendClosureComponents(CanType Ty, unsigned discriminator, bool isImplicit,
                                const DeclContext *parentContext,
                                ArrayRef<GenericEnvironment *> capturedEnvs);
 
@@ -678,8 +707,8 @@ protected:
   bool tryAppendStandardSubstitution(const GenericTypeDecl *type);
 
   void appendConstructorEntity(const ConstructorDecl *ctor, bool isAllocating);
-  
-  void appendDestructorEntity(const DestructorDecl *decl, bool isDeallocating);
+
+  void appendDestructorEntity(const DestructorDecl *decl, DestructorKind kind);
 
   /// \param accessorKindCode The code to describe the accessor and addressor
   /// kind. Usually retrieved using getCodeForAccessorKind.
@@ -728,8 +757,7 @@ protected:
   void appendConstrainedExistential(Type base, GenericSignature sig,
                                     const ValueDecl *forDecl);
 
-  void appendLifetimeDependenceKind(LifetimeDependenceKind kind,
-                                    bool isSelfDependence);
+  void appendLifetimeDependence(LifetimeDependenceInfo info);
 };
 
 } // end namespace Mangle

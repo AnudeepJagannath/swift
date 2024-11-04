@@ -28,6 +28,8 @@
 #include "swift/SIL/SILDeclRef.h"
 #include "swift/SIL/SILLinkage.h"
 #include "swift/SIL/SILPrintContext.h"
+#include "swift/SIL/SILUndef.h"
+#include "llvm/ADT/MapVector.h"
 
 namespace swift {
 
@@ -54,7 +56,8 @@ enum IsThunk_t {
   IsNotThunk,
   IsThunk,
   IsReabstractionThunk,
-  IsSignatureOptimizedThunk
+  IsSignatureOptimizedThunk,
+  IsBackDeployedThunk,
 };
 enum IsDynamicallyReplaceable_t {
   IsNotDynamic,
@@ -103,13 +106,11 @@ public:
   static GenericSignature buildTypeErasedSignature(
       GenericSignature sig, ArrayRef<Type> typeErasedParams);
 
-  static SILSpecializeAttr *create(SILModule &M,
-                                   GenericSignature specializedSignature,
-                                   ArrayRef<Type> typeErasedParams,
-                                   bool exported, SpecializationKind kind,
-                                   SILFunction *target, Identifier spiGroup,
-                                   const ModuleDecl *spiModule,
-                                   AvailabilityContext availability);
+  static SILSpecializeAttr *
+  create(SILModule &M, GenericSignature specializedSignature,
+         ArrayRef<Type> typeErasedParams, bool exported,
+         SpecializationKind kind, SILFunction *target, Identifier spiGroup,
+         const ModuleDecl *spiModule, AvailabilityRange availability);
 
   bool isExported() const {
     return exported;
@@ -155,7 +156,7 @@ public:
     return spiModule;
   }
 
-  AvailabilityContext getAvailability() const {
+  AvailabilityRange getAvailability() const {
     return availability;
   }
 
@@ -168,7 +169,7 @@ private:
   GenericSignature unerasedSpecializedSignature;
   llvm::SmallVector<Type, 2> typeErasedParams;
   Identifier spiGroup;
-  AvailabilityContext availability;
+  AvailabilityRange availability;
   const ModuleDecl *spiModule = nullptr;
   SILFunction *F = nullptr;
   SILFunction *targetFunction = nullptr;
@@ -179,7 +180,7 @@ private:
                     ArrayRef<Type> typeErasedParams,
                     SILFunction *target, Identifier spiGroup,
                     const ModuleDecl *spiModule,
-                    AvailabilityContext availability);
+                    AvailabilityRange availability);
 };
 
 /// SILFunction - A function body that has been lowered to SIL. This consists of
@@ -331,18 +332,14 @@ private:
 
   /// The availability used to determine if declarations of this function
   /// should use weak linking.
-  AvailabilityContext Availability;
+  AvailabilityRange Availability;
 
   Purpose specialPurpose = Purpose::None;
 
   PerformanceConstraints perfConstraints = PerformanceConstraints::None;
 
-  /// This is the set of undef values we've created, for uniquing purposes.
-  ///
-  /// We use a SmallDenseMap since in most functions, we will have only one type
-  /// of undef if we have any at all. In that case, by staying small we avoid
-  /// needing a heap allocation.
-  llvm::SmallDenseMap<SILType, SILUndef *, 1> undefValues;
+  /// The undefs of each type in the function.
+  llvm::SmallMapVector<SILType, SILUndef *, 1> undefValues;
 
   /// This is the number of uses of this SILFunction inside the SIL.
   /// It does not include references from debug scopes.
@@ -354,7 +351,7 @@ private:
   unsigned BlockListChangeIdx = 0;
 
   /// The isolation of this function.
-  ActorIsolation actorIsolation = ActorIsolation::forUnspecified();
+  std::optional<ActorIsolation> actorIsolation;
 
   /// The function's bare attribute. Bare means that the function is SIL-only
   /// and does not require debug info.
@@ -370,7 +367,7 @@ private:
   ///
   /// The inliner uses this information to avoid inlining (non-trivial)
   /// functions into the thunk.
-  unsigned Thunk : 2;
+  unsigned Thunk : 3;
 
   /// The scope in which the parent class can be subclassed, if this is a method
   /// which is contained in the vtable of that class.
@@ -464,8 +461,6 @@ private:
   /// lifetime-dependence on an argument.
   unsigned HasUnsafeNonEscapableResult : 1;
 
-  unsigned HasResultDependsOnSelf : 1;
-
   /// True, if this function or a caller (transitively) has a performance
   /// constraint.
   /// If true, optimizations must not introduce new runtime calls or metadata
@@ -490,6 +485,7 @@ private:
       break;
     case IsThunk:
     case IsReabstractionThunk:
+    case IsBackDeployedThunk:
       thunkCanHaveSubclassScope = false;
       break;
     }
@@ -758,11 +754,6 @@ public:
     HasUnsafeNonEscapableResult = value;
   }
 
-  bool hasResultDependsOnSelf() const { return HasResultDependsOnSelf; }
-
-  void setHasResultDependsOnSelf(bool flag = true) {
-    HasResultDependsOnSelf = flag;
-  }
   /// Returns true if this is a reabstraction thunk of escaping function type
   /// whose single argument is a potentially non-escaping closure. i.e. the
   /// thunks' function argument may itself have @inout_aliasable parameters.
@@ -820,7 +811,7 @@ public:
   // callee.
   bool hasOwnedParameters() const {
     for (auto &ParamInfo : getLoweredFunctionType()->getParameters()) {
-      if (ParamInfo.isConsumed())
+      if (ParamInfo.isConsumedInCallee())
         return true;
     }
     return false;
@@ -874,10 +865,8 @@ public:
   void setLinkage(SILLinkage linkage) { Linkage = unsigned(linkage); }
 
 ///   Checks if this (callee) function body can be inlined into the caller
-///   by comparing their SerializedKind_t values.
+///   by comparing their `SerializedKind_t` values.
 ///
-///   If the \p assumeFragileCaller is true, the caller must be serialized,
-///   in which case the callee needs to be serialized also to be inlined.
 ///   If both callee and caller are `not_serialized`, the callee can be inlined
 ///   into the caller during SIL inlining passes even if it (and the caller)
 ///   might contain private symbols. If this callee is `serialized_for_pkg`,
@@ -894,21 +883,13 @@ public:
 ///  ```
 ///
 /// \p callerSerializedKind The caller's SerializedKind.
-/// \p assumeFragileCaller True if the call site of this function already
-///                        knows that the caller is serialized.
-  bool canBeInlinedIntoCaller(
-      std::optional<SerializedKind_t> callerSerializedKind = std::nullopt,
-      bool assumeFragileCaller = true) const;
+  bool canBeInlinedIntoCaller(SerializedKind_t callerSerializedKind) const;
 
   /// Returns true if this function can be referenced from a fragile function
   /// body.
   /// \p callerSerializedKind The caller's SerializedKind. Used to be passed to
   ///                         \c canBeInlinedIntoCaller.
-  /// \p assumeFragileCaller Default to true since this function must be called
-  //                         if the caller is [serialized].
-  bool hasValidLinkageForFragileRef(
-      std::optional<SerializedKind_t> callerSerializedKind = std::nullopt,
-      bool assumeFragileCaller = true) const;
+  bool hasValidLinkageForFragileRef(SerializedKind_t callerSerializedKind) const;
 
   /// Get's the effective linkage which is used to derive the llvm linkage.
   /// Usually this is the same as getLinkage(), except in one case: if this
@@ -945,11 +926,11 @@ public:
 
   /// Returns the availability context used to determine if the function's
   /// symbol should be weakly referenced across module boundaries.
-  AvailabilityContext getAvailabilityForLinkage() const {
+  AvailabilityRange getAvailabilityForLinkage() const {
     return Availability;
   }
 
-  void setAvailabilityForLinkage(AvailabilityContext availability) {
+  void setAvailabilityForLinkage(AvailabilityRange availability) {
     Availability = availability;
   }
 
@@ -1165,11 +1146,9 @@ public:
   bool isSerialized() const {
     return SerializedKind_t(SerializedKind) == IsSerialized;
   }
-  bool isSerializedForPackage() const {
-    return SerializedKind_t(SerializedKind) == IsSerializedForPackage;
-  }
-  bool isNotSerialized() const {
-    return SerializedKind_t(SerializedKind) == IsNotSerialized;
+  bool isAnySerialized() const {
+    return SerializedKind_t(SerializedKind) == IsSerialized ||
+           SerializedKind_t(SerializedKind) == IsSerializedForPackage;
   }
 
   /// Get this function's serialized attribute.
@@ -1472,7 +1451,9 @@ public:
     actorIsolation = newActorIsolation;
   }
 
-  ActorIsolation getActorIsolation() const { return actorIsolation; }
+  std::optional<ActorIsolation> getActorIsolation() const {
+    return actorIsolation;
+  }
 
   /// Return the source file that this SILFunction belongs to if it exists.
   SourceFile *getSourceFile() const;
@@ -1654,6 +1635,10 @@ public:
   Lifetime getLifetime(VarDecl *decl, SILType ty) {
     return ty.getLifetime(*this).getLifetimeForAnnotatedValue(
         decl->getLifetimeAnnotation());
+  }
+
+  ArrayRef<std::pair<SILType, SILUndef *>> getUndefValues() {
+    return {undefValues.begin(), undefValues.end()};
   }
 
   /// verify - Run the SIL verifier to make sure that the SILFunction follows

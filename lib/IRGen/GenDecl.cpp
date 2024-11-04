@@ -22,11 +22,13 @@
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/IRGenOptions.h"
 #include "swift/AST/Module.h"
+#include "swift/AST/ModuleDependencies.h"
 #include "swift/AST/NameLookup.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeMemberVisitor.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/ClangImporter/ClangModule.h"
 #include "swift/Demangling/ManglingMacros.h"
 #include "swift/IRGen/Linking.h"
@@ -474,103 +476,6 @@ void IRGenModule::emitSourceFile(SourceFile &SF) {
     emitGlobalDecl(localDecl);
   for (auto *opaqueDecl : SF.getOpaqueReturnTypeDecls())
     maybeEmitOpaqueTypeDecl(opaqueDecl);
-
-  SF.collectLinkLibraries([this](LinkLibrary linkLib) {
-    this->addLinkLibrary(linkLib);
-  });
-
-  if (ObjCInterop)
-    this->addLinkLibrary(LinkLibrary("objc", LibraryKind::Library));
-
-  // If C++ interop is enabled, add -lc++ on Darwin and -lstdc++ on linux.
-  // Also link with C++ bridging utility module (Cxx) and C++ stdlib overlay
-  // (std) if available.
-  if (Context.LangOpts.EnableCXXInterop) {
-    const llvm::Triple &target = Context.LangOpts.Target;
-    if (target.isOSDarwin())
-      this->addLinkLibrary(LinkLibrary("c++", LibraryKind::Library));
-    else if (target.isOSLinux())
-      this->addLinkLibrary(LinkLibrary("stdc++", LibraryKind::Library));
-
-    // Do not try to link Cxx with itself.
-    if (!getSwiftModule()->getName().is("Cxx")) {
-      bool isStatic = false;
-      if (const auto *M = Context.getModuleByName("Cxx"))
-        isStatic = M->isStaticLibrary();
-      this->addLinkLibrary(LinkLibrary(target.isOSWindows() && isStatic
-                                          ? "libswiftCxx"
-                                          : "swiftCxx",
-                                       LibraryKind::Library));
-    }
-
-    // Do not try to link CxxStdlib with the C++ standard library, Cxx or
-    // itself.
-    if (llvm::none_of(llvm::ArrayRef{"Cxx", "CxxStdlib", "std"},
-                      [M = getSwiftModule()->getName().str()](StringRef Name) {
-                        return M == Name;
-                      })) {
-      // Only link with CxxStdlib on platforms where the overlay is available.
-      switch (target.getOS()) {
-      case llvm::Triple::Linux:
-        if (!target.isAndroid())
-          this->addLinkLibrary(LinkLibrary("swiftCxxStdlib",
-                                           LibraryKind::Library));
-        break;
-      case llvm::Triple::Win32: {
-        bool isStatic = Context.getModuleByName("CxxStdlib")->isStaticLibrary();
-        this->addLinkLibrary(
-            LinkLibrary(isStatic ? "libswiftCxxStdlib" : "swiftCxxStdlib",
-                        LibraryKind::Library));
-        break;
-      }
-      default:
-        if (target.isOSDarwin())
-          this->addLinkLibrary(LinkLibrary("swiftCxxStdlib",
-                                           LibraryKind::Library));
-        break;
-      }
-    }
-  }
-
-  // FIXME: It'd be better to have the driver invocation or build system that
-  // executes the linker introduce these compatibility libraries, since at
-  // that point we know whether we're building an executable, which is the only
-  // place where the compatibility libraries take effect. For the benefit of
-  // build systems that build Swift code, but don't use Swift to drive
-  // the linker, we can also use autolinking to pull in the compatibility
-  // libraries. This may however cause the library to get pulled in in
-  // situations where it isn't useful, such as for dylibs, though this is
-  // harmless aside from code size.
-  if (!IRGen.Opts.UseJIT && !Context.LangOpts.hasFeature(Feature::Embedded)) {
-    auto addBackDeployLib = [&](llvm::VersionTuple version,
-                                StringRef libraryName, bool forceLoad) {
-      std::optional<llvm::VersionTuple> compatibilityVersion;
-      if (libraryName == "swiftCompatibilityDynamicReplacements") {
-        compatibilityVersion = IRGen.Opts.
-            AutolinkRuntimeCompatibilityDynamicReplacementLibraryVersion;
-      } else if (libraryName == "swiftCompatibilityConcurrency") {
-        compatibilityVersion =
-            IRGen.Opts.AutolinkRuntimeCompatibilityConcurrencyLibraryVersion;
-      } else {
-        compatibilityVersion = IRGen.Opts.
-            AutolinkRuntimeCompatibilityLibraryVersion;
-      }
-
-      if (!compatibilityVersion)
-        return;
-
-      if (*compatibilityVersion > version)
-        return;
-
-      this->addLinkLibrary(LinkLibrary(libraryName,
-                                       LibraryKind::Library,
-                                       forceLoad));
-    };
-
-#define BACK_DEPLOYMENT_LIB(Version, Filter, LibraryName, ForceLoad) \
-      addBackDeployLib(llvm::VersionTuple Version, LibraryName, ForceLoad);
-    #include "swift/Frontend/BackDeploymentLibs.def"
-  }
 }
 
 /// Emit all the top-level code in the synthesized file unit.
@@ -1172,9 +1077,9 @@ void IRGenModule::emitGlobalLists() {
     if (IRGen.Opts.EmitGenericRODatas) {
       emitGlobalList(
           *this, GenericRODatas, "generic_ro_datas",
-          GetObjCSectionName("__swift_rodatas", "regular"),
+          GetObjCSectionName("__objc_clsrolist", "regular"),
           llvm::GlobalValue::InternalLinkage, Int8PtrTy, /*isConstant*/ false,
-          /*asContiguousArray*/ true, /*canBeStrippedByLinker*/ true);
+          /*asContiguousArray*/ true, /*canBeStrippedByLinker*/ false);
     }
 
     // Objective-C class references go in a variable with a meaningless
@@ -1237,8 +1142,9 @@ void IRGenModule::emitGlobalLists() {
 // Eagerly emit functions that are externally visible. Functions that are
 // dynamic replacements must also be eagerly emitted.
 static bool isLazilyEmittedFunction(SILFunction &f, SILModule &m) {
-  // Embedded Swift only emits specialized function, so don't emit generic
-  // functions, even if they're externally visible.
+  // Embedded Swift only emits specialized function (except when they are
+  // protocol witness methods). So don't emit generic functions, even if they're
+  // externally visible.
   if (f.getASTContext().LangOpts.hasFeature(Feature::Embedded) &&
       f.getLoweredFunctionType()->getSubstGenericSignature()) {
     return true;
@@ -1427,9 +1333,8 @@ void IRGenerator::emitLazyDefinitions() {
     assert(LazyFieldDescriptors.empty());
     // LazyFunctionDefinitions are allowed, but they must not be generic
     for (SILFunction *f : LazyFunctionDefinitions) {
-      assert(!f->isGeneric());
+      ASSERT(hasValidSignatureForEmbedded(f));
     }
-    assert(LazyWitnessTables.empty());
     assert(LazyCanonicalSpecializedMetadataAccessors.empty());
     assert(LazyMetadataAccessors.empty());
     // LazyClassMetadata is allowed
@@ -1577,7 +1482,7 @@ void IRGenerator::addLazyFunction(SILFunction *f) {
 
   // Embedded Swift doesn't expect any generic functions to be referenced.
   if (SIL.getASTContext().LangOpts.hasFeature(Feature::Embedded)) {
-    assert(!f->isGeneric());
+    ASSERT(hasValidSignatureForEmbedded(f));
   }
 
   assert(!FinishedEmittingLazyDefinitions);
@@ -2663,7 +2568,6 @@ void IRGenModule::emitGlobalDecl(Decl *D) {
   case DeclKind::TypeAlias:
   case DeclKind::GenericTypeParam:
   case DeclKind::AssociatedType:
-  case DeclKind::IfConfig: 
   case DeclKind::PoundDiagnostic:
   case DeclKind::Macro:
     return;
@@ -3209,7 +3113,7 @@ void IRGenModule::createReplaceableProlog(IRGenFunction &IGF, SILFunction *f) {
     // Index of swiftasync context | ((index of swiftself) << 8).
     arguments.push_back(IGM.getInt32(paramAttributeFlags));
     arguments.push_back(currentResumeFn);
-    auto resumeProjFn = IGF.getOrCreateResumePrjFn(true /*forProlog*/);
+    auto resumeProjFn = IGF.getOrCreateResumePrjFn();
     arguments.push_back(
         Builder.CreateBitOrPointerCast(resumeProjFn, IGM.Int8PtrTy));
     auto dispatchFn = IGF.createAsyncDispatchFn(
@@ -3566,6 +3470,24 @@ llvm::CallBase *swift::irgen::emitCXXConstructorCall(
                                       invokeNormalDest, invokeUnwindDest);
   });
   return result;
+}
+
+// For a SILFunction to be legal in Embedded Swift, it must be either
+// - non-generic
+// - generic with parameters thar are either
+//     - fully specialized (concrete)
+//     - a class-bound archetype (class-bound existential)
+bool swift::irgen::hasValidSignatureForEmbedded(SILFunction *f) {
+  auto s = f->getLoweredFunctionType()->getInvocationGenericSignature();
+  for (auto genParam : s.getGenericParams()) {
+    auto mappedParam = f->getGenericEnvironment()->mapTypeIntoContext(genParam);
+    if (auto archeTy = dyn_cast<ArchetypeType>(mappedParam)) {
+      if (archeTy->requiresClass())
+        continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 StackProtectorMode IRGenModule::shouldEmitStackProtector(SILFunction *f) {
@@ -4447,7 +4369,10 @@ static bool conformanceIsVisibleViaMetadata(
 
 
 void IRGenModule::addProtocolConformance(ConformanceDescription &&record) {
-
+  if (Context.LangOpts.hasFeature(Feature::Embedded)) {
+    return;
+  }
+    
   emitProtocolConformance(record);
 
   if (conformanceIsVisibleViaMetadata(record.conformance)) {
@@ -5801,7 +5726,6 @@ void IRGenModule::emitNestedTypeDecls(DeclRange members) {
     case DeclKind::Missing:
       llvm_unreachable("missing decl in IRGen");
 
-    case DeclKind::IfConfig:
     case DeclKind::PoundDiagnostic:
     case DeclKind::Macro:
       continue;
@@ -6183,7 +6107,7 @@ IRGenModule::getAddrOfWitnessTableLazyCacheVariable(
 ///
 /// This can only be used with non-dependent conformances.
 llvm::Constant*
-IRGenModule::getAddrOfWitnessTable(const RootProtocolConformance *conf,
+IRGenModule::getAddrOfWitnessTable(const ProtocolConformance *conf,
                                    ConstantInit definition) {
   IRGen.addLazyWitnessTable(conf);
 
@@ -6258,6 +6182,7 @@ IRGenModule::getAddrOfContinuationPrototype(CanSILFunctionType fnType) {
   llvm::Function *&entry = GlobalFuncs[entity];
   if (entry) return entry;
 
+  GenericContextScope scope(*this, fnType->getInvocationGenericSignature());
   auto signature = Signature::forCoroutineContinuation(*this, fnType);
   LinkInfo link = LinkInfo::get(*this, entity, NotForDefinition);
   entry = createFunction(*this, link, signature);
@@ -6352,4 +6277,63 @@ void IRGenModule::setColocateMetadataSection(llvm::Function *f) {
   case llvm::Triple::COFF:
     break;
   }
+}
+
+llvm::Function *IRGenModule::getOrCreateProfilingThunk(
+  llvm::Function *f,
+  StringRef prefix) {
+
+  llvm::SmallString<32> name;
+  {
+    llvm::raw_svector_ostream os(name);
+    os << prefix;
+    os << f->getName();
+  }
+
+  auto thunk = cast<llvm::Function>(
+    getOrCreateHelperFunction(name, f->getReturnType(),
+                              f->getFunctionType()->params(),
+    [&](IRGenFunction &IGF) {
+      Explosion args = IGF.collectParameters();
+      auto res = IGF.Builder.CreateCall(f->getFunctionType(), f, args.getAll());
+      res->setAttributes(f->getAttributes());
+      (void)args.claimAll();
+      if (res->getType()->isVoidTy()) {
+        IGF.Builder.CreateRetVoid();
+      } else {
+        IGF.Builder.CreateRet(res);
+      }
+    }, /*isNoInline*/ true));
+
+  thunk->setAttributes(f->getAttributes());
+  thunk->setCallingConv(f->getCallingConv());
+  thunk->setDLLStorageClass(f->getDLLStorageClass());
+  if (f->getComdat())
+    thunk->setComdat(f->getParent()->getOrInsertComdat(thunk->getName()));
+  setMustHaveFramePointer(thunk);
+  thunk->addFnAttr(llvm::Attribute::NoInline);
+
+  return cast<llvm::Function>(thunk);
+}
+
+llvm::Function*
+IRGenModule::getAddrOfWitnessTableProfilingThunk(
+  llvm::Function *witness,
+  const NormalProtocolConformance &conformance) {
+
+  assert(
+    conformance.getDeclContext()->getSelfNominalTypeDecl()->isGenericContext());
+
+  return getOrCreateProfilingThunk(witness,
+                            "__swift_prof_thunk__generic_witness__");
+}
+
+llvm::Function *
+IRGenModule::getAddrOfVTableProfilingThunk(
+  llvm::Function *vTableFun, ClassDecl *classDecl) {
+
+  assert(classDecl->getSelfNominalTypeDecl()->isGenericContext());
+
+  return getOrCreateProfilingThunk(vTableFun,
+                            "__swift_prof_thunk__generic_vtable__");
 }

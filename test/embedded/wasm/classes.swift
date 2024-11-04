@@ -7,6 +7,8 @@
 // RUN: %target-run %t/check.wasm
 // REQUIRES: executable_test
 // REQUIRES: CPU=wasm32
+// REQUIRES: embedded_stdlib_cross_compiling
+// REQUIRES: swift_feature_Embedded
 
 //--- rt.c
 
@@ -15,6 +17,9 @@
 
 int putchar(int c) { return c; }
 void free(void *ptr) {}
+void *memmove(void *dest, const void *src, size_t n) {
+    return __builtin_memmove(dest, src, n);
+}
 
 int posix_memalign(void **memptr, size_t alignment, size_t size) {
     uintptr_t mem = __builtin_wasm_memory_grow(0, (size + 0xffff) / 0x10000);

@@ -82,6 +82,8 @@ func missingControllingExprInIf() {
   if { // expected-error {{missing condition in 'if' statement}}
   } // expected-error {{expected '{' after 'if' condition}}
   // expected-error@-2 {{cannot convert value of type 'Void' to expected condition type 'Bool'}}
+  // expected-error@-3 {{'if' may only be used as expression in return, throw, or as the source of an assignment}}
+  // expected-error@-4 {{'if' must have an unconditional 'else' to be used as expression}}
 
   if // expected-error {{missing condition in 'if' statement}}
   {
@@ -239,6 +241,7 @@ func missingControllingExprInSwitch() {
 
   switch { // expected-error {{expected expression in 'switch' statement}}
   } // expected-error {{expected '{' after 'switch' subject expression}}
+  // expected-error@-2 {{'switch' may only be used as expression in return, throw, or as the source of an assignment}}
 
   switch // expected-error {{expected expression in 'switch' statement}} expected-error {{'switch' statement body must have at least one 'case' or 'default' block}}
   {
@@ -759,7 +762,7 @@ let ￼tryx  = 123        // expected-error {{invalid character in source file}}
 
 
 // <rdar://problem/21369926> Malformed Swift Enums crash playground service
-enum Rank: Int {  // expected-error {{'Rank' declares raw type 'Int', but does not conform to RawRepresentable and conformance could not be synthesized}}
+enum Rank: Int {  // expected-error {{'Rank' declares raw type 'Int', but does not conform to RawRepresentable and conformance could not be synthesized}} expected-note {{add stubs for conformance}}
   case Ace = 1
   case Two = 2.1  // expected-error {{cannot convert value of type 'Double' to raw type 'Int'}}
 }

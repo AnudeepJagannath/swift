@@ -20,7 +20,7 @@ extension LoadInst : OnoneSimplifyable, SILCombineSimplifyable {
     if optimizeLoadFromStringLiteral(context) {
       return
     }
-    if optmizeLoadFromEmptyCollection(context) {
+    if optimizeLoadFromEmptyCollection(context) {
       return
     }
     if replaceLoadOfGlobalLet(context) {
@@ -85,7 +85,7 @@ extension LoadInst : OnoneSimplifyable, SILCombineSimplifyable {
 
   /// Loading `count` or `capacity` from the empty `Array`, `Set` or `Dictionary` singleton
   /// is replaced by a 0 literal.
-  private func optmizeLoadFromEmptyCollection(_ context: SimplifyContext) -> Bool {
+  private func optimizeLoadFromEmptyCollection(_ context: SimplifyContext) -> Bool {
     if self.isZeroLoadFromEmptyCollection() {
       let builder = Builder(before: self, context)
       let zeroLiteral = builder.createIntegerLiteral(0, type: type)
@@ -136,7 +136,7 @@ extension LoadInst : OnoneSimplifyable, SILCombineSimplifyable {
         }
       case let sea as StructElementAddrInst:
         let structType = sea.struct.type
-        if structType.nominal.name == "_SwiftArrayBodyStorage" {
+        if structType.nominal!.name == "_SwiftArrayBodyStorage" {
           guard let fields = structType.getNominalFields(in: parentFunction) else {
             return false
           }
@@ -154,7 +154,7 @@ extension LoadInst : OnoneSimplifyable, SILCombineSimplifyable {
         addr = sea.struct
       case let rea as RefElementAddrInst:
         let classType = rea.instance.type
-        switch classType.nominal.name {
+        switch classType.nominal!.name {
         case "__RawDictionaryStorage",
               "__RawSetStorage":
           // For Dictionary and Set we support "count" and "capacity".
@@ -281,7 +281,7 @@ private func transitivelyErase(load: LoadInst, _ context: SimplifyContext) {
 
 private extension Value {
   func canBeCopied(into function: Function, _ context: SimplifyContext) -> Bool {
-    if !function.isSerialized {
+    if !function.isAnySerialized {
       return true
     }
 
@@ -297,7 +297,7 @@ private extension Value {
 
     while let value = worklist.pop() {
       if let fri = value as? FunctionRefInst {
-        if !fri.referencedFunction.hasValidLinkageForFragileRef {
+        if !fri.referencedFunction.hasValidLinkageForFragileRef(function.serializedKind) {
           return false
         }
       }

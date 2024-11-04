@@ -50,6 +50,7 @@
 #include "swift/Basic/NullablePtr.h"
 #include "swift/Basic/OptionalEnum.h"
 #include "swift/Basic/Range.h"
+#include "swift/Basic/SwiftObjectHeader.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/TinyPtrVector.h"
 #include "llvm/Support/TrailingObjects.h"
@@ -64,7 +65,7 @@ namespace swift {
   enum class AccessSemantics : unsigned char;
   class AccessorDecl;
   class ApplyExpr;
-  class AvailabilityContext;
+  class AvailabilityRange;
   class GenericEnvironment;
   class ArchetypeType;
   class ASTContext;
@@ -108,6 +109,7 @@ namespace swift {
   class ProtocolType;
   struct RawComment;
   enum class ResilienceExpansion : unsigned;
+  class ReturnStmt;
   enum class EffectKind : uint8_t;
   enum class PolymorphicEffectKind : uint8_t;
   class TrailingWhereClause;
@@ -151,7 +153,6 @@ enum class DescriptiveDeclKind : uint8_t {
   Extension,
   EnumCase,
   TopLevelCode,
-  IfConfig,
   PoundDiagnostic,
   PatternBinding,
   Var,
@@ -349,7 +350,7 @@ enum class ArtificialMainKind : uint8_t {
 };
 
 /// Decl - Base class for all declarations in Swift.
-class alignas(1 << DeclAlignInBits) Decl : public ASTAllocated<Decl> {
+class alignas(1 << DeclAlignInBits) Decl : public ASTAllocated<Decl>, public SwiftObjectHeader {
 protected:
   // clang-format off
   //
@@ -357,7 +358,7 @@ protected:
   // for the inline bitfields.
   union { uint64_t OpaqueBits;
 
-  SWIFT_INLINE_BITFIELD_BASE(Decl, bitmax(NumDeclKindBits,8)+1+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD_BASE(Decl, bitmax(NumDeclKindBits,8)+1+1+1+1+1+1+1+1+1+1+1+1,
     Kind : bitmax(NumDeclKindBits,8),
 
     /// Whether this declaration is invalid.
@@ -372,10 +373,6 @@ protected:
     /// Use getClangNode() to retrieve the corresponding Clang AST.
     FromClang : 1,
 
-    /// Whether this declaration was added to the surrounding
-    /// DeclContext of an active #if config clause.
-    EscapedFromIfConfig : 1,
-
     /// Whether this declaration is syntactically scoped inside of
     /// a local context, but should behave like a top-level
     /// declaration for name lookup purposes. This is used by
@@ -388,7 +385,29 @@ protected:
     /// True if \c ObjCInterfaceAndImplementationRequest has been computed
     /// and did \em not find anything. This is the fast path where we can bail
     /// out without checking other caches or computing anything.
-    LacksObjCInterfaceOrImplementation : 1
+    LacksObjCInterfaceOrImplementation : 1,
+
+    /// True if we're in the common case where the ExpandMemberAttributeMacros
+    /// request returned an empty array.
+    NoMemberAttributeMacros : 1,
+
+    /// True if we're in the common case where the ExpandPeerMacroRequest
+    /// request returned an empty array.
+    NoPeerMacros : 1,
+
+    /// True if we're in the common case where the GlobalActorAttributeRequest
+    /// request returned a pair of null pointers.
+    NoGlobalActorAttribute : 1,
+
+    /// True if we're in the common case where the SPIGroupsRequest
+    /// request returned an empty array of identifiers.
+    NoSPIGroups : 1,
+
+    /// True if we have computed whether this declaration is unsafe.
+    IsUnsafeComputed : 1,
+
+    /// True if this declaration has been determined to be "unsafe".
+    IsUnsafe : 1
   );
 
   SWIFT_INLINE_BITFIELD_FULL(PatternBindingDecl, Decl, 1+1+2+16,
@@ -436,7 +455,7 @@ protected:
     IsStatic : 1
   );
 
-  SWIFT_INLINE_BITFIELD(VarDecl, AbstractStorageDecl, 2+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(VarDecl, AbstractStorageDecl, 2+1+1+1+1+1+1+1,
     /// Encodes whether this is a 'let' binding.
     Introducer : 2,
 
@@ -454,7 +473,13 @@ protected:
     IsPropertyWrapperBackingProperty : 1,
 
     /// Whether this is a lazily top-level global variable from the main file.
-    IsTopLevelGlobal : 1
+    IsTopLevelGlobal : 1,
+
+    /// Whether this variable has no attached property wrappers.
+    NoAttachedPropertyWrappers : 1,
+
+    /// Whether this variable has no property wrapper auxiliary variables.
+    NoPropertyWrapperAuxiliaryVariables : 1
   );
 
   SWIFT_INLINE_BITFIELD(ParamDecl, VarDecl, 1+2+NumDefaultArgumentKindBits,
@@ -504,7 +529,7 @@ protected:
 
     /// Whether this function is a distributed thunk for a distributed
     /// function or computed property.
-    DistributedThunk: 1
+    DistributedThunk : 1
   );
 
   SWIFT_INLINE_BITFIELD(FuncDecl, AbstractFunctionDecl,
@@ -563,12 +588,10 @@ protected:
 
   SWIFT_INLINE_BITFIELD_EMPTY(TypeDecl, ValueDecl);
 
-  SWIFT_INLINE_BITFIELD_FULL(GenericTypeParamDecl, TypeDecl, 16+16+1+1,
-    : NumPadBits,
-
+  SWIFT_INLINE_BITFIELD_FULL(GenericTypeParamDecl, TypeDecl, 16+16+3+1,
     Depth : 16,
     Index : 16,
-    ParameterPack : 1,
+    ParamKind : 3,
 
     /// Whether this generic parameter represents an opaque type.
     IsOpaqueType : 1
@@ -600,7 +623,7 @@ protected:
     IsComputingSemanticMembers : 1
   );
 
-  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1+1+8,
+  SWIFT_INLINE_BITFIELD_FULL(ProtocolDecl, NominalTypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+8,
     /// Whether the \c RequiresClass bit is valid.
     RequiresClassValid : 1,
 
@@ -624,8 +647,11 @@ protected:
     /// because they could not be imported from Objective-C).
     HasMissingRequirements : 1,
 
-    /// Whether we've computed the inherited protocols list yet.
+    /// Whether we've computed the InheritedProtocolsRequest.
     InheritedProtocolsValid : 1,
+
+    /// Whether we've computed the AllInheritedProtocolsRequest.
+    AllInheritedProtocolsValid : 1,
 
     /// Whether we have computed a requirement signature.
     HasRequirementSignature : 1,
@@ -697,7 +723,7 @@ protected:
     HasAnyUnavailableDuringLoweringValues : 1
   );
 
-  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ModuleDecl, TypeDecl, 1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+1+8,
     /// If the module is compiled as static library.
     StaticLibrary : 1,
 
@@ -755,10 +781,14 @@ protected:
     /// Whether this module has been built with C++ interoperability enabled.
     HasCxxInteroperability : 1,
 
-    /// Whether this module has been built with -experimental-allow-non-resilient-access.
+    /// Whether this module uses the platform default C++ stdlib, or an
+    /// overridden C++ stdlib.
+    CXXStdlibKind : 8,
+
+    /// Whether this module has been built with -allow-non-resilient-access.
     AllowNonResilientAccess : 1,
 
-    /// Whether this module has been built with -experimental-package-cmo.
+    /// Whether this module has been built with -package-cmo.
     SerializePackageEnabled : 1
   );
 
@@ -790,11 +820,6 @@ protected:
     HasLazyConformances : 1
   );
 
-  SWIFT_INLINE_BITFIELD(IfConfigDecl, Decl, 1,
-    /// Whether this decl is missing its closing '#endif'.
-    HadMissingEnd : 1
-  );
-
   SWIFT_INLINE_BITFIELD(PoundDiagnosticDecl, Decl, 1+1,
     /// `true` if the diagnostic is an error, `false` if it's a warning.
     IsError : 1,
@@ -824,6 +849,11 @@ protected:
   friend class MemberLookupTable;
   friend class DeclDeserializer;
   friend class RawCommentRequest;
+  friend class ExpandMemberAttributeMacros;
+  friend class ExpandPeerMacroRequest;
+  friend class GlobalActorAttributeRequest;
+  friend class SPIGroupsRequest;
+  friend class IsUnsafeRequest;
 
 private:
   llvm::PointerUnion<DeclContext *, ASTContext *> Context;
@@ -831,6 +861,8 @@ private:
   Decl(const Decl&) = delete;
   void operator=(const Decl&) = delete;
   SourceLoc getLocFromSource() const;
+
+  static SwiftMetatype getDeclMetatype(DeclKind kind);
 
   /// Returns the serialized locations of this declaration from the
   /// corresponding .swiftsourceinfo file. "Empty" (ie. \c BufferID of 0, an
@@ -842,18 +874,54 @@ private:
   /// Directly set the invalid bit
   void setInvalidBit();
 
+  bool hasNoMemberAttributeMacros() const {
+    return Bits.Decl.NoMemberAttributeMacros;
+  }
+
+  void setHasNoMemberAttributeMacros() {
+    Bits.Decl.NoMemberAttributeMacros = true;
+  }
+
+  bool hasNoPeerMacros() const {
+    return Bits.Decl.NoPeerMacros;
+  }
+
+  void setHasNoPeerMacros() {
+    Bits.Decl.NoPeerMacros = true;
+  }
+
+  bool hasNoGlobalActorAttribute() const {
+    return Bits.Decl.NoGlobalActorAttribute;
+  }
+
+  void setHasNoGlobalActorAttribute() {
+    Bits.Decl.NoGlobalActorAttribute = true;
+  }
+
+  bool hasNoSPIGroups() const {
+    return Bits.Decl.NoSPIGroups;
+  }
+
+  void setHasNoSPIGroups() {
+    Bits.Decl.NoSPIGroups = true;
+  }
+
 protected:
 
   Decl(DeclKind kind, llvm::PointerUnion<DeclContext *, ASTContext *> context)
-    : Context(context) {
+    : SwiftObjectHeader(getDeclMetatype(kind)), Context(context) {
     Bits.OpaqueBits = 0;
     Bits.Decl.Kind = unsigned(kind);
     Bits.Decl.Invalid = false;
     Bits.Decl.Implicit = false;
     Bits.Decl.FromClang = false;
-    Bits.Decl.EscapedFromIfConfig = false;
     Bits.Decl.Hoisted = false;
     Bits.Decl.LacksObjCInterfaceOrImplementation = false;
+    Bits.Decl.NoMemberAttributeMacros = false;
+    Bits.Decl.NoGlobalActorAttribute = false;
+    Bits.Decl.NoSPIGroups = false;
+    Bits.Decl.IsUnsafeComputed = false;
+    Bits.Decl.IsUnsafe = false;
   }
 
   /// Get the Clang node associated with this declaration.
@@ -914,6 +982,12 @@ public:
   /// Retrieve the module in which this declaration resides.
   LLVM_READONLY
   ModuleDecl *getModuleContext() const;
+
+  /// Retrieve the module in which this declaration would be found by name
+  /// lookup queries. The result can differ from that of `getModuleContext()`
+  /// when the decl was imported via Cxx interop.
+  LLVM_READONLY
+  ModuleDecl *getModuleContextForNameLookup() const;
 
   /// getASTContext - Return the ASTContext that this decl lives in.
   LLVM_READONLY
@@ -1003,7 +1077,8 @@ public:
   /// Returns the OS version in which the decl became ABI as specified by the
   /// `@backDeployed` attribute.
   std::optional<llvm::VersionTuple>
-  getBackDeployedBeforeOSVersion(ASTContext &Ctx) const;
+  getBackDeployedBeforeOSVersion(ASTContext &Ctx,
+                                 bool forTargetVariant = false) const;
 
   /// Returns true if the decl has an active `@backDeployed` attribute for the
   /// given context.
@@ -1111,15 +1186,26 @@ public:
   /// Whether this declaration predates the introduction of concurrency.
   bool preconcurrency() const;
 
+  /// Whether this declaration is considered "unsafe", i.e., should not be
+  /// used in a "safe" dialect.
+  bool isUnsafe() const;
+
+private:
+  bool isUnsafeComputed() const {
+    return Bits.Decl.IsUnsafeComputed;
+  }
+
+  bool isUnsafeRaw() const {
+    return Bits.Decl.IsUnsafe;
+  }
+
+  void setUnsafe(bool value) {
+    assert(!Bits.Decl.IsUnsafeComputed);
+    Bits.Decl.IsUnsafe = value;
+    Bits.Decl.IsUnsafeComputed = true;
+  }
+
 public:
-  bool escapedFromIfConfig() const {
-    return Bits.Decl.EscapedFromIfConfig;
-  }
-
-  void setEscapedFromIfConfig(bool Escaped) {
-    Bits.Decl.EscapedFromIfConfig = Escaped;
-  }
-
   bool getSemanticAttrsComputed() const {
     return Bits.Decl.SemanticAttrsComputed;
   }
@@ -1136,6 +1222,9 @@ public:
   std::optional<StringRef> getSourceFileName() const;
 
   std::optional<unsigned> getSourceOrder() const;
+
+  /// Get the declaration that actually provides a doc comment for another.
+  const Decl *getDocCommentProvidingDecl() const;
 
   /// \returns The brief comment attached to this declaration, or the brief
   /// comment attached to the comment providing decl.
@@ -1216,8 +1305,10 @@ public:
 
   bool hasUnderscoredNaming() const;
 
-  bool isPrivateStdlibDecl(bool treatNonBuiltinProtocolsAsPublic = true) const;
-  
+  /// Whether this declaration is from a system module and should be considered
+  /// implicitly private.
+  bool isPrivateSystemDecl(bool treatNonBuiltinProtocolsAsPublic = true) const;
+
   /// Check if this is a declaration defined at the top level of the Swift module
   bool isStdlibDecl() const;
 
@@ -1239,7 +1330,7 @@ public:
     return getAttrs().hasAttribute<NoImplicitCopyAttr>();
   }
 
-  AvailabilityContext getAvailabilityForLinkage() const;
+  AvailabilityRange getAvailabilityForLinkage() const;
 
   /// Whether this declaration or one of its outer contexts has the
   /// @_weakLinked attribute.
@@ -1278,6 +1369,10 @@ public:
   /// without any inference rules applied.
   std::optional<std::pair<CustomAttr *, NominalTypeDecl *>>
   getGlobalActorAttr() const;
+
+  /// Determine whether there is an explicit isolation attribute
+  /// of any kind.
+  bool hasExplicitIsolationAttribute() const;
 
   /// If an alternative module name is specified for this decl, e.g. using
   /// @_originalDefinedIn attribute, this function returns this module name.
@@ -1481,6 +1576,8 @@ public:
   /// Retrieve the position of any where clause for this context's
   /// generic parameters.
   SourceRange getGenericTrailingWhereClauseSourceRange() const;
+
+  static bool classof(const Decl *D);
 };
 static_assert(sizeof(_GenericContext) + sizeof(DeclContext) ==
               sizeof(GenericContext), "Please add fields to _GenericContext");
@@ -1915,6 +2012,10 @@ public:
   /// extension X where T: Q, T: ~Copyable { }
   /// \endcode
   bool isWrittenWithConstraints() const;
+
+  /// Does this extension add conformance to an invertible protocol for the
+  /// extended type?
+  bool isAddingConformanceToInvertible() const;
 
   /// If this extension represents an imported Objective-C category, returns the
   /// category's name. Otherwise returns the empty identifier.
@@ -2375,8 +2476,12 @@ public:
     getMutablePatternList()[i].setOriginalInit(E);
   }
 
-  /// Returns a fully typechecked init expression for the pattern at the given
+  /// Returns a typechecked init expression for the pattern at the given
   /// index.
+  Expr *getContextualizedInit(unsigned i) const;
+
+  /// Returns an init expression for the pattern at the given index.
+  /// The initializer is fully type checked, including effects checking.
   Expr *getCheckedAndContextualizedInit(unsigned i) const;
 
   /// Returns the result of `getCheckedAndContextualizedInit()` if the init is
@@ -2567,51 +2672,6 @@ public:
   }
 };
 
-/// IfConfigDecl - This class represents #if/#else/#endif blocks.
-/// Active and inactive block members are stored separately, with the intention
-/// being that active members will be handed back to the enclosing context.
-class IfConfigDecl : public Decl {
-  /// An array of clauses controlling each of the #if/#elseif/#else conditions.
-  /// The array is ASTContext allocated.
-  ArrayRef<IfConfigClause> Clauses;
-  SourceLoc EndLoc;
-  SourceLoc getLocFromSource() const { return Clauses[0].Loc; }
-  friend class Decl;
-public:
-  
-  IfConfigDecl(DeclContext *Parent, ArrayRef<IfConfigClause> Clauses,
-               SourceLoc EndLoc, bool HadMissingEnd)
-    : Decl(DeclKind::IfConfig, Parent), Clauses(Clauses), EndLoc(EndLoc)
-  {
-    Bits.IfConfigDecl.HadMissingEnd = HadMissingEnd;
-  }
-
-  ArrayRef<IfConfigClause> getClauses() const { return Clauses; }
-
-  /// Return the active clause, or null if there is no active one.
-  const IfConfigClause *getActiveClause() const {
-    for (auto &Clause : Clauses)
-      if (Clause.isActive) return &Clause;
-    return nullptr;
-  }
-
-  const ArrayRef<ASTNode> getActiveClauseElements() const {
-    if (auto *Clause = getActiveClause())
-      return Clause->Elements;
-    return {};
-  }
-  
-  SourceLoc getEndLoc() const { return EndLoc; }
-
-  bool hadMissingEnd() const { return Bits.IfConfigDecl.HadMissingEnd; }
-  
-  SourceRange getSourceRange() const;
-  
-  static bool classof(const Decl *D) {
-    return D->getKind() == DeclKind::IfConfig;
-  }
-};
-
 class StringLiteralExpr;
 
 class PoundDiagnosticDecl : public Decl {
@@ -2660,54 +2720,6 @@ public:
   
 class OpaqueTypeDecl;
 
-/// Describes the least favorable positions at which a requirement refers
-/// to a given generic parameter in terms of variance, for use in the
-/// is-inheritable and is-available-existential checks.
-class GenericParameterReferenceInfo final {
-  using OptionalTypePosition = OptionalEnum<decltype(TypePosition::Covariant)>;
-
-public:
-  /// Whether the uncurried interface type of the declaration, stripped of any
-  /// optionality, is a direct reference to the generic parameter at hand. For
-  /// example, "func foo(x: Int) -> () -> Self?" has a covariant 'Self' result.
-  bool hasCovariantSelfResult;
-
-  OptionalTypePosition selfRef;
-  OptionalTypePosition assocTypeRef;
-
-  /// A reference to 'Self'.
-  static GenericParameterReferenceInfo forSelfRef(TypePosition position) {
-    return GenericParameterReferenceInfo(false, position, std::nullopt);
-  }
-
-  /// A reference to the generic parameter in covariant result position.
-  static GenericParameterReferenceInfo forCovariantResult() {
-    return GenericParameterReferenceInfo(true, TypePosition::Covariant,
-                                         std::nullopt);
-  }
-
-  /// A reference to 'Self' through an associated type.
-  static GenericParameterReferenceInfo forAssocTypeRef(TypePosition position) {
-    return GenericParameterReferenceInfo(false, std::nullopt, position);
-  }
-
-  GenericParameterReferenceInfo &operator|=(const GenericParameterReferenceInfo &other);
-
-  explicit operator bool() const {
-    return hasCovariantSelfResult || selfRef || assocTypeRef;
-  }
-
-  GenericParameterReferenceInfo()
-      : hasCovariantSelfResult(false), selfRef(std::nullopt),
-        assocTypeRef(std::nullopt) {}
-
-private:
-  GenericParameterReferenceInfo(bool hasCovariantSelfResult, OptionalTypePosition selfRef,
-                    OptionalTypePosition assocTypeRef)
-      : hasCovariantSelfResult(hasCovariantSelfResult), selfRef(selfRef),
-        assocTypeRef(assocTypeRef) {}
-};
-
 /// ValueDecl - All named decls that are values in the language.  These can
 /// have a type, etc.
 class ValueDecl : public Decl {
@@ -2742,6 +2754,10 @@ private:
     /// allows the entity to be replaced at runtime.
     unsigned isDynamic : 1;
 
+    /// Whether the DynamicallyReplacedDeclRequest request was evaluated and
+    /// output a null pointer.
+    unsigned noDynamicallyReplacedDecl : 1;
+
     /// Whether the "isFinal" bit has been computed yet.
     unsigned isFinalComputed : 1;
 
@@ -2755,6 +2771,9 @@ private:
     /// Whether this declaration produces an implicitly unwrapped
     /// optional result.
     unsigned isIUO : 1;
+
+    /// Whether we've evaluated the ApplyAccessNoteRequest.
+    unsigned accessNoteApplied : 1;
   } LazySemanticInfo = { };
 
   friend class DynamicallyReplacedDeclRequest;
@@ -2765,6 +2784,10 @@ private:
   friend class IsImplicitlyUnwrappedOptionalRequest;
   friend class InterfaceTypeRequest;
   friend class CheckRedeclarationRequest;
+  friend class ActorIsolationRequest;
+  friend class DynamicallyReplacedDeclRequest;
+  friend class ApplyAccessNoteRequest;
+
   friend class Decl;
   SourceLoc getLocFromSource() const { return NameLoc; }
 protected:
@@ -2885,6 +2908,14 @@ public:
   /// Returns \c true if this value decl is inlinable with attributes
   /// \c \@usableFromInline, \c \@inlinalbe, and \c \@_alwaysEmitIntoClient
   bool isUsableFromInline() const;
+
+  /// Treat as public and allow skipping access checks if the following conditions
+  /// are met:
+  /// - This decl has a package access level,
+  /// - Has a @usableFromInline (or other inlinable) attribute,
+  /// - And is defined in a module built from a public or private
+  ///   interface that does not contain package-name.
+  bool isInterfacePackageEffectivelyPublic() const;
 
   /// Returns \c true if this declaration is *not* intended to be used directly
   /// by application developers despite the visibility.
@@ -3030,6 +3061,10 @@ public:
 
   /// Retrieve the declaration that this declaration overrides, if any.
   ValueDecl *getOverriddenDecl() const;
+
+  /// Retrieve the declaration that this declaration overrides, including super
+  /// deinit.
+  ValueDecl *getOverriddenDeclOrSuperDeinit() const;
 
   /// Retrieve the declarations that this declaration overrides, if any.
   llvm::TinyPtrVector<ValueDecl *> getOverriddenDecls() const;
@@ -3222,17 +3257,6 @@ public:
   /// @_dynamicReplacement(for: ...), compute the original declaration
   /// that this declaration dynamically replaces.
   ValueDecl *getDynamicallyReplacedDecl() const;
-
-  /// Find references to 'Self' in the type signature of this declaration in the
-  /// context of the given existential base type.
-  ///
-  /// \param treatNonResultCovariantSelfAsInvariant When set, covariant 'Self'
-  /// references that are not in covariant result type position are considered
-  /// invariant. This position is the uncurried interface type of a declaration,
-  /// stripped of any optionality. For example, this is true for 'Self' in
-  /// 'func foo(Int) -> () -> Self?'.
-  GenericParameterReferenceInfo findExistentialSelfReferences(
-      Type baseTy, bool treatNonResultCovariantSelfAsInvariant) const;
 };
 
 /// This is a common base class for declarations which declare a type.
@@ -3667,7 +3691,11 @@ class GenericTypeParamDecl final
   }
 
   size_t numTrailingObjects(OverloadToken<SourceLoc>) const {
-    return isParameterPack() ? 1 : 0;
+    if (isParameterPack() || isValue()) {
+      return 1;
+    }
+
+    return 0;
   }
 
   /// Construct a new generic type parameter.
@@ -3678,19 +3706,18 @@ class GenericTypeParamDecl final
   ///
   /// \param name The name of the generic parameter.
   /// \param nameLoc The location of the name.
-  /// \param eachLoc The location of the 'each' keyword for a type parameter
-  ///                pack.
+  /// \param specifierLoc The location of the 'each' or 'let' keyword for pack
+  ///                     or value parameters.
   /// \param depth The generic signature depth.
   /// \param index The index of the parameter in the generic signature.
-  /// \param isParameterPack Whether the generic parameter is for a type
-  ///                        parameter pack, denoted by \c <each T>.
+  /// \param paramKind The kind of generic type parameter this is.
   /// \param isOpaqueType Whether the generic parameter is written as an opaque
   ///                     parameter e.g 'some Collection'.
   /// \param opaqueTypeRepr The TypeRepr of an opaque generic parameter.
   ///
   GenericTypeParamDecl(DeclContext *dc, Identifier name, SourceLoc nameLoc,
-                       SourceLoc eachLoc, unsigned depth, unsigned index,
-                       bool isParameterPack, bool isOpaqueType,
+                       SourceLoc specifierLoc, unsigned depth, unsigned index,
+                       GenericTypeParamKind paramKind, bool isOpaqueType,
                        TypeRepr *opaqueTypeRepr);
 
   /// Construct a new generic type parameter.
@@ -3701,20 +3728,20 @@ class GenericTypeParamDecl final
   ///
   /// \param name The name of the generic parameter.
   /// \param nameLoc The location of the name.
-  /// \param eachLoc The location of the 'each' keyword for a type parameter
-  ///                pack.
+  /// \param specifierLoc The location of the 'each' or 'let' keyword for pack
+  ///                     or value parameters.
   /// \param depth The generic signature depth.
   /// \param index The index of the parameter in the generic signature.
-  /// \param isParameterPack Whether the generic parameter is for a type
-  ///                        parameter pack, denoted by \c <each T>.
+  /// \param paramKind The kind of generic type parameter this is.
   /// \param isOpaqueType Whether the generic parameter is written as an opaque
   ///                     parameter e.g 'some Collection'.
   /// \param opaqueTypeRepr The TypeRepr of an opaque generic parameter.
   ///
   static GenericTypeParamDecl *create(DeclContext *dc, Identifier name,
-                                      SourceLoc nameLoc, SourceLoc eachLoc,
+                                      SourceLoc nameLoc, SourceLoc specifierLoc,
                                       unsigned depth, unsigned index,
-                                      bool isParameterPack, bool isOpaqueType,
+                                      GenericTypeParamKind paramKind,
+                                      bool isOpaqueType,
                                       TypeRepr *opaqueTypeRepr);
 
 public:
@@ -3723,10 +3750,10 @@ public:
   /// Construct a new generic type parameter. This should only be used by the
   /// ClangImporter, use \c GenericTypeParamDecl::create[...] instead.
   GenericTypeParamDecl(DeclContext *dc, Identifier name, SourceLoc nameLoc,
-                       SourceLoc eachLoc, unsigned depth, unsigned index,
-                       bool isParameterPack)
-      : GenericTypeParamDecl(dc, name, nameLoc, eachLoc, depth, index,
-                             isParameterPack, /*isOpaqueType*/ false, nullptr) {
+                       SourceLoc specifierLoc, unsigned depth, unsigned index,
+                       GenericTypeParamKind paramKind)
+      : GenericTypeParamDecl(dc, name, nameLoc, specifierLoc, depth, index,
+                             paramKind, false, nullptr) {
   }
 
   /// Construct a deserialized generic type parameter.
@@ -3738,14 +3765,14 @@ public:
   /// \param name The name of the generic parameter.
   /// \param depth The generic signature depth.
   /// \param index The index of the parameter in the generic signature.
-  /// \param isParameterPack Whether the generic parameter is for a type
-  ///                        parameter pack, denoted by \c <each T>.
+  /// \param paramKind The kind of generic type parameter this is.
   /// \param isOpaqueType Whether the generic parameter is written as an opaque
   ///                     parameter e.g 'some Collection'.
   ///
   static GenericTypeParamDecl *
   createDeserialized(DeclContext *dc, Identifier name, unsigned depth,
-                     unsigned index, bool isParameterPack, bool isOpaqueType);
+                     unsigned index, GenericTypeParamKind paramKind,
+                     bool isOpaqueType);
 
   /// Construct a new parsed generic type parameter.
   ///
@@ -3755,16 +3782,16 @@ public:
   ///
   /// \param name The name of the generic parameter.
   /// \param nameLoc The location of the name.
-  /// \param eachLoc The location of the 'each' keyword for a type parameter
-  ///                pack.
+  /// \param specifierLoc The location of the 'each' or 'let' keyword for pack
+  ///                     or value parameters.
   /// \param index The index of the parameter in the generic signature.
-  /// \param isParameterPack Whether the generic parameter is for a type
-  ///                        parameter pack, denoted by \c <each T>.
+  /// \param paramKind The kind of generic type parameter this is.
   ///
   static GenericTypeParamDecl *createParsed(DeclContext *dc, Identifier name,
                                             SourceLoc nameLoc,
-                                            SourceLoc eachLoc, unsigned index,
-                                            bool isParameterPack);
+                                            SourceLoc specifierLoc,
+                                            unsigned index,
+                                            GenericTypeParamKind paramKind);
 
   /// Construct a new implicit generic type parameter.
   ///
@@ -3775,20 +3802,17 @@ public:
   /// \param name The name of the generic parameter.
   /// \param depth The generic signature depth.
   /// \param index The index of the parameter in the generic signature.
-  /// \param isParameterPack Whether the generic parameter is for a type
-  ///                        parameter pack, denoted by \c <each T>.
-  /// \param isOpaqueType Whether the generic parameter is written as an opaque
-  ///                     parameter e.g 'some Collection'.
+  /// \param paramKind The kind of generic type parameter this is.
   /// \param opaqueTypeRepr The TypeRepr of an opaque generic parameter.
   /// \param nameLoc The location of the name.
-  /// \param eachLoc The location of the 'each' keyword for a type parameter
-  ///                pack.
+  /// \param specifierLoc The location of the 'each' or 'let' keyword for pack
+  ///                     or value parameters.
   ///
   static GenericTypeParamDecl *
   createImplicit(DeclContext *dc, Identifier name, unsigned depth,
-                 unsigned index, bool isParameterPack = false,
-                 bool isOpaqueType = false, TypeRepr *opaqueTypeRepr = nullptr,
-                 SourceLoc nameLoc = {}, SourceLoc eachLoc = {});
+                 unsigned index, GenericTypeParamKind paramKind,
+                 TypeRepr *opaqueTypeRepr = nullptr, SourceLoc nameLoc = {},
+                 SourceLoc specifierLoc = {});
 
   /// The depth of this generic type parameter, i.e., the number of outer
   /// levels of generic parameter lists that enclose this type parameter.
@@ -3810,6 +3834,11 @@ public:
     assert(Bits.GenericTypeParamDecl.Depth == depth && "Truncation");
   }
 
+  /// The kind of generic type parameter this is.
+  GenericTypeParamKind getParamKind() const {
+    return (GenericTypeParamKind) Bits.GenericTypeParamDecl.ParamKind;
+  }
+
   /// Returns \c true if this generic type parameter is declared as a type
   /// parameter pack.
   ///
@@ -3817,7 +3846,23 @@ public:
   /// func foo<each T>(_ : for each T) { }
   /// struct Foo<each T> { }
   /// \endcode
-  bool isParameterPack() const { return Bits.GenericTypeParamDecl.ParameterPack; }
+  bool isParameterPack() const {
+    return getParamKind() == GenericTypeParamKind::Pack;
+  }
+
+  /// Returns \c true if this generic type parameter is declared as a value
+  /// type parameter.
+  ///
+  /// \code
+  /// struct Vector<Element, let N: Int>
+  /// \endcode
+  bool isValue() const {
+    return getParamKind() == GenericTypeParamKind::Value;
+  }
+
+  /// Returns the underlying value type associated with this generic value
+  /// parameter. E.g. if this is 'let N: Int' returns 'Int'.
+  Type getValueType() const;
 
   /// Determine whether this generic parameter represents an opaque type.
   ///
@@ -3855,9 +3900,26 @@ public:
   /// Here 'T' and 'U' have indexes 0 and 1, respectively. 'V' has index 0.
   unsigned getIndex() const { return Bits.GenericTypeParamDecl.Index; }
 
-  /// Retrieve the 'each' keyword location for a type parameter pack \c each T
+  /// Retrieve either the 'each' keyword or the 'let' keyword location for this
+  /// generic parameter depending on if it's a parameter pack or a value.
+  SourceLoc getSpecifierLoc() const {
+    if (!isParameterPack() && !isValue())
+      return SourceLoc();
+
+    return *getTrailingObjects<SourceLoc>();
+  }
+
+  /// Retrieve the 'each' keyword location for a type parameter pack \c each T.
   SourceLoc getEachLoc() const {
     if (!isParameterPack())
+      return SourceLoc();
+
+    return *getTrailingObjects<SourceLoc>();
+  }
+
+  /// Retrieve the 'let' keyword location for a value parameter \c let N.
+  SourceLoc getLetLoc() const {
+    if (!isValue())
       return SourceLoc();
 
     return *getTrailingObjects<SourceLoc>();
@@ -4646,6 +4708,15 @@ public:
   /// \sa isEffectivelyExhaustive
   bool isFormallyExhaustive(const DeclContext *useDC) const;
 
+  /// True if \s isFormallyExhaustive is true or the use site's module belongs
+  /// to the same package as this enum's defining module. If in same package
+  /// even though `isFormallyExhaustive` is false, we can skip requiring
+  /// `@unknown default` at the use site switch stmts because package modules
+  /// are expected to be built together whether they are resiliently built or
+  /// not. Used for diagnostics during typechecks only; if
+  /// `isFormallyExhaustive` is false, it should be reflected in SILgen.
+  bool treatAsExhaustiveForDiags(const DeclContext *useDC) const;
+
   /// True if the enum can be exhaustively switched within a function defined
   /// within \p M, with \p expansion specifying whether the function is
   /// inlinable.
@@ -5191,6 +5262,7 @@ class ProtocolDecl final : public NominalTypeDecl {
 
   ArrayRef<PrimaryAssociatedTypeName> PrimaryAssociatedTypeNames;
   ArrayRef<ProtocolDecl *> InheritedProtocols;
+  ArrayRef<ProtocolDecl *> AllInheritedProtocols;
   ArrayRef<AssociatedTypeDecl *> AssociatedTypes;
   ArrayRef<ValueDecl *> ProtocolRequirements;
 
@@ -5267,6 +5339,7 @@ class ProtocolDecl final : public NominalTypeDecl {
   friend class ExistentialConformsToSelfRequest;
   friend class HasSelfOrAssociatedTypeRequirementsRequest;
   friend class InheritedProtocolsRequest;
+  friend class AllInheritedProtocolsRequest;
   friend class PrimaryAssociatedTypesRequest;
   friend class ProtocolRequirementsRequest;
   
@@ -5404,6 +5477,13 @@ private:
   }
   void setInheritedProtocolsValid() {
     Bits.ProtocolDecl.InheritedProtocolsValid = true;
+  }
+
+  bool areAllInheritedProtocolsValid() const {
+    return Bits.ProtocolDecl.AllInheritedProtocolsValid;
+  }
+  void setAllInheritedProtocolsValid() {
+    Bits.ProtocolDecl.AllInheritedProtocolsValid = true;
   }
 
   bool areProtocolRequirementsValid() const {
@@ -5685,6 +5765,8 @@ private:
     unsigned RequiresOpaqueAccessors : 1;
     unsigned RequiresOpaqueModifyCoroutineComputed : 1;
     unsigned RequiresOpaqueModifyCoroutine : 1;
+    unsigned RequiresOpaqueModify2CoroutineComputed : 1;
+    unsigned RequiresOpaqueModify2Coroutine : 1;
   } LazySemanticInfo = { };
 
   /// The implementation info for the accessors.
@@ -5949,16 +6031,27 @@ public:
     return getOpaqueReadOwnership() != OpaqueReadOwnership::Borrowed;
   }
 
+  /// Does this storage require a '_read' accessor in its opaque-accessors set?
+  bool requiresOpaqueReadCoroutine() const;
+
   /// Does this storage require a 'read' accessor in its opaque-accessors set?
-  bool requiresOpaqueReadCoroutine() const {
-    return getOpaqueReadOwnership() != OpaqueReadOwnership::Owned;
-  }
+  bool requiresOpaqueRead2Coroutine() const;
 
   /// Does this storage require a 'set' accessor in its opaque-accessors set?
   bool requiresOpaqueSetter() const { return supportsMutation(); }
 
-  /// Does this storage require a 'modify' accessor in its opaque-accessors set?
+  /// Does this storage require a '_modify' accessor in its opaque-accessors
+  /// set?
   bool requiresOpaqueModifyCoroutine() const;
+
+  /// Does this storage require a 'modify' accessor in its opaque-accessors
+  /// set?
+  bool requiresOpaqueModify2Coroutine() const;
+
+  /// Given that CoroutineAccessors is enabled, is _read/_modify required for
+  /// ABI stability?
+  bool
+  requiresCorrespondingUnderscoredCoroutineAccessor(AccessorKind kind) const;
 
   /// Does this storage have any explicit observers (willSet or didSet) attached
   /// to it?
@@ -6074,7 +6167,26 @@ enum class PropertyWrapperSynthesizedPropertyKind {
 /// VarDecl - 'var' and 'let' declarations.
 class VarDecl : public AbstractStorageDecl {
   friend class NamingPatternRequest;
+  friend class AttachedPropertyWrappersRequest;
+  friend class PropertyWrapperAuxiliaryVariablesRequest;
+
   NamedPattern *NamingPattern = nullptr;
+
+  bool hasNoAttachedPropertyWrappers() const {
+    return Bits.VarDecl.NoAttachedPropertyWrappers;
+  }
+
+  void setHasNoAttachedPropertyWrappers() {
+    Bits.VarDecl.NoAttachedPropertyWrappers = true;
+  }
+
+  bool hasNoPropertyWrapperAuxiliaryVariables() const {
+    return Bits.VarDecl.NoPropertyWrapperAuxiliaryVariables;
+  }
+
+  void setHasNoPropertyWrapperAuxiliaryVariables() {
+    Bits.VarDecl.NoPropertyWrapperAuxiliaryVariables = true;
+  }
 
 public:
   enum class Introducer : uint8_t {
@@ -6590,7 +6702,7 @@ public:
   /// attribute.
   bool hasSemanticsAttr(StringRef attrValue) const {
     return llvm::any_of(getSemanticsAttrs(), [&](const SemanticsAttr *attr) {
-      return attrValue.equals(attr->Value);
+      return attrValue == attr->Value;
     });
   }
 
@@ -6616,8 +6728,6 @@ class ParamDecl : public VarDecl {
 
     /// Whether or not this parameter is '_const'.
     IsCompileTimeConst = 1 << 1,
-
-    HasResultDependsOn = 1 << 2,
   };
 
   llvm::PointerIntPair<Identifier, 3, OptionSet<ArgumentNameFlags>>
@@ -6655,9 +6765,6 @@ class ParamDecl : public VarDecl {
 
     /// Whether or not this parameter is 'isolated'.
     IsIsolated = 1 << 2,
-
-    /// Whether or not this paramater is '_resultDependsOn'
-    IsResultDependsOn = 1 << 3,
 
     /// Whether or not this parameter is 'sending'.
     IsSending = 1 << 4,
@@ -6958,18 +7065,6 @@ public:
     auto flags = ArgumentNameAndFlags.getInt();
     flags = value ? flags | ArgumentNameFlags::IsCompileTimeConst
                   : flags - ArgumentNameFlags::IsCompileTimeConst;
-    ArgumentNameAndFlags.setInt(flags);
-  }
-
-  bool hasResultDependsOn() const {
-    return ArgumentNameAndFlags.getInt().contains(
-        ArgumentNameFlags::HasResultDependsOn);
-  }
-
-  void setResultDependsOn(bool value = true) {
-    auto flags = ArgumentNameAndFlags.getInt();
-    flags = value ? flags | ArgumentNameFlags::HasResultDependsOn
-                  : flags - ArgumentNameFlags::HasResultDependsOn;
     ArgumentNameAndFlags.setInt(flags);
   }
 
@@ -7392,7 +7487,8 @@ public:
 
   /// Add the given derivative function configuration.
   void addDerivativeFunctionConfiguration(const AutoDiffConfig &config);
-  std::optional<LifetimeDependenceInfo> getLifetimeDependenceInfo() const;
+  std::optional<llvm::ArrayRef<LifetimeDependenceInfo>>
+  getLifetimeDependencies() const;
 
 protected:
   // If a function has a body at all, we have either a parsed body AST node or
@@ -7417,6 +7513,7 @@ protected:
   friend class ParseAbstractFunctionBodyRequest;
   friend class TypeCheckFunctionBodyRequest;
   friend class IsFunctionBodySkippedRequest;
+  friend class LifetimeDependenceInfoRequest;
 
   CaptureInfo Captures;
 
@@ -7432,6 +7529,7 @@ protected:
   struct {
     unsigned NeedsNewVTableEntryComputed : 1;
     unsigned NeedsNewVTableEntry : 1;
+    unsigned NoLifetimeDependenceInfo : 1;
   } LazySemanticInfo = { };
 
   AbstractFunctionDecl(DeclKind Kind, DeclContext *Parent, DeclName Name,
@@ -7594,6 +7692,18 @@ public:
   /// Note that a true return value does not imply that the body was actually
   /// parsed.
   bool hasBody() const;
+
+  /// Returns a boolean value indicating whether the body, if any, contains
+  /// an explicit `return` statement.
+  ///
+  /// \returns `true` if the body contains an explicit `return` statement,
+  /// `false` otherwise.
+  bool bodyHasExplicitReturnStmt() const;
+
+  /// Finds occurrences of explicit `return` statements within the body, if any.
+  ///
+  /// \param results An out container to which the results are added.
+  void getExplicitReturnStmts(SmallVectorImpl<ReturnStmt *> &results) const;
 
   /// Returns true if the text of this function's body can be retrieved either
   /// by extracting the text from the source buffer or reading the inlinable
@@ -7900,9 +8010,14 @@ public:
   /// declaration, given that it is @objc and 'async'.
   std::optional<ForeignAsyncConvention> getForeignAsyncConvention() const;
 
+  /// Whether the given DeclKind is for an AbstractFunctionDecl.
+  static bool isKind(DeclKind kind) {
+    return kind >= DeclKind::First_AbstractFunctionDecl &&
+           kind <= DeclKind::Last_AbstractFunctionDecl;
+  }
+
   static bool classof(const Decl *D) {
-    return D->getKind() >= DeclKind::First_AbstractFunctionDecl &&
-           D->getKind() <= DeclKind::Last_AbstractFunctionDecl;
+    return isKind(D->getKind());
   }
 
   static bool classof(const DeclContext *DC) {
@@ -8441,7 +8556,13 @@ public:
     return hasName() ? getBaseIdentifier().str() : "_";
   }
 
-  Type getArgumentInterfaceType() const;
+  /// Retrieve the payload type for the enum element, which is a tuple of the
+  /// associated values, or null if there are no associated values.
+  Type getPayloadInterfaceType() const;
+
+  /// Retrieve the parameters of the implicit case constructor for the enum
+  /// element.
+  ArrayRef<AnyFunctionType::Param> getCaseConstructorParams() const;
 
   void setParameterList(ParameterList *params);
   ParameterList *getParameterList() const { return Params; }
@@ -8718,8 +8839,6 @@ public:
     Bits.ConstructorDecl.HasStubImplementation = stub;
   }
 
-  bool hasLifetimeDependentReturn() const;
-
   ConstructorDecl *getOverriddenDecl() const {
     return cast_or_null<ConstructorDecl>(
         AbstractFunctionDecl::getOverriddenDecl());
@@ -8774,6 +8893,10 @@ public:
 
   /// Retrieve the Objective-C selector for destructors.
   ObjCSelector getObjCSelector() const;
+
+  /// Retrieves destructor decl from the superclass, or nil if there is no
+  /// superclass
+  DestructorDecl *getSuperDeinit() const;
 
   static bool classof(const Decl *D) {
     return D->getKind() == DeclKind::Destructor;
@@ -9385,17 +9508,6 @@ public:
   }
 };
 
-/// Find references to the given generic parameter in the type signature of the
-/// given declaration using the given generic signature.
-///
-/// \param skipParamIndex If the value is a function or subscript declaration,
-/// specifies the index of the parameter that shall be skipped.
-GenericParameterReferenceInfo
-findGenericParameterReferences(const ValueDecl *value, CanGenericSignature sig,
-                               GenericTypeParamType *genericParam,
-                               bool treatNonResultCovarianceAsInvariant,
-                               std::optional<unsigned> skipParamIndex);
-
 inline void
 AbstractStorageDecl::overwriteSetterAccess(AccessLevel accessLevel) {
   Accessors.setInt(accessLevel);
@@ -9521,6 +9633,16 @@ inline bool DeclContext::classof(const Decl *D) {
   default: return false;
 #define DECL(ID, PARENT) // See previous line
 #define CONTEXT_DECL(ID, PARENT) \
+  case DeclKind::ID: return true;
+#include "swift/AST/DeclNodes.def"
+  }
+}
+
+inline bool GenericContext::classof(const Decl *D) {
+  switch (D->getKind()) { //
+  default: return false;
+#define DECL(ID, PARENT) // See previous line
+#define GENERIC_DECL(ID, PARENT) \
   case DeclKind::ID: return true;
 #include "swift/AST/DeclNodes.def"
   }

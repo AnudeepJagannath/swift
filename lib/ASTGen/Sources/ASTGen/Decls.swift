@@ -41,15 +41,15 @@ extension ASTGenVisitor {
     case .functionDecl(let node):
       return self.generate(functionDecl: node).asDecl
     case .ifConfigDecl:
-      break
+      fatalError("Should have been handled by the caller")
     case .importDecl(let node):
       return self.generate(importDecl: node).asDecl
     case .initializerDecl(let node):
       return self.generate(initializerDecl: node).asDecl
     case .macroDecl:
       break
-    case .macroExpansionDecl:
-      break
+    case .macroExpansionDecl(let node):
+      return self.generate(macroExpansionDecl: node).asDecl
     case .missingDecl:
       break
     case .operatorDecl(let node):
@@ -68,10 +68,6 @@ extension ASTGenVisitor {
       return self.generate(typeAliasDecl: node).asDecl
     case .variableDecl(let node):
       return self.generate(variableDecl: node).asDecl
-#if RESILIENT_SWIFT_SYNTAX
-    @unknown default:
-      fatalError()
-#endif
     }
     return self.generateWithLegacy(node)
   }
@@ -425,10 +421,6 @@ extension ASTGenVisitor {
         accessors: CollectionOfOne(accessor).bridgedArray(in: self),
         rBraceLoc: rightBrace
       )
-#if RESILIENT_SWIFT_SYNTAX
-    @unknown default:
-      fatalError()
-#endif
     }
   }
 
@@ -628,6 +620,29 @@ extension ASTGenVisitor {
   }
 }
 
+// MARK: - MacroExpansionDecl
+
+extension ASTGenVisitor {
+  func generate(macroExpansionDecl node: MacroExpansionDeclSyntax) -> BridgedMacroExpansionDecl {
+    let attrs = self.generateDeclAttributes(node, allowStatic: true)
+    let info = self.generate(freestandingMacroExpansion: node)
+
+    let decl = BridgedMacroExpansionDecl.createParsed(
+      self.declContext,
+      poundLoc: info.poundLoc,
+      macroNameRef: info.macroNameRef,
+      macroNameLoc: info.macroNameLoc,
+      leftAngleLoc: info.leftAngleLoc,
+      genericArgs: info.genericArgs,
+      rightAngleLoc: info.rightAngleLoc,
+      args: info.arguments
+    )
+    decl.asDecl.setAttrs(attrs.attributes)
+
+    return decl
+  }
+}
+
 // MARK: - OperatorDecl
 
 extension BridgedOperatorFixity {
@@ -734,10 +749,6 @@ extension ASTGenVisitor {
         } else {
           body.associativity = associativity
         }
-#if RESILIENT_SWIFT_SYNTAX
-      @unknown default:
-        fatalError()
-#endif
       }
     }
 
@@ -838,7 +849,19 @@ extension ASTGenVisitor {
 extension ASTGenVisitor {
   @inline(__always)
   func generate(memberBlockItemList node: MemberBlockItemListSyntax) -> BridgedArrayRef {
-    node.lazy.map(self.generate).bridgedArray(in: self)
+    var allBridged: [BridgedDecl] = []
+    visitIfConfigElements(node, of: MemberBlockItemSyntax.self) { element in
+      if let ifConfigDecl = element.decl.as(IfConfigDeclSyntax.self) {
+        return .ifConfigDecl(ifConfigDecl)
+      }
+
+      return .underlying(element)
+    } body: { member in
+      // TODO: Set semicolon loc.
+      allBridged.append(self.generate(decl: member.decl))
+    }
+
+    return allBridged.lazy.bridgedArray(in: self)
   }
 
   @inline(__always)

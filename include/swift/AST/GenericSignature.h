@@ -170,9 +170,6 @@ public:
   /// Stores a set of requirements on a type parameter. Used by
   /// GenericEnvironment for building archetypes.
   struct LocalRequirements {
-    Type anchor;
-
-    Type concreteType;
     Type superclass;
 
     RequiredProtocols protos;
@@ -322,12 +319,6 @@ public:
       SmallVector<Requirement, 2> &reqs,
       SmallVector<InverseRequirement, 2> &inverses) const;
 
-  /// Look up a stored conformance in the generic signature. These are formed
-  /// from same-type constraints placed on associated types of generic
-  /// parameters which have conformance constraints on them.
-  ProtocolConformanceRef lookupConformance(CanType depTy,
-                                           ProtocolDecl *proto) const;
-
   /// Iterate over all generic parameters, passing a flag to the callback
   /// indicating if the generic parameter is canonical or not.
   void forEachParam(
@@ -412,6 +403,11 @@ public:
       Requirement requirement, bool allowMissing = false) const;
 
   bool isReducedType(Type type) const;
+
+  /// Return the reduced version of the given type parameter under this generic
+  /// signature. To reduce a type that more generally contains type parameters,
+  /// use GenericSignature::getReducedType().
+  CanType getReducedTypeParameter(CanType type) const;
 
   /// Determine whether the given type parameter is defined under this generic
   /// signature.

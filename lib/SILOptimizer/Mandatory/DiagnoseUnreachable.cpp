@@ -16,6 +16,7 @@
 #include "swift/AST/Expr.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/Stmt.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/MemAccessUtils.h"
 #include "swift/SIL/Projection.h"
@@ -772,6 +773,14 @@ static bool simplifyBlocksWithCallsToNoReturn(SILBasicBlock &BB,
     // happens when passing a guaranteed argument through generic code paths
     // to no return functions.
     if (isa<EndBorrowInst>(currInst))
+      return false;
+
+    // destroy_value [dead_end] instructions are inserted at the availability
+    // boundary by lifetime completion.  Such instructions correctly mark the
+    // lifetime boundary of the destroyed value and never arise from dead user
+    // code.
+    auto *dvi = dyn_cast<DestroyValueInst>(currInst);
+    if (dvi && dvi->isDeadEnd())
       return false;
 
     // If no-return instruction is not something we can point in code or

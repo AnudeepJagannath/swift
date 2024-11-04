@@ -34,6 +34,8 @@
 
 namespace swift {
 
+class DeadEndBlocks;
+
 enum class LifetimeCompletion { NoLifetime, AlreadyComplete, WasCompleted };
 
 class OSSALifetimeCompletion {
@@ -42,13 +44,17 @@ class OSSALifetimeCompletion {
   // create a new phi would result in an immediately redundant phi.
   const DominanceInfo *domInfo = nullptr;
 
+  DeadEndBlocks &deadEndBlocks;
+
   // Cache intructions already handled by the recursive algorithm to avoid
   // recomputing their lifetimes.
   ValueSet completedValues;
 
 public:
-  OSSALifetimeCompletion(SILFunction *function, const DominanceInfo *domInfo)
-    : domInfo(domInfo), completedValues(function) {}
+  OSSALifetimeCompletion(SILFunction *function, const DominanceInfo *domInfo,
+                         DeadEndBlocks &deadEndBlocks)
+      : domInfo(domInfo), deadEndBlocks(deadEndBlocks),
+        completedValues(function) {}
 
   // The kind of boundary at which to complete the lifetime.
   //
@@ -57,19 +63,10 @@ public:
   // Availability: "As late as possible."  Consume the value in the last blocks
   //               beyond the non-consuming uses in which the value has been
   //               consumed on no incoming paths.
-  // AvailabilityWithLeaks: "As late as possible or later."  Consume the value
-  //                        in the last blocks beyond the non-consuming uses in
-  //                        which the value has been consumed on no incoming
-  //                        paths, unless that block's terminator isn't an
-  //                        unreachable, in which case, don't consume it there.
-  //
-  //                        This boundary works around bugs where SILGen emits
-  //                        illegal OSSA lifetimes.
   struct Boundary {
     enum Value : uint8_t {
       Liveness,
       Availability,
-      AvailabilityWithLeaks,
     };
     Value value;
 
@@ -115,15 +112,16 @@ public:
                : LifetimeCompletion::AlreadyComplete;
   }
 
-  enum AllowLeaks_t : bool {
-    AllowLeaks = true,
-    DoNotAllowLeaks = false,
+  enum class LifetimeEnd : uint8_t {
+    /// The lifetime ends at the boundary.
+    Boundary,
+    /// The lifetime "ends" in a loop.
+    Loop,
   };
 
-  static void visitUnreachableLifetimeEnds(
-      SILValue value, AllowLeaks_t allowLeaks,
-      const SSAPrunedLiveness &liveness,
-      llvm::function_ref<void(SILInstruction *)> visit);
+  static void visitAvailabilityBoundary(
+      SILValue value, const SSAPrunedLiveness &liveness,
+      llvm::function_ref<void(SILInstruction *, LifetimeEnd end)> visit);
 
 protected:
   bool analyzeAndUpdateLifetime(SILValue value, Boundary boundary);
@@ -144,6 +142,7 @@ class UnreachableLifetimeCompletion {
   // If domInfo is nullptr, lifetime completion may attempt to recreate
   // redundant phis, which should be immediately discarded.
   const DominanceInfo *domInfo = nullptr;
+  DeadEndBlocks &deadEndBlocks;
 
   BasicBlockSetVector unreachableBlocks;
   InstructionSet unreachableInsts; // not including those in unreachableBlocks
@@ -151,9 +150,11 @@ class UnreachableLifetimeCompletion {
   bool updatingLifetimes = false;
 
 public:
-  UnreachableLifetimeCompletion(SILFunction *function, DominanceInfo *domInfo)
-    : function(function), unreachableBlocks(function),
-      unreachableInsts(function), incompleteValues(function) {}
+  UnreachableLifetimeCompletion(SILFunction *function, DominanceInfo *domInfo,
+                                DeadEndBlocks &deadEndBlocks)
+      : function(function), domInfo(domInfo), deadEndBlocks(deadEndBlocks),
+        unreachableBlocks(function), unreachableInsts(function),
+        incompleteValues(function) {}
 
   /// Record information about this unreachable instruction and return true if
   /// ends any simple OSSA lifetimes.
@@ -179,9 +180,6 @@ operator<<(llvm::raw_ostream &OS, OSSALifetimeCompletion::Boundary boundary) {
     break;
   case OSSALifetimeCompletion::Boundary::Availability:
     OS << "availability";
-    break;
-  case OSSALifetimeCompletion::Boundary::AvailabilityWithLeaks:
-    OS << "availability_with_leaks";
     break;
   }
   return OS;

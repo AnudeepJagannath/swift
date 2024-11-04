@@ -24,6 +24,7 @@
 #include "swift/AST/ModuleDependencies.h"
 #include "swift/AST/PluginLoader.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/FileTypes.h"
 #include "swift/Basic/Platform.h"
 #include "swift/Basic/SourceManager.h"
@@ -232,9 +233,13 @@ SerializationOptions CompilerInvocation::computeSerializationOptions(
   } else {
     serializationOpts.ExtraClangOptions = getClangImporterOptions().ExtraArgs;
   }
-  if (LangOpts.ClangTarget) {
+  if (LangOpts.ClangTarget &&
+      !getClangImporterOptions().DirectClangCC1ModuleBuild) {
     serializationOpts.ExtraClangOptions.push_back("--target=" +
                                                   LangOpts.ClangTarget->str());
+  }
+  if (LangOpts.EnableAppExtensionRestrictions) {
+    serializationOpts.ExtraClangOptions.push_back("-fapplication-extension");
   }
 
   serializationOpts.PluginSearchOptions =
@@ -297,7 +302,8 @@ bool CompilerInstance::setUpASTContextIfNeeded() {
       Invocation.getLangOptions(), Invocation.getTypeCheckerOptions(),
       Invocation.getSILOptions(), Invocation.getSearchPathOptions(),
       Invocation.getClangImporterOptions(), Invocation.getSymbolGraphOptions(),
-      Invocation.getCASOptions(), SourceMgr, Diagnostics, OutputBackend));
+      Invocation.getCASOptions(), Invocation.getSerializationOptions(),
+      SourceMgr, Diagnostics, OutputBackend));
   if (!Invocation.getFrontendOptions().ModuleAliasMap.empty())
     Context->setModuleAliases(Invocation.getFrontendOptions().ModuleAliasMap);
 
@@ -376,9 +382,11 @@ void CompilerInstance::setupStatsReporter() {
       StatsOutputDir,
       &getSourceMgr(),
       getClangSourceManager(getASTContext()),
+      Invoke.getFrontendOptions().FineGrainedTimers,
       Invoke.getFrontendOptions().TraceStats,
       Invoke.getFrontendOptions().ProfileEvents,
-      Invoke.getFrontendOptions().ProfileEntities);
+      Invoke.getFrontendOptions().ProfileEntities,
+      Invoke.getFrontendOptions().PrintZeroStats);
   // Hand the stats reporter down to the ASTContext so the rest of the compiler
   // can use it.
   getASTContext().setStatsReporter(Reporter.get());
@@ -474,10 +482,31 @@ void CompilerInstance::setupOutputBackend() {
 
   // Mirror the output into CAS.
   if (supportCaching()) {
+    auto &InAndOuts = Invocation.getFrontendOptions().InputsAndOutputs;
     CASOutputBackend = createSwiftCachingOutputBackend(
-        *CAS, *ResultCache, *CompileJobBaseKey,
-        Invocation.getFrontendOptions().InputsAndOutputs,
+        *CAS, *ResultCache, *CompileJobBaseKey, InAndOuts,
         Invocation.getFrontendOptions().RequestedAction);
+
+    if (Invocation.getIRGenOptions().UseCASBackend) {
+      auto OutputFiles = InAndOuts.copyOutputFilenames();
+      std::unordered_set<std::string> OutputFileSet(
+          std::make_move_iterator(OutputFiles.begin()),
+          std::make_move_iterator(OutputFiles.end()));
+      // Filter the object file output if MCCAS is enabled, we do not want to
+      // store the object file itself, but store the MCCAS CASID instead.
+      auto FilterBackend = llvm::vfs::makeFilteringOutputBackend(
+          CASOutputBackend,
+          [&, OutputFileSet](StringRef Path,
+                             std::optional<llvm::vfs::OutputConfig> Config) {
+            if (InAndOuts.getPrincipalOutputType() != file_types::ID::TY_Object)
+              return true;
+            return !(OutputFileSet.find(Path.str()) != OutputFileSet.end());
+          });
+      OutputBackend =
+          llvm::vfs::makeMirroringOutputBackend(OutputBackend, FilterBackend);
+      return;
+    }
+
     OutputBackend =
         llvm::vfs::makeMirroringOutputBackend(OutputBackend, CASOutputBackend);
   }
@@ -535,10 +564,12 @@ bool CompilerInstance::setup(const CompilerInvocation &Invoke,
     return true;
   }
 
-  setupStatsReporter();
+  if (hasASTContext()) {
+    setupStatsReporter();
+  }
 
   if (setupDiagnosticVerifierIfNeeded()) {
-    Error = "Setting up diagnostics verified failed";
+    Error = "Setting up diagnostics verifier failed";
     return true;
   }
 
@@ -550,6 +581,10 @@ bool CompilerInstance::setup(const CompilerInvocation &Invoke,
   const auto &LangOpts = Invocation.getLangOptions();
   if (LangOpts.EnableModuleLoadingRemarks) {
     Invocation.getSearchPathOptions().dump(LangOpts.Target.isOSDarwin());
+  }
+
+  if (LangOpts.OpenSourcesAsVolatile) {
+    this->getSourceMgr().setOpenSourcesAsVolatile();
   }
 
   // If we expect an implicit stdlib import, load in the standard library. If we
@@ -592,10 +627,12 @@ bool CompilerInstance::setUpVirtualFileSystemOverlays() {
   }
 
   if (Invocation.getCASOptions().requireCASFS()) {
-    if (!CASOpts.CASFSRootIDs.empty() || !CASOpts.ClangIncludeTrees.empty()) {
+    if (!CASOpts.CASFSRootIDs.empty() || !CASOpts.ClangIncludeTrees.empty() ||
+        !CASOpts.ClangIncludeTreeFileList.empty()) {
       // Set up CASFS as BaseFS.
       auto FS = createCASFileSystem(*CAS, CASOpts.CASFSRootIDs,
-                                    CASOpts.ClangIncludeTrees);
+                                    CASOpts.ClangIncludeTrees,
+                                    CASOpts.ClangIncludeTreeFileList);
       if (!FS) {
         Diagnostics.diagnose(SourceLoc(), diag::error_cas,
                              toString(FS.takeError()));
@@ -669,15 +706,21 @@ bool CompilerInstance::setUpVirtualFileSystemOverlays() {
 }
 
 void CompilerInstance::setUpLLVMArguments() {
-  // Honor -Xllvm.
-  if (!Invocation.getFrontendOptions().LLVMArgs.empty()) {
-    llvm::SmallVector<const char *, 4> Args;
-    Args.push_back("swift (LLVM option parsing)");
-    for (unsigned i = 0, e = Invocation.getFrontendOptions().LLVMArgs.size();
-         i != e; ++i)
-      Args.push_back(Invocation.getFrontendOptions().LLVMArgs[i].c_str());
-    Args.push_back(nullptr);
-    llvm::cl::ParseCommandLineOptions(Args.size()-1, Args.data());
+  // Dependency scanning has no need for LLVM options, and
+  // must not use `llvm::cl::` utilities operating on global state
+  // since dependency scanning is multi-threaded.
+  if (Invocation.getFrontendOptions().RequestedAction !=
+      FrontendOptions::ActionType::ScanDependencies) {
+    // Honor -Xllvm.
+    if (!Invocation.getFrontendOptions().LLVMArgs.empty()) {
+      llvm::SmallVector<const char *, 4> Args;
+      Args.push_back("swift (LLVM option parsing)");
+      for (unsigned i = 0, e = Invocation.getFrontendOptions().LLVMArgs.size();
+           i != e; ++i)
+        Args.push_back(Invocation.getFrontendOptions().LLVMArgs[i].c_str());
+      Args.push_back(nullptr);
+      llvm::cl::ParseCommandLineOptions(Args.size()-1, Args.data());
+    }
   }
 }
 
@@ -691,12 +734,10 @@ void CompilerInstance::setUpDiagnosticOptions() {
   if (Invocation.getDiagnosticOptions().SuppressRemarks) {
     Diagnostics.setSuppressRemarks(true);
   }
-  if (Invocation.getDiagnosticOptions().WarningsAsErrors) {
-    Diagnostics.setWarningsAsErrors(true);
-  }
-  if (Invocation.getDiagnosticOptions().PrintDiagnosticNames) {
-    Diagnostics.setPrintDiagnosticNames(true);
-  }
+  Diagnostics.setWarningsAsErrorsRules(
+      Invocation.getDiagnosticOptions().WarningsAsErrorsRules);
+  Diagnostics.setPrintDiagnosticNamesMode(
+      Invocation.getDiagnosticOptions().PrintDiagnosticNames);
   Diagnostics.setDiagnosticDocumentationPath(
       Invocation.getDiagnosticOptions().DiagnosticDocumentationPath);
   Diagnostics.setLanguageVersion(
@@ -781,8 +822,11 @@ bool CompilerInstance::setUpModuleLoaders() {
   }
 
   // Configure ModuleInterfaceChecker for the ASTContext.
+  auto CacheFromInvocation = getInvocation().getClangModuleCachePath();
   auto const &Clang = clangImporter->getClangInstance();
-  std::string ModuleCachePath = getModuleCachePathFromClang(Clang);
+  std::string ModuleCachePath = CacheFromInvocation.empty()
+                                    ? getModuleCachePathFromClang(Clang)
+                                    : CacheFromInvocation.str();
   auto &FEOpts = Invocation.getFrontendOptions();
   ModuleInterfaceLoaderOptions LoaderOpts(FEOpts);
   Context->addModuleInterfaceChecker(
@@ -1430,6 +1474,10 @@ ModuleDecl *CompilerInstance::getMainModule() const {
       MainModule->setExportAsName(getASTContext().getIdentifier(
           Invocation.getFrontendOptions().ExportAsName));
     }
+    if (!Invocation.getFrontendOptions().PublicModuleName.empty()) {
+      MainModule->setPublicModuleName(getASTContext().getIdentifier(
+          Invocation.getFrontendOptions().PublicModuleName));
+    }
     if (Invocation.getFrontendOptions().EnableLibraryEvolution)
       MainModule->setResilienceStrategy(ResilienceStrategy::Resilient);
     if (Invocation.getLangOptions().isSwiftVersionAtLeast(6))
@@ -1437,10 +1485,17 @@ ModuleDecl *CompilerInstance::getMainModule() const {
     if (Invocation.getLangOptions().EnableCXXInterop &&
         Invocation.getLangOptions().RequireCxxInteropToImportCxxInteropModule)
       MainModule->setHasCxxInteroperability();
+    if (Invocation.getLangOptions().EnableCXXInterop)
+      MainModule->setCXXStdlibKind(Invocation.getLangOptions().CXXStdlib);
     if (Invocation.getLangOptions().AllowNonResilientAccess)
       MainModule->setAllowNonResilientAccess();
     if (Invocation.getSILOptions().EnableSerializePackage)
       MainModule->setSerializePackageEnabled();
+
+    if (auto compilerVersion =
+            Invocation.getFrontendOptions().SwiftInterfaceCompilerVersion) {
+      MainModule->setSwiftInterfaceCompilerVersion(compilerVersion);
+    }
 
     // Register the main module with the AST context.
     Context->addLoadedModule(MainModule);
@@ -1650,11 +1705,6 @@ CompilerInstance::getSourceFileParsingOptions(bool forPrimary) const {
         action != ActionType::ScanDependencies) {
       opts |= ParsingFlags::DisablePoundIfEvaluation;
     }
-
-    // If we need to dump the parse tree, disable delayed bodies as we want to
-    // show everything.
-    if (action == ActionType::DumpParse)
-      opts |= ParsingFlags::DisableDelayedBodies;
   }
 
   const auto &typeOpts = getASTContext().TypeCheckerOpts;
@@ -1708,9 +1758,9 @@ CompilerInstance::getSourceFileParsingOptions(bool forPrimary) const {
 }
 
 SourceFile *CompilerInstance::createSourceFileForMainModule(
-    ModuleDecl *mod, SourceFileKind fileKind, std::optional<unsigned> bufferID,
+    ModuleDecl *mod, SourceFileKind fileKind, unsigned bufferID,
     bool isMainBuffer) const {
-  auto isPrimary = bufferID && isPrimaryInput(*bufferID);
+  auto isPrimary = isPrimaryInput(bufferID);
   auto opts = getSourceFileParsingOptions(isPrimary);
 
   auto *inputFile = new (*Context)

@@ -23,6 +23,7 @@
 #include "TypeCheckType.h"
 #include "CodeSynthesis.h"
 #include "MiscDiagnostics.h"
+#include "swift/AST/ASTBridging.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/ASTVisitor.h"
 #include "swift/AST/Attr.h"
@@ -37,6 +38,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/Parse/Lexer.h"
@@ -321,6 +323,7 @@ TypeCheckSourceFileRequest::evaluate(Evaluator &eval, SourceFile *SF) const {
   if (!Ctx.LangOpts.hasFeature(Feature::RegionBasedIsolation))
     diagnoseUnnecessaryPreconcurrencyImports(*SF);
   diagnoseUnnecessaryPublicImports(*SF);
+  diagnoseMissingImports(*SF);
 
   // Check to see if there are any inconsistent imports.
   // Whole-module @_implementationOnly imports.
@@ -570,9 +573,9 @@ bool swift::typeCheckForCodeCompletion(
                                                  callback);
 }
 
-Expr *swift::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE, DeclContext *Context,
-                                bool replaceInvalidRefsWithErrors) {
-  return TypeChecker::resolveDeclRefExpr(UDRE, Context, replaceInvalidRefsWithErrors);
+Expr *swift::resolveDeclRefExpr(UnresolvedDeclRefExpr *UDRE,
+                                DeclContext *Context) {
+  return TypeChecker::resolveDeclRefExpr(UDRE, Context);
 }
 
 void TypeChecker::checkForForbiddenPrefix(ASTContext &C, DeclBaseName Name) {
@@ -595,11 +598,11 @@ DeclTypeCheckingSemantics
 TypeChecker::getDeclTypeCheckingSemantics(ValueDecl *decl) {
   // Check for a @_semantics attribute.
   if (auto semantics = decl->getAttrs().getAttribute<SemanticsAttr>()) {
-    if (semantics->Value.equals("typechecker.type(of:)"))
+    if (semantics->Value == "typechecker.type(of:)")
       return DeclTypeCheckingSemantics::TypeOf;
-    if (semantics->Value.equals("typechecker.withoutActuallyEscaping(_:do:)"))
+    if (semantics->Value == "typechecker.withoutActuallyEscaping(_:do:)")
       return DeclTypeCheckingSemantics::WithoutActuallyEscaping;
-    if (semantics->Value.equals("typechecker._openExistential(_:do:)"))
+    if (semantics->Value == "typechecker._openExistential(_:do:)")
       return DeclTypeCheckingSemantics::OpenExistential;
   }
   return DeclTypeCheckingSemantics::Normal;
@@ -611,7 +614,7 @@ bool TypeChecker::isDifferentiable(Type type, bool tangentVectorEqualsSelf,
   if (stage)
     type = dc->mapTypeIntoContext(type);
   auto tanSpace = type->getAutoDiffTangentSpace(
-      LookUpConformanceInModule(dc->getParentModule()));
+      LookUpConformanceInModule());
   if (!tanSpace)
     return false;
   // If no `Self == Self.TangentVector` requirement, return true.
@@ -762,4 +765,37 @@ bool TypeChecker::diagnoseInvalidFunctionType(
   }
 
   return hadAnyError;
+}
+
+extern "C" intptr_t swift_ASTGen_evaluatePoundIfCondition(
+                        BridgedASTContext astContext,
+                        void *_Nonnull diagEngine,
+                        BridgedStringRef sourceFileBuffer,
+                        BridgedStringRef conditionText,
+                        bool);
+
+std::pair<bool, bool> EvaluateIfConditionRequest::evaluate(
+    Evaluator &evaluator, SourceFile *sourceFile, SourceRange conditionRange,
+    bool shouldEvaluate
+) const {
+  // FIXME: When we migrate to SwiftParser, use the parsed syntax tree.
+  ASTContext &ctx = sourceFile->getASTContext();
+  auto &sourceMgr = ctx.SourceMgr;
+
+  // Extract the full buffer containing the condition.
+  auto bufferID = sourceMgr.findBufferContainingLoc(conditionRange.Start);
+  StringRef sourceFileText = sourceMgr.getEntireTextForBuffer(bufferID);
+
+  // Extract the condition text from that buffer.
+  auto conditionCharRange = Lexer::getCharSourceRangeFromSourceRange(sourceMgr, conditionRange);
+  StringRef conditionText = sourceMgr.extractText(conditionCharRange, bufferID);
+
+  // Evaluate the condition.
+  intptr_t evalResult = swift_ASTGen_evaluatePoundIfCondition(
+      ctx, &ctx.Diags, sourceFileText, conditionText, shouldEvaluate
+  );
+
+  bool isActive = (evalResult & 0x01) != 0;
+  bool allowSyntaxErrors = (evalResult & 0x02) != 0;
+  return std::pair(isActive, allowSyntaxErrors);
 }

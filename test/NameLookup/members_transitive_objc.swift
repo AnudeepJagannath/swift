@@ -5,23 +5,24 @@
 // RUN: %target-swift-frontend -emit-module -I %t -I %S/Inputs/MemberImportVisibility -o %t %S/Inputs/MemberImportVisibility/Categories_E.swift
 // RUN: %target-swift-frontend -typecheck %s -I %t -I %S/Inputs/MemberImportVisibility -import-objc-header %S/Inputs/MemberImportVisibility/Bridging.h -verify -swift-version 5
 // RUN: %target-swift-frontend -typecheck %s -I %t -I %S/Inputs/MemberImportVisibility -import-objc-header %S/Inputs/MemberImportVisibility/Bridging.h -verify -swift-version 6
-// RUN: %target-swift-frontend -typecheck %s -I %t -I %S/Inputs/MemberImportVisibility -import-objc-header %S/Inputs/MemberImportVisibility/Bridging.h -verify -swift-version 5 -enable-experimental-feature MemberImportVisibility -verify-additional-prefix member-visibility-
+// RUN: %target-swift-frontend -typecheck %s -I %t -I %S/Inputs/MemberImportVisibility -import-objc-header %S/Inputs/MemberImportVisibility/Bridging.h -verify -swift-version 5 -enable-upcoming-feature MemberImportVisibility -verify-additional-prefix member-visibility-
 
 // REQUIRES: objc_interop
+// REQUIRES: swift_feature_MemberImportVisibility
 
 import Categories_B
 import Categories_E
 
-// expected-member-visibility-note@-1 2 {{add import of module 'Categories_C'}}{{1-1=import Categories_C\n}}
-// expected-member-visibility-note@-2 {{add import of module 'Categories_D'}}{{1-1=import Categories_D\n}}
+// expected-member-visibility-note@-1 2 {{add import of module 'Categories_C'}}{{1-1=internal import Categories_C\n}}
+// expected-member-visibility-note@-2 {{add import of module 'Categories_D'}}{{1-1=internal import Categories_D\n}}
 func test(x: X) {
   x.fromA()
   x.fromOverlayForA()
   x.fromB()
   x.fromOverlayForB()
-  x.fromC() // expected-member-visibility-error {{class method 'fromC()' is not available due to missing import of defining module 'Categories_C'}}
+  x.fromC() // expected-member-visibility-error {{instance method 'fromC()' is not available due to missing import of defining module 'Categories_C'}}
   x.fromOverlayForC() // expected-member-visibility-error {{instance method 'fromOverlayForC()' is not available due to missing import of defining module 'Categories_C'}}
-  x.fromSubmoduleOfD() // expected-member-visibility-error {{class method 'fromSubmoduleOfD()' is not available due to missing import of defining module 'Categories_D'}}
+  x.fromSubmoduleOfD() // expected-member-visibility-error {{instance method 'fromSubmoduleOfD()' is not available due to missing import of defining module 'Categories_D'}}
   x.fromBridgingHeader()
 }
 

@@ -24,6 +24,7 @@
 #include "swift/AST/DeclNameLoc.h"
 #include "swift/AST/Identifier.h"
 #include "swift/AST/KnownProtocols.h"
+#include "swift/AST/LifetimeDependence.h"
 #include "swift/AST/MacroDeclaration.h"
 #include "swift/AST/Ownership.h"
 #include "swift/AST/PlatformKind.h"
@@ -146,6 +147,14 @@ protected:
       Value : 32
     );
 
+    SWIFT_INLINE_BITFIELD(AvailableAttr, DeclAttribute, 1+1,
+      /// Whether this attribute was spelled `@_spi_available`.
+      IsSPI : 1,
+
+      /// Whether this attribute was spelled `@_unavailableInEmbedded`.
+      IsForEmbedded : 1
+    );
+
     SWIFT_INLINE_BITFIELD(ClangImporterSynthesizedTypeAttr, DeclAttribute, 1,
       kind : 1
     );
@@ -184,8 +193,9 @@ protected:
       isUnchecked : 1
     );
 
-    SWIFT_INLINE_BITFIELD(ObjCImplementationAttr, DeclAttribute, 2,
+    SWIFT_INLINE_BITFIELD(ObjCImplementationAttr, DeclAttribute, 3,
       isCategoryNameInvalid : 1,
+      hasInvalidImplicitLangAttrs : 1,
       isEarlyAdopter : 1
     );
 
@@ -672,8 +682,6 @@ enum class PlatformAgnosticAvailabilityKind {
 /// Defines the @available attribute.
 class AvailableAttr : public DeclAttribute {
 public:
-#define INIT_VER_TUPLE(X) X(X.empty() ? std::optional<llvm::VersionTuple>() : X)
-
   AvailableAttr(SourceLoc AtLoc, SourceRange Range, PlatformKind Platform,
                 StringRef Message, StringRef Rename, ValueDecl *RenameDecl,
                 const llvm::VersionTuple &Introduced,
@@ -682,15 +690,7 @@ public:
                 SourceRange DeprecatedRange,
                 const llvm::VersionTuple &Obsoleted, SourceRange ObsoletedRange,
                 PlatformAgnosticAvailabilityKind PlatformAgnostic,
-                bool Implicit, bool IsSPI)
-      : DeclAttribute(DeclAttrKind::Available, AtLoc, Range, Implicit),
-        Message(Message), Rename(Rename), RenameDecl(RenameDecl),
-        INIT_VER_TUPLE(Introduced), IntroducedRange(IntroducedRange),
-        INIT_VER_TUPLE(Deprecated), DeprecatedRange(DeprecatedRange),
-        INIT_VER_TUPLE(Obsoleted), ObsoletedRange(ObsoletedRange),
-        PlatformAgnostic(PlatformAgnostic), Platform(Platform), IsSPI(IsSPI) {}
-
-#undef INIT_VER_TUPLE
+                bool Implicit, bool IsSPI, bool IsForEmbedded = false);
 
   /// The optional message.
   const StringRef Message;
@@ -733,9 +733,6 @@ public:
   /// The platform of the availability.
   const PlatformKind Platform;
 
-  /// Whether this is available as SPI.
-  const bool IsSPI;
-
   /// Whether this is a language-version-specific entity.
   bool isLanguageVersionSpecific() const;
 
@@ -750,6 +747,12 @@ public:
 
   /// Whether this is a noasync attribute.
   bool isNoAsync() const;
+
+  /// Whether this attribute was spelled `@_spi_available`.
+  bool isSPI() const { return Bits.AvailableAttr.IsSPI; }
+
+  /// Whether this attribute was spelled `@_unavailableInEmbedded`.
+  bool isForEmbedded() const { return Bits.AvailableAttr.IsForEmbedded; }
 
   /// Returns the platform-agnostic availability.
   PlatformAgnosticAvailabilityKind getPlatformAgnosticAvailability() const {
@@ -2316,7 +2319,7 @@ public:
   const llvm::VersionTuple Version;
 
   /// Returns true if this attribute is active given the current platform.
-  bool isActivePlatform(const ASTContext &ctx) const;
+  bool isActivePlatform(const ASTContext &ctx, bool forTargetVariant) const;
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DeclAttrKind::BackDeployed;
@@ -2434,6 +2437,7 @@ public:
       : DeclAttribute(DeclAttrKind::ObjCImplementation, AtLoc, Range, Implicit),
         CategoryName(CategoryName) {
     Bits.ObjCImplementationAttr.isCategoryNameInvalid = isCategoryNameInvalid;
+    Bits.ObjCImplementationAttr.hasInvalidImplicitLangAttrs = false;
     Bits.ObjCImplementationAttr.isEarlyAdopter = isEarlyAdopter;
   }
 
@@ -2449,6 +2453,16 @@ public:
 
   void setCategoryNameInvalid(bool newValue = true) {
     Bits.ObjCImplementationAttr.isCategoryNameInvalid = newValue;
+  }
+
+  /// Has at least one implicitly ObjC member failed to validate? If so,
+  /// diagnostics that might be duplicative will be suppressed.
+  bool hasInvalidImplicitLangAttrs() const {
+    return Bits.ObjCImplementationAttr.hasInvalidImplicitLangAttrs;
+  }
+
+  void setHasInvalidImplicitLangAttrs(bool newValue = true) {
+    Bits.ObjCImplementationAttr.hasInvalidImplicitLangAttrs = newValue;
   }
 
   static bool classof(const DeclAttribute *DA) {
@@ -2529,46 +2543,50 @@ public:
 /// Specifies the raw storage used by a type.
 class RawLayoutAttr final : public DeclAttribute {
   /// The element type to share size and alignment with, if any.
-  TypeRepr *LikeType;
+  TypeRepr *LikeType = nullptr;
   /// The number of elements in an array to share stride and alignment with,
-  /// or zero if no such size was specified. If `LikeType` is null, this is
-  /// the size in bytes of the raw storage.
-  unsigned SizeOrCount;
+  /// or nullptr if no such size was specified.
+  TypeRepr *CountType = nullptr;
+  /// The size in bytes of the raw storage.
+  unsigned Size = 0;
   /// If `LikeType` is null, the alignment in bytes to use for the raw storage.
-  unsigned Alignment;
+  unsigned Alignment = 0;
+  /// If a value of this raw layout type should move like its `LikeType`.
+  bool MovesAsLike = false;
   /// The resolved like type.
   mutable Type CachedResolvedLikeType = Type();
+  /// The resolved count type.
+  mutable Type CachedResolvedCountType = Type();
 
-  friend class ResolveRawLayoutLikeTypeRequest;
+  friend class ResolveRawLayoutTypeRequest;
 
 public:
   /// Construct a `@_rawLayout(like: T)` attribute.
-  RawLayoutAttr(TypeRepr *LikeType, SourceLoc AtLoc, SourceRange Range)
-      : DeclAttribute(DeclAttrKind::RawLayout, AtLoc, Range,
-                      /*implicit*/ false),
-        LikeType(LikeType), SizeOrCount(0), Alignment(~0u) {}
-
-  /// Construct a `@_rawLayout(likeArrayOf: T, count: N)` attribute.
-  RawLayoutAttr(TypeRepr *LikeType, unsigned Count, SourceLoc AtLoc,
+  RawLayoutAttr(TypeRepr *LikeType, bool movesAsLike, SourceLoc AtLoc,
                 SourceRange Range)
       : DeclAttribute(DeclAttrKind::RawLayout, AtLoc, Range,
                       /*implicit*/ false),
-        LikeType(LikeType), SizeOrCount(Count), Alignment(0) {}
+        LikeType(LikeType), MovesAsLike(movesAsLike) {}
+
+  /// Construct a `@_rawLayout(likeArrayOf: T, count: N)` attribute.
+  RawLayoutAttr(TypeRepr *LikeType, TypeRepr *CountType, bool movesAsLike,
+                SourceLoc AtLoc, SourceRange Range)
+      : DeclAttribute(DeclAttrKind::RawLayout, AtLoc, Range,
+                      /*implicit*/ false),
+        LikeType(LikeType), CountType(CountType), MovesAsLike(movesAsLike) {}
 
   /// Construct a `@_rawLayout(size: N, alignment: M)` attribute.
   RawLayoutAttr(unsigned Size, unsigned Alignment, SourceLoc AtLoc,
                 SourceRange Range)
       : DeclAttribute(DeclAttrKind::RawLayout, AtLoc, Range,
                       /*implicit*/ false),
-        LikeType(nullptr), SizeOrCount(Size), Alignment(Alignment) {}
+        Size(Size), Alignment(Alignment) {}
 
   /// Return the type whose single-element layout the attribute type should get
   /// its layout from. Returns null if the attribute specifies an array or manual
   /// layout.
   TypeRepr *getScalarLikeType() const {
-    if (!LikeType)
-      return nullptr;
-    if (Alignment != ~0u)
+    if (!LikeType || CountType)
       return nullptr;
     return LikeType;
   }
@@ -2576,13 +2594,11 @@ public:
   /// Return the type whose array layout the attribute type should get its
   /// layout from, along with the size of that array. Returns None if the
   /// attribute specifies scalar or manual layout.
-  std::optional<std::pair<TypeRepr *, unsigned>>
+  std::optional<std::pair<TypeRepr *, TypeRepr *>>
   getArrayLikeTypeAndCount() const {
-    if (!LikeType)
+    if (!LikeType || !CountType)
       return std::nullopt;
-    if (Alignment == ~0u)
-      return std::nullopt;
-    return std::make_pair(LikeType, SizeOrCount);
+    return std::make_pair(LikeType, CountType);
   }
 
   /// Return the size and alignment of the attributed type. Returns
@@ -2590,18 +2606,17 @@ public:
   std::optional<std::pair<unsigned, unsigned>> getSizeAndAlignment() const {
     if (LikeType)
       return std::nullopt;
-    return std::make_pair(SizeOrCount, Alignment);
+    return std::make_pair(Size, Alignment);
   }
 
   Type getResolvedLikeType(StructDecl *sd) const;
+  Type getResolvedCountType(StructDecl *sd) const;
 
   /// Return the type whose single-element layout the attribute type should get
   /// its layout from. Returns None if the attribute specifies an array or manual
   /// layout.
   std::optional<Type> getResolvedScalarLikeType(StructDecl *sd) const {
-    if (!LikeType)
-      return std::nullopt;
-    if (Alignment != ~0u)
+    if (!LikeType || CountType)
       return std::nullopt;
     return getResolvedLikeType(sd);
   }
@@ -2609,17 +2624,40 @@ public:
   /// Return the type whose array layout the attribute type should get its
   /// layout from, along with the size of that array. Returns None if the
   /// attribute specifies scalar or manual layout.
-  std::optional<std::pair<Type, unsigned>>
+  std::optional<std::pair<Type, Type>>
   getResolvedArrayLikeTypeAndCount(StructDecl *sd) const {
-    if (!LikeType)
+    if (!LikeType || !CountType)
       return std::nullopt;
-    if (Alignment == ~0u)
-      return std::nullopt;
-    return std::make_pair(getResolvedLikeType(sd), SizeOrCount);
+    return std::make_pair(getResolvedLikeType(sd), getResolvedCountType(sd));
+  }
+
+  /// Whether a value of this raw layout should move like its `LikeType`.
+  bool shouldMoveAsLikeType() const {
+    return MovesAsLike;
   }
 
   static bool classof(const DeclAttribute *DA) {
     return DA->getKind() == DeclAttrKind::RawLayout;
+  }
+};
+
+class LifetimeAttr final : public DeclAttribute {
+  LifetimeEntry *entry;
+
+  LifetimeAttr(SourceLoc atLoc, SourceRange baseRange, bool implicit,
+               LifetimeEntry *entry)
+      : DeclAttribute(DeclAttrKind::Lifetime, atLoc, baseRange, implicit),
+        entry(entry) {}
+
+public:
+  static LifetimeAttr *create(ASTContext &context, SourceLoc atLoc,
+                              SourceRange baseRange, bool implicit,
+                              LifetimeEntry *entry);
+
+  LifetimeEntry *getLifetimeEntry() const { return entry; }
+
+  static bool classof(const DeclAttribute *DA) {
+    return DA->getKind() == DeclAttrKind::Lifetime;
   }
 };
 
@@ -2696,6 +2734,10 @@ public:
     return getUnavailable(ctx) != nullptr;
   }
 
+  bool isDeprecated(const ASTContext &ctx) const {
+    return getDeprecated(ctx) != nullptr;
+  }
+
   /// Determine whether there is a swiftVersionSpecific attribute that's
   /// unavailable relative to the provided language version.
   bool
@@ -2732,7 +2774,8 @@ public:
 
   /// Returns the `@backDeployed` attribute that is active for the current
   /// platform.
-  const BackDeployedAttr *getBackDeployed(const ASTContext &ctx) const;
+  const BackDeployedAttr *getBackDeployed(const ASTContext &ctx,
+                                          bool forTargetVariant) const;
 
   SWIFT_DEBUG_DUMPER(dump(const Decl *D = nullptr));
   void print(ASTPrinter &Printer, const PrintOptions &Options,
@@ -2862,7 +2905,7 @@ public:
   /// Return whether this attribute set includes the given semantics attribute.
   bool hasSemanticsAttr(StringRef attrValue) const {
     return llvm::any_of(getSemanticsAttrs(), [&](const SemanticsAttr *attr) {
-      return attrValue.equals(attr->Value);
+      return attrValue == attr->Value;
     });
   }
 
@@ -3044,6 +3087,10 @@ public:
 
   /// Return the name (like "autoclosure") for an attribute ID.
   static const char *getAttrName(TypeAttrKind kind);
+
+  /// Returns whether the given attribute is considered "user inaccessible",
+  /// which affects e.g whether it shows up in code completion.
+  static bool isUserInaccessible(TypeAttrKind DK);
 
   static TypeAttribute *createSimple(const ASTContext &context,
                                      TypeAttrKind kind,

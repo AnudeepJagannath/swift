@@ -16,8 +16,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "TypeChecker.h"
+#include "OpenedExistentials.h"
 #include "TypeCheckConcurrency.h"
 #include "TypeCheckEffects.h"
+#include "swift/AST/ASTBridging.h"
 #include "swift/AST/ASTWalker.h"
 #include "swift/AST/DiagnosticsSema.h"
 #include "swift/AST/Effects.h"
@@ -28,6 +30,7 @@
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 
 using namespace swift;
 
@@ -508,6 +511,10 @@ template <class Impl>
 class EffectsHandlingWalker : public ASTWalker {
   Impl &asImpl() { return *static_cast<Impl*>(this); }
 public:
+  LazyInitializerWalking getLazyInitializerWalkingBehavior() override {
+    return LazyInitializerWalking::InAccessor;
+  }
+
   /// Only look at the expansions for effects checking.
   MacroWalking getMacroWalkingBehavior() const override {
     return MacroWalking::Expansion;
@@ -517,9 +524,7 @@ public:
     ShouldRecurse_t recurse = ShouldRecurse;
     // Skip the implementations of all local declarations... except
     // PBD.  We should really just have a PatternBindingStmt.
-    if (auto ic = dyn_cast<IfConfigDecl>(D)) {
-      recurse = asImpl().checkIfConfig(ic);
-    } else if (auto patternBinding = dyn_cast<PatternBindingDecl>(D)) {
+    if (auto patternBinding = dyn_cast<PatternBindingDecl>(D)) {
       if (patternBinding->isAsyncLet())
         recurse = asImpl().checkAsyncLet(patternBinding);
     } else if (auto macroExpansionDecl = dyn_cast<MacroExpansionDecl>(D)) {
@@ -805,17 +810,17 @@ static Type typeEraseOpenedArchetypes(Type type) {
   if (!type || !type->hasOpenedExistential())
     return type;
 
-  const OpenedArchetypeType *root = nullptr;
+  GenericEnvironment *env = nullptr;
   type.visit([&](Type type) {
     if (auto opened = dyn_cast<OpenedArchetypeType>(type.getPointer())) {
-      root = opened->getRoot();
+      env = opened->getGenericEnvironment();
     }
   });
 
-  if (!root)
+  if (!env)
     return type;
 
-  return constraints::typeEraseOpenedArchetypesWithRoot(type, root);
+  return typeEraseOpenedArchetypesFromEnvironment(type, env);
 }
 
 /// A type expressing the result of classifying whether a call or function
@@ -939,7 +944,7 @@ public:
                                   ConditionalEffectKind conditionalKind,
                                   PotentialEffectReason reason) {
     Classification result;
-    if (!thrownError || isNeverThrownError(thrownError))
+    if (isNeverThrownError(thrownError))
       return result;
 
     assert(!thrownError->hasError());
@@ -1162,8 +1167,8 @@ public:
           conditional = ConditionalEffectKind::Always;
 
         // Use the Failure type witness, when present.
-        Type thrownError = conformanceRef.getAssociatedType(
-            type, failureAssocType->getDeclaredInterfaceType());
+        Type thrownError = conformanceRef.getTypeWitness(
+            type, failureAssocType);
         return Classification::forThrows(
             thrownError, conditional,
             /*FIXME*/PotentialEffectReason::forConformance());
@@ -1251,6 +1256,7 @@ public:
     Classification classification;
     PotentialEffectReason reason = PotentialEffectReason::forPropertyAccess();
     ConcreteDeclRef declRef = E->getDeclRef();
+
     if (auto getter = getEffectfulGetOnlyAccessor(declRef)) {
       reason = getKindOfEffectfulProp(declRef);
       classification = Classification::forDeclRef(
@@ -1283,7 +1289,7 @@ public:
     thrownValue = removeErasureToExistentialError(thrownValue);
 
     Type thrownType = thrownValue->getType();
-    if (!thrownType)
+    if (!thrownType || thrownType->hasError())
       return Classification::forInvalidCode();
 
     // FIXME: Add a potential effect reason for a throw site.
@@ -1390,7 +1396,7 @@ public:
             isRethrowLikeTypedThrows(fnRef.getFunction())) {
           // If we are in a rethrowing context and the function we're referring
           // to is a rethrow-like function using typed throws or we are
-          // calling the next() or next(_:) of an async iterator,
+          // calling the next() or next(isolation:) of an async iterator,
           // then look at all of the closure arguments.
           LLVM_FALLTHROUGH;
         } else {
@@ -1711,10 +1717,6 @@ private:
       return ShouldRecurse;
     }
 
-    ShouldRecurse_t checkIfConfig(IfConfigDecl *D) {
-      return ShouldRecurse;
-    }
-
     ShouldRecurse_t checkForEach(ForEachStmt *S) {
       classification.merge(Self.classifyForEach(S));
       return ShouldRecurse;
@@ -1823,10 +1825,6 @@ private:
       return ShouldRecurse;
     }
     ShouldRecurse_t checkInterpolatedStringLiteral(InterpolatedStringLiteralExpr *E) {
-      return ShouldRecurse;
-    }
-
-    ShouldRecurse_t checkIfConfig(IfConfigDecl *D) {
       return ShouldRecurse;
     }
 
@@ -2018,7 +2016,7 @@ private:
   /// Given the type of an argument, try to determine if it contains
   /// a throws/async function in a way that is permitted to cause a
   /// rethrows/reasync function to throw/async.
-  static Classification 
+  static Classification
   classifyArgumentByType(Type paramType, SubstitutionMap subs,
                          ConditionalEffectKind conditional,
                          PotentialEffectReason reason, EffectKind kind) {
@@ -2084,6 +2082,9 @@ public:
     /// The initializer for a global variable.
     GlobalVarInitializer,
 
+    /// The initializer for a `lazy` variable.
+    LazyVarInitializer,
+
     /// The initializer for an enum element.
     EnumElementInitializer,
 
@@ -2099,8 +2100,12 @@ public:
 
 private:
   static Context getContextForPatternBinding(PatternBindingDecl *pbd) {
+    auto *var = pbd->getSingleVar();
+
     if (!pbd->isStatic() && pbd->getDeclContext()->isTypeContext()) {
       return Context(Kind::IVarInitializer, pbd->getDeclContext());
+    } else if (var && var->getAttrs().hasAttribute<LazyAttr>()) {
+      return Context(Kind::LazyVarInitializer, pbd->getDeclContext());
     } else {
       return Context(Kind::GlobalVarInitializer, pbd->getDeclContext());
     }
@@ -2518,6 +2523,7 @@ public:
 
     case Kind::EnumElementInitializer:
     case Kind::GlobalVarInitializer:
+    case Kind::LazyVarInitializer:
     case Kind::IVarInitializer:
     case Kind::DefaultArgument:
     case Kind::PropertyWrapper:
@@ -2554,6 +2560,7 @@ public:
 
     case Kind::EnumElementInitializer:
     case Kind::GlobalVarInitializer:
+    case Kind::LazyVarInitializer:
     case Kind::IVarInitializer:
     case Kind::DefaultArgument:
     case Kind::PropertyWrapper:
@@ -2580,6 +2587,7 @@ public:
 
     case Kind::EnumElementInitializer:
     case Kind::GlobalVarInitializer:
+    case Kind::LazyVarInitializer:
     case Kind::IVarInitializer:
     case Kind::DefaultArgument:
     case Kind::PropertyWrapper:
@@ -2663,12 +2671,20 @@ public:
   }
 
   /// providing a \c kind helps tailor the emitted message.
-  void
-  diagnoseUnhandledAsyncSite(DiagnosticEngine &Diags, ASTNode node,
+  void diagnoseUnhandledAsyncSite(DiagnosticEngine &Diags, ASTNode node,
                              std::optional<PotentialEffectReason> maybeReason,
                              bool forAwait = false) {
-    if (node.isImplicit())
+    if (node.isImplicit()) {
+      // The reason we return early on implicit nodes is that sometimes we
+      // inject implicit closures, e.g. in 'async let' and we'd end up
+      // "double reporting" some errors, with no great way to make sure the
+      // "more specific diagnostic" is emitted. So instead, we avoid emitting
+      // about implicit code.
+      //
+      // Some synthesized code, like macros, are NOT marked implicit, so we will
+      // report about errors in them properly.
       return;
+    }
 
     switch (getKind()) {
     case Kind::PotentiallyHandled: {
@@ -2681,6 +2697,7 @@ public:
 
     case Kind::EnumElementInitializer:
     case Kind::GlobalVarInitializer:
+    case Kind::LazyVarInitializer:
     case Kind::IVarInitializer:
     case Kind::DefaultArgument:
     case Kind::PropertyWrapper:
@@ -2691,7 +2708,16 @@ public:
       return;
     }
   }
+
 };
+
+/// ASTGen helper function to look for a "try" or "throw" in inactive code
+/// within the given source file.
+extern "C" bool swift_ASTGen_inactiveCodeContainsTryOrThrow(
+    BridgedASTContext ctx,
+    BridgedStringRef sourceFileBuffer,
+    BridgedStringRef searchRange
+);
 
 /// A class to walk over a local context and validate the correctness
 /// of its error coverage.
@@ -2723,13 +2749,13 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
 
       /// Do we have a throw site using 'try' in this context?
       HasTryThrowSite = 0x10,
-      
+
       /// Are we in the context of an 'await'?
       IsAsyncCovered = 0x20,
-      
+
       /// Do we have any calls to 'async' functions in this context?
       HasAnyAsyncSite = 0x40,
-      
+
       /// Do we have any 'await's in this context?
       HasAnyAwait = 0x80,
 
@@ -3010,9 +3036,24 @@ class CheckEffectsCoverage : public EffectsHandlingWalker<CheckEffectsCoverage> 
   Type getCaughtErrorTypeAt(SourceLoc loc) {
     auto dc = CurContext.getDeclContext();
     auto module = dc->getParentModule();
+
+    // Autoclosures can't be found via ASTScope lookup.
+    if (CurContext.isAutoClosure()) {
+      auto *closure = dyn_cast<AutoClosureExpr>(CurContext.getDeclContext());
+      if (auto type = closure->getEffectiveThrownType())
+        return *type;
+
+      // Otherwise, the closure does not throw.
+      return Ctx.getNeverType();
+    }
+
     if (CatchNode catchNode = ASTScope::lookupCatchNode(module, loc)) {
       if (auto caughtType = catchNode.getThrownErrorTypeInContext(Ctx))
         return *caughtType;
+
+      // If a catch node returns null for its thrown error type, we're
+      // in a non-throwing context.
+      return Ctx.getNeverType();
     }
 
     // Fall back to the error existential.
@@ -3124,7 +3165,7 @@ private:
 
     S->getBody()->walk(*this);
 
-    diagnoseNoThrowInDo(S, scope);
+    diagnoseNoThrowInDo(S, scope, S->getBody()->getSourceRange());
 
     return MaxThrowingKind;
   }
@@ -3148,17 +3189,40 @@ private:
 
     S->getBody()->walk(*this);
 
-    diagnoseNoThrowInDo(S, scope);
+    diagnoseNoThrowInDo(S, scope, S->getBody()->getSourceRange());
 
     scope.preserveCoverageFromNonExhaustiveCatch();
     return MaxThrowingKind;
   }
 
-  void diagnoseNoThrowInDo(DoCatchStmt *S, ContextScope &scope) {
+  /// Determine whether the inactive code within the given body range
+  /// contains a "try" or a "throw".
+  bool inactiveCodeContainsTryOrThrow(SourceRange bodyRange) {
+#if SWIFT_BUILD_SWIFT_SYNTAX
+    SourceManager &sourceMgr = Ctx.SourceMgr;
+    auto bufferID = sourceMgr.findBufferContainingLoc(bodyRange.Start);
+    StringRef sourceFileText = sourceMgr.getEntireTextForBuffer(bufferID);
+
+    // Extract the search text from that buffer.
+    auto searchTextCharRange = Lexer::getCharSourceRangeFromSourceRange(
+        sourceMgr, bodyRange);
+    StringRef searchText = sourceMgr.extractText(searchTextCharRange, bufferID);
+
+    return swift_ASTGen_inactiveCodeContainsTryOrThrow(
+        Ctx, sourceFileText, searchText);
+#else
+    return false;
+#endif
+  }
+
+  void diagnoseNoThrowInDo(
+      DoCatchStmt *S, ContextScope &scope, SourceRange bodyRange
+  ) {
     // Warn if nothing threw within the body, unless this is the
     // implicit do/catch in a debugger function.
     if (!Flags.has(ContextFlags::HasAnyThrowSite) &&
-        !scope.wasTopLevelDebuggerFunction()) {
+        !scope.wasTopLevelDebuggerFunction() &&
+        !inactiveCodeContainsTryOrThrow(bodyRange)) {
       Ctx.Diags.diagnose(S->getCatches().front()->getStartLoc(),
                          diag::no_throw_in_do_with_catch);
     }
@@ -3275,41 +3339,6 @@ private:
       E->getAppendingExpr()->walk(*this);
     scope.preserveCoverageFromInterpolatedString();
     return ShouldNotRecurse;
-  }
-
-  ShouldRecurse_t checkIfConfig(IfConfigDecl *ICD) {
-    // Check the inactive regions of a #if block to disable warnings that may
-    // be due to platform specific code.
-    struct ConservativeThrowChecker : public ASTWalker {
-      CheckEffectsCoverage &CEC;
-      ConservativeThrowChecker(CheckEffectsCoverage &CEC) : CEC(CEC) {}
-
-      MacroWalking getMacroWalkingBehavior() const override {
-        return MacroWalking::Arguments;
-      }
-
-      PostWalkResult<Expr *> walkToExprPost(Expr *E) override {
-        if (isa<TryExpr>(E))
-          CEC.Flags.set(ContextFlags::HasAnyThrowSite);
-        return Action::Continue(E);
-      }
-      
-      PostWalkResult<Stmt *> walkToStmtPost(Stmt *S) override {
-        if (isa<ThrowStmt>(S))
-          CEC.Flags.set(ContextFlags::HasAnyThrowSite);
-
-        return Action::Continue(S);
-      }
-    };
-
-    for (auto &clause : ICD->getClauses()) {
-      // Active clauses are handled by the normal AST walk.
-      if (clause.isActive) continue;
-      
-      for (auto elt : clause.Elements)
-        elt.walk(ConservativeThrowChecker(*this));
-    }
-    return ShouldRecurse;
   }
 
   ShouldRecurse_t checkThrow(ThrowStmt *S) {
@@ -3680,8 +3709,15 @@ private:
            // callee is isolated to an actor.
            auto callee = call->getCalledValue(/*skipFunctionConversions=*/true);
            if (callee) {
-             Ctx.Diags.diagnose(diag.expr.getStartLoc(), diag::actor_isolated_sync_func,
+             auto calleeIsolation = getInferredActorIsolation(callee);
+             Ctx.Diags.diagnose(diag.expr.getStartLoc(),
+                                diag::actor_isolated_sync_func,
                                 callee);
+             if (calleeIsolation.source.isInferred()) {
+               callee->diagnose(diag::actor_isolation_source,
+                                calleeIsolation.isolation,
+                                calleeIsolation.source);
+             }
            } else {
              Ctx.Diags.diagnose(
                  diag.expr.getStartLoc(), diag::actor_isolated_sync_func_value,
@@ -3758,12 +3794,25 @@ void TypeChecker::checkFunctionEffects(AbstractFunctionDecl *fn) {
       superInit->walk(checker);
 }
 
-void TypeChecker::checkInitializerEffects(Initializer *initCtx,
-                                                Expr *init) {
+evaluator::SideEffect
+CheckInitEffectsRequest::evaluate(Evaluator &evaluator,
+                                  Initializer *initCtx,
+                                  Expr *init) const {
   auto &ctx = initCtx->getASTContext();
   CheckEffectsCoverage checker(ctx, Context::forInitializer(initCtx));
   init->walk(checker);
   init->walk(LocalFunctionEffectsChecker());
+
+  return {};
+}
+
+
+void TypeChecker::checkInitializerEffects(Initializer *initCtx,
+                                          Expr *init) {
+  evaluateOrDefault(
+      initCtx->getASTContext().evaluator,
+      CheckInitEffectsRequest{initCtx, init},
+      {});
 }
 
 void TypeChecker::checkCallerSideDefaultArgumentEffects(DeclContext *initCtx,

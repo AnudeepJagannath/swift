@@ -40,6 +40,7 @@ set(SWIFT_BENCH_MODULES
     single-source/ArrayRemoveAll
     single-source/ArraySetElement
     single-source/ArraySubscript
+    single-source/AsyncTree
     single-source/BinaryFloatingPointConversionFromBinaryInteger
     single-source/BinaryFloatingPointProperties
     single-source/BitCount
@@ -209,9 +210,11 @@ set(SWIFT_BENCH_MODULES
     single-source/XorLoop
     cxx-source/CreateObjects
     cxx-source/CxxSetToCollection
+    cxx-source/CxxSpanTests
     cxx-source/CxxStringConversion
     cxx-source/CxxVectorSum
-    cxx-source/ReadAccessor
+    # TODO: rdar://92120528
+    # cxx-source/ReadAccessor
 )
 
 set(SWIFT_MULTISOURCE_SWIFT_BENCHES

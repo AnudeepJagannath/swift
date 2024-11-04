@@ -12,6 +12,7 @@
 
 #define DEBUG_TYPE "capture-prop"
 #include "swift/AST/GenericEnvironment.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Demangling/Demangle.h"
 #include "swift/SIL/SILCloner.h"
 #include "swift/SIL/SILInstruction.h"
@@ -255,7 +256,7 @@ CanSILFunctionType getPartialApplyInterfaceResultType(PartialApplyInst *PAI) {
   // return signature.
   auto FTy = PAI->getType().castTo<SILFunctionType>();
   assert(!PAI->hasSubstitutions() ||
-         !PAI->getSubstitutionMap().hasArchetypes());
+         !PAI->getSubstitutionMap().getRecursiveProperties().hasArchetype());
   FTy = cast<SILFunctionType>(
     FTy->mapTypeOutOfContext()->getCanonicalType());
   auto NewFTy = FTy;
@@ -511,7 +512,8 @@ bool CapturePropagation::optimizePartialApply(PartialApplyInst *PAI) {
   if (SubstF->isExternalDeclaration())
     return false;
 
-  if (PAI->hasSubstitutions() && PAI->getSubstitutionMap().hasArchetypes()) {
+  if (PAI->hasSubstitutions() &&
+      PAI->getSubstitutionMap().getRecursiveProperties().hasArchetype()) {
     LLVM_DEBUG(llvm::dbgs()
                  << "CapturePropagation: cannot handle partial specialization "
                     "of partial_apply:\n";
@@ -589,6 +591,7 @@ bool CapturePropagation::optimizePartialApply(PartialApplyInst *PAI) {
 
 void CapturePropagation::run() {
   DominanceAnalysis *DA = PM->getAnalysis<DominanceAnalysis>();
+  PostDominanceAnalysis *PDA = PM->getAnalysis<PostDominanceAnalysis>();
   auto *F = getFunction();
   bool HasChanged = false;
 
@@ -597,7 +600,8 @@ void CapturePropagation::run() {
     return;
 
   // Cache cold blocks per function.
-  ColdBlockInfo ColdBlocks(DA);
+  ColdBlockInfo ColdBlocks(DA, PDA);
+  ColdBlocks.analyze(F);
   for (auto &BB : *F) {
     if (ColdBlocks.isCold(&BB))
       continue;

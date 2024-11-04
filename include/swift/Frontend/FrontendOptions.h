@@ -38,12 +38,12 @@ enum class IntermoduleDepTrackingMode;
 /// Options for controlling the behavior of the frontend.
 class FrontendOptions {
   friend class ArgsToFrontendOptionsConverter;
+public:
 
   /// A list of arbitrary modules to import and make implicitly visible.
   std::vector<std::pair<std::string, bool /*testable*/>>
       ImplicitImportModuleNames;
 
-public:
   FrontendInputsAndOutputs InputsAndOutputs;
 
   void forAllOutputPaths(const InputFile &input,
@@ -69,6 +69,9 @@ public:
 
   /// Module name to use when referenced in clients module interfaces.
   std::string ExportAsName;
+
+  /// The public facing name of the module to build.
+  std::string PublicModuleName;
 
   /// Arguments which should be passed in immediate mode.
   std::vector<std::string> ImmediateArgv;
@@ -106,6 +109,10 @@ public:
 
   /// User-defined module version number.
   llvm::VersionTuple UserModuleVersion;
+
+  /// The Swift compiler version number that would be used to synthesize
+  /// swiftinterface files and subsequently their swiftmodules.
+  llvm::VersionTuple SwiftInterfaceCompilerVersion;
 
   /// A set of modules allowed to import this module.
   std::set<std::string> AllowableClients;
@@ -175,20 +182,21 @@ public:
     Immediate, ///< Immediate mode
     REPL,      ///< REPL mode
 
-    EmitAssembly, ///< Emit assembly
-    EmitIRGen,    ///< Emit LLVM IR before LLVM optimizations
-    EmitIR,       ///< Emit LLVM IR after LLVM optimizations
-    EmitBC,       ///< Emit LLVM BC
-    EmitObject,   ///< Emit object file
+    EmitAssembly,   ///< Emit assembly
+    EmitLoweredSIL, ///< Emit lowered SIL before IRGen runs
+    EmitIRGen,      ///< Emit LLVM IR before LLVM optimizations
+    EmitIR,         ///< Emit LLVM IR after LLVM optimizations
+    EmitBC,         ///< Emit LLVM BC
+    EmitObject,     ///< Emit object file
 
     DumpTypeInfo, ///< Dump IRGen type info
 
     EmitPCM, ///< Emit precompiled Clang module from a module map
     DumpPCM, ///< Dump information about a precompiled Clang module
 
-    ScanDependencies,        ///< Scan dependencies of Swift source files
-    PrintVersion,       ///< Print version information.
-    PrintFeature,       ///< Print supported feature of this compiler
+    ScanDependencies, ///< Scan dependencies of Swift source files
+    PrintVersion,     ///< Print version information.
+    PrintFeature,     ///< Print supported feature of this compiler
   };
 
   /// Indicates the action the user requested that the frontend perform.
@@ -224,6 +232,13 @@ public:
 
   /// The path to which we should output statistics files.
   std::string StatsOutputDir;
+
+  /// Whether to enable timers tracking individual requests. This adds some
+  /// runtime overhead.
+  bool FineGrainedTimers = false;
+
+  /// Whether we are printing all stats even if they are zero.
+  bool PrintZeroStats = false;
 
   /// Trace changes to stats to files in StatsOutputDir.
   bool TraceStats = false;
@@ -358,7 +373,7 @@ public:
 
   /// Whether the dependency scanner invocation should resolve imports
   /// to filesystem modules in parallel.
-  bool ParallelDependencyScan = false;
+  bool ParallelDependencyScan = true;
 
   /// When performing an incremental build, ensure that cross-module incremental
   /// build metadata is available in any swift modules emitted by this frontend

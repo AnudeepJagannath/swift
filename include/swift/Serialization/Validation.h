@@ -14,6 +14,7 @@
 #define SWIFT_SERIALIZATION_VALIDATION_H
 
 #include "swift/AST/Identifier.h"
+#include "swift/Basic/CXXStdlibKind.h"
 #include "swift/Basic/LLVM.h"
 #include "swift/Basic/Version.h"
 #include "swift/Serialization/SerializationOptions.h"
@@ -128,6 +129,9 @@ class ExtendedValidationInfo {
   StringRef ModuleABIName;
   StringRef ModulePackageName;
   StringRef ExportAsName;
+  StringRef PublicModuleName;
+  CXXStdlibKind CXXStdlib;
+  llvm::VersionTuple SwiftInterfaceCompilerVersion;
   struct {
     unsigned ArePrivateImportsEnabled : 1;
     unsigned IsSIB : 1;
@@ -228,6 +232,9 @@ public:
   StringRef getModulePackageName() const { return ModulePackageName; }
   void setModulePackageName(StringRef name) { ModulePackageName = name; }
 
+  StringRef getPublicModuleName() const { return PublicModuleName; }
+  void setPublicModuleName(StringRef name) { PublicModuleName = name; }
+
   StringRef getExportAsName() const { return ExportAsName; }
   void setExportAsName(StringRef name) { ExportAsName = name; }
 
@@ -240,6 +247,19 @@ public:
   bool hasCxxInteroperability() const { return Bits.HasCxxInteroperability; }
   void setHasCxxInteroperability(bool val) {
     Bits.HasCxxInteroperability = val;
+  }
+
+  CXXStdlibKind getCXXStdlibKind() const { return CXXStdlib; }
+  void setCXXStdlibKind(CXXStdlibKind kind) { CXXStdlib = kind; }
+
+  llvm::VersionTuple getSwiftInterfaceCompilerVersion() const {
+    return SwiftInterfaceCompilerVersion;
+  }
+  void setSwiftInterfaceCompilerVersion(StringRef version) {
+    llvm::VersionTuple compilerVersion;
+    if (compilerVersion.tryParse(version))
+      return;
+    SwiftInterfaceCompilerVersion = compilerVersion;
   }
 };
 

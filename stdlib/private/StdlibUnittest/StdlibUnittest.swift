@@ -20,10 +20,13 @@ import SwiftPrivateLibcExtras
 import Foundation
 #endif
 import Darwin
+import var Darwin.errno
 #elseif canImport(Glibc)
 import Glibc
 #elseif canImport(Musl)
 import Musl
+#elseif canImport(Android)
+import Android
 #elseif os(WASI)
 import WASILibc
 #elseif os(Windows)
@@ -1104,7 +1107,7 @@ class _ParentProcess {
       var ret: CInt
       repeat {
         ret = _stdlib_select(&readfds, &writefds, &errorfds, nil)
-      } while ret == -1  &&  errno == EINTR
+      } while ret == -1 && errno == EINTR
       if ret <= 0 {
         fatalError("select() returned an error")
       }

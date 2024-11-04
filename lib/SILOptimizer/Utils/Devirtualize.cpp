@@ -12,11 +12,13 @@
 
 #define DEBUG_TYPE "sil-devirtualize-utility"
 #include "swift/SILOptimizer/Utils/Devirtualize.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/Decl.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/CalleeCache.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/OptimizationRemark.h"
@@ -385,6 +387,76 @@ swift::getExactDynamicTypeOfUnderlyingObject(SILValue instance,
   return getExactDynamicType(instance, cha, /* forUnderlyingObject */ true);
 }
 
+/// Combine two substitution maps as follows.
+///
+/// The result is written in terms of the generic parameters of 'genericSig'.
+///
+/// Generic parameters with a depth less than 'firstDepth'
+/// come from 'firstSubMap'.
+///
+/// Generic parameters with a depth greater than 'firstDepth' come from
+/// 'secondSubMap', but are looked up starting with a depth or index of
+/// 'secondDepth'.
+///
+/// The 'how' parameter determines if we're looking at the depth or index.
+static SubstitutionMap
+combineSubstitutionMaps(SubstitutionMap firstSubMap,
+                        SubstitutionMap secondSubMap,
+                        unsigned firstDepth,
+                        unsigned secondDepth,
+                        GenericSignature genericSig) {
+  auto &ctx = genericSig->getASTContext();
+
+  return SubstitutionMap::get(
+    genericSig,
+    [&](SubstitutableType *type) {
+      auto *gp = cast<GenericTypeParamType>(type);
+      if (gp->getDepth() < firstDepth)
+        return QuerySubstitutionMap{firstSubMap}(gp);
+
+      auto *replacement = GenericTypeParamType::get(
+          gp->getParamKind(),
+          gp->getDepth() + secondDepth - firstDepth,
+          gp->getIndex(),
+          gp->getValueType(),
+          ctx);
+      return QuerySubstitutionMap{secondSubMap}(replacement);
+    },
+    // We might not have enough information in the substitution maps alone.
+    //
+    // Eg,
+    //
+    // class Base<T1> {
+    //   func foo<U1>(_: U1) where T1 : P {}
+    // }
+    //
+    // class Derived<T2> : Base<Foo<T2>> {
+    //   override func foo<U2>(_: U2) where T2 : Q {}
+    // }
+    //
+    // Suppose we're devirtualizing a call to Base.foo() on a value whose
+    // type is known to be Derived<Bar>. We start with substitutions written
+    // in terms of Base.foo()'s generic signature:
+    //
+    // <T1, U1 where T1 : P>
+    // T1 := Foo<Bar>
+    // T1 : P := Foo<Bar> : P
+    //
+    // We want to build substitutions in terms of Derived.foo()'s
+    // generic signature:
+    //
+    // <T2, U2 where T2 : Q>
+    // T2 := Bar
+    // T2 : Q := Bar : Q
+    //
+    // The conformance Bar : Q is difficult to recover in the general case.
+    //
+    // Some combination of storing substitution maps in BoundGenericTypes
+    // as well as for method overrides would solve this, but for now, just
+    // punt to global lookup.
+    LookUpConformanceInModule());
+}
+
 // Start with the substitutions from the apply.
 // Try to propagate them to find out the real substitutions required
 // to invoke the method.
@@ -419,7 +491,7 @@ getSubstitutionsForCallee(SILModule &module, CanSILFunctionType baseCalleeType,
     if (auto metatypeType = derivedClass->getAs<MetatypeType>())
       derivedClass = metatypeType->getInstanceType();
     baseSubMap = derivedClass->getContextSubstitutionMap(
-        module.getSwiftModule(), baseClassDecl);
+        baseClassDecl);
   }
 
   SubstitutionMap origSubMap = applySite.getSubstitutionMap();
@@ -439,13 +511,11 @@ getSubstitutionsForCallee(SILModule &module, CanSILFunctionType baseCalleeType,
 
   auto baseCalleeSig = baseCalleeType->getInvocationGenericSignature();
 
-  return
-    SubstitutionMap::combineSubstitutionMaps(baseSubMap,
-                                             origSubMap,
-                                             CombineSubstitutionMaps::AtDepth,
-                                             baseDepth,
-                                             origDepth,
-                                             baseCalleeSig);
+  return combineSubstitutionMaps(baseSubMap,
+                                 origSubMap,
+                                 baseDepth,
+                                 origDepth,
+                                 baseCalleeSig);
 }
 
 // Return the new apply and true if a cast required CFG modification.
@@ -719,11 +789,11 @@ bool swift::canDevirtualizeClassMethod(FullApplySite applySite, ClassDecl *cd,
     return false;
   }
 
-  // pcmo TODO: check for tri-state serialized kind
-  if (applySite.getFunction()->isSerialized()) {
+  if (applySite.getFunction()->isAnySerialized()) {
     // function_ref inside fragile function cannot reference a private or
     // hidden symbol.
-    if (!f->hasValidLinkageForFragileRef())
+    if (!f->hasValidLinkageForFragileRef(
+      applySite.getFunction()->getSerializedKind()))
       return false;
   }
 
@@ -798,6 +868,17 @@ swift::devirtualizeClassMethod(SILPassManager *pm, FullApplySite applySite,
     ++indirectResultArgIter;
   }
 
+  if (SILType errorTy = substConv.getIndirectErrorResultType(applySite.getFunction()->getTypeExpansionContext())) {
+    auto errorArgs = applySite.getIndirectSILErrorResults();
+    ASSERT(errorArgs.size() == 1);
+    SILValue errorArg = errorArgs[0];
+    auto castRes = castValueToABICompatibleType(
+        &builder, pm, loc, errorArg, errorArg->getType(),
+        errorTy, {applySite.getInstruction()});
+    newArgs.push_back(castRes.first);
+    changedCFG |= castRes.second;
+  }
+
   auto paramArgIter = applySite.getArgumentsWithoutIndirectResults().begin();
   // Skip the last parameter, which is `self`. Add it below.
   for (auto param : substConv.getParameters()) {
@@ -806,7 +887,7 @@ swift::devirtualizeClassMethod(SILPassManager *pm, FullApplySite applySite,
     SILValue arg = *paramArgIter;
     if (builder.hasOwnership() && arg->getType().isObject() &&
         arg->getOwnershipKind() == OwnershipKind::Owned &&
-        param.isGuaranteed()) {
+        param.isGuaranteedInCaller()) {
       SILBuilderWithScope borrowBuilder(applySite.getInstruction(), builder);
       arg = borrowBuilder.createBeginBorrow(loc, arg);
       newArgBorrows.push_back(arg);
@@ -954,18 +1035,16 @@ getWitnessMethodSubstitutions(
         }
 
         if (depth < baseDepth) {
-          paramType = GenericTypeParamType::get(
-              paramType->isParameterPack(),
-              depth, paramType->getIndex(), ctx);
+          paramType = GenericTypeParamType::get(paramType->getParamKind(),
+              depth, paramType->getIndex(), paramType->getValueType(), ctx);
 
           return Type(paramType).subst(baseSubMap);
         }
 
         depth = depth - baseDepth + 1;
 
-        paramType = GenericTypeParamType::get(
-            paramType->isParameterPack(),
-            depth, paramType->getIndex(), ctx);
+        paramType = GenericTypeParamType::get(paramType->getParamKind(),
+            depth, paramType->getIndex(), paramType->getValueType(), ctx);
         return Type(paramType).subst(origSubMap);
       },
       [&](CanType type, Type substType, ProtocolDecl *proto) {
@@ -983,15 +1062,14 @@ getWitnessMethodSubstitutions(
         }
 
         if (depth < baseDepth) {
-          type = CanType(type.transform([&](Type t) -> Type {
-            if (t->isEqual(paramType)) {
-              return GenericTypeParamType::get(
-                  paramType->isParameterPack(),
-                  depth, paramType->getIndex(), ctx);
+          type = CanType(type.transformRec([&](TypeBase *t) -> std::optional<Type> {
+            if (t == paramType) {
+              return Type(GenericTypeParamType::get(paramType->getParamKind(),
+                  depth, paramType->getIndex(), paramType->getValueType(), ctx));
             }
 
-            assert(!t->is<GenericTypeParamType>());
-            return t;
+            assert(!isa<GenericTypeParamType>(t));
+            return std::nullopt;
           }));
 
           return baseSubMap.lookupConformance(type, proto);
@@ -999,15 +1077,14 @@ getWitnessMethodSubstitutions(
 
         depth = depth - baseDepth + 1;
 
-        type = CanType(type.transform([&](Type t) -> Type {
-          if (t->isEqual(paramType)) {
-            return GenericTypeParamType::get(
-                paramType->isParameterPack(),
-                depth, paramType->getIndex(), ctx);
+        type = CanType(type.transformRec([&](TypeBase *t) -> std::optional<Type> {
+          if (t == paramType) {
+            return Type(GenericTypeParamType::get(paramType->getParamKind(),
+                depth, paramType->getIndex(), paramType->getValueType(), ctx));
           }
 
-          assert(!t->is<GenericTypeParamType>());
-          return t;
+          assert(!isa<GenericTypeParamType>(t));
+          return std::nullopt;
         }));
 
         return origSubMap.lookupConformance(type, proto);
@@ -1089,7 +1166,7 @@ devirtualizeWitnessMethod(SILPassManager *pm, ApplySite applySite, SILFunction *
           applySite.getKind() != ApplySiteKind::PartialApplyInst &&
           arg->getType().isObject() &&
           arg->getOwnershipKind() == OwnershipKind::Owned &&
-          paramInfo.isGuaranteedConvention()) {
+          paramInfo.isGuaranteedConventionInCaller()) {
         SILBuilderWithScope borrowBuilder(applySite.getInstruction(),
                                           argBuilder);
         arg = borrowBuilder.createBeginBorrow(applySite.getLoc(), arg);
@@ -1162,19 +1239,17 @@ static bool canDevirtualizeWitnessMethod(ApplySite applySite, bool isMandatory) 
     }
   }
 
-  std::tie(f, wt) = applySite.getModule().lookUpFunctionInWitnessTable(
-      wmi->getConformance(), wmi->getMember(), SILModule::LinkingMode::LinkAll);
+  std::tie(f, wt) = lookUpFunctionInWitnessTable(wmi, SILModule::LinkingMode::LinkAll);
 
   if (!f)
     return false;
 
-  // pcmo TODO: check for tri-state serialized kind
-  if (applySite.getFunction()->isSerialized()) {
-    // function_ref inside fragile function cannot reference a private or
-    // hidden symbol.
-    if (!f->hasValidLinkageForFragileRef())
-      return false;
-  }
+  // function_ref inside fragile function cannot reference a private or
+  // hidden symbol.
+  if (!isMandatory &&
+      applySite.getFunction()->isAnySerialized() &&
+      !f->hasValidLinkageForFragileRef(applySite.getFunction()->getSerializedKind()))
+    return false;
 
   // devirtualizeWitnessMethod below does not support this case. It currently
   // assumes it can try_apply call the target.
@@ -1275,8 +1350,7 @@ swift::tryDevirtualizeWitnessMethod(SILPassManager *pm, ApplySite applySite,
 
   auto *wmi = cast<WitnessMethodInst>(applySite.getCallee());
 
-  std::tie(f, wt) = applySite.getModule().lookUpFunctionInWitnessTable(
-      wmi->getConformance(), wmi->getMember(), SILModule::LinkingMode::LinkAll);
+  std::tie(f, wt) = lookUpFunctionInWitnessTable(wmi, SILModule::LinkingMode::LinkAll);
 
   return devirtualizeWitnessMethod(pm, applySite, f, wmi->getConformance(), ore);
 }

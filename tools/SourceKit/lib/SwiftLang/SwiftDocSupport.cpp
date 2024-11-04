@@ -274,7 +274,6 @@ static void initDocGenericParams(const Decl *D, DocEntityInfo &Info,
   // substitution).
   unsigned TypeContextDepth = 0;
   SubstitutionMap SubMap;
-  ModuleDecl *M = nullptr;
   Type BaseType;
   if (SynthesizedTarget) {
     BaseType = SynthesizedTarget.getBaseNominal()->getDeclaredInterfaceType();
@@ -284,8 +283,7 @@ static void initDocGenericParams(const Decl *D, DocEntityInfo &Info,
         DC = cast<ExtensionDecl>(D)->getExtendedNominal();
       else
         DC = D->getInnermostDeclContext()->getInnermostTypeContext();
-      M = DC->getParentModule();
-      SubMap = BaseType->getContextSubstitutionMap(M, DC);
+      SubMap = BaseType->getContextSubstitutionMap(DC);
       TypeContextDepth = SubMap.getGenericSignature().getNextDepth();
     }
   }
@@ -300,9 +298,7 @@ static void initDocGenericParams(const Decl *D, DocEntityInfo &Info,
           return Type(type).subst(SubMap);
         return type;
       },
-      [&](CanType depType, Type substType, ProtocolDecl *proto) {
-        return M->lookupConformance(substType, proto);
-      },
+      LookUpConformanceInModule(),
       SubstFlags::DesugarMemberTypes);
   };
 
@@ -448,7 +444,7 @@ static bool initDocEntityInfo(const Decl *D,
   }
 
   Info.IsUnavailable = AvailableAttr::isUnavailable(D);
-  Info.IsDeprecated = D->getAttrs().getDeprecated(D->getASTContext()) != nullptr;
+  Info.IsDeprecated = D->getAttrs().isDeprecated(D->getASTContext());
   Info.IsOptional = D->getAttrs().hasAttribute<OptionalAttr>();
   if (auto *AFD = dyn_cast<AbstractFunctionDecl>(D)) {
     Info.IsAsync = AFD->hasAsync();
@@ -1048,7 +1044,7 @@ static void addParameterEntities(CompilerInstance &CI,
     auto SF = dyn_cast<SourceFile>(Unit);
     if (!SF)
       continue;
-    FuncWalker Walker(CI.getSourceMgr(), *SF->getBufferID(), FuncEnts);
+    FuncWalker Walker(CI.getSourceMgr(), SF->getBufferID(), FuncEnts);
     SF->walk(Walker);
   }
 }
@@ -1062,7 +1058,7 @@ static void reportSourceAnnotations(const SourceTextInfo &IFaceInfo,
       continue;
 
     SyntaxModelContext SyntaxContext(*SF);
-    DocSyntaxWalker SyntaxWalker(CI.getSourceMgr(), *SF->getBufferID(),
+    DocSyntaxWalker SyntaxWalker(CI.getSourceMgr(), SF->getBufferID(),
                                  IFaceInfo.References, Consumer);
     SyntaxContext.walk(SyntaxWalker);
     SyntaxWalker.finished();
@@ -1432,7 +1428,7 @@ void SwiftLangSupport::findLocalRenameRanges(
 
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
       auto &SF = AstUnit->getPrimarySourceFile();
-      swift::ide::RangeConfig Range{*SF.getBufferID(), Line, Column, Length};
+      swift::ide::RangeConfig Range{SF.getBufferID(), Line, Column, Length};
       SourceManager &SM = SF.getASTContext().SourceMgr;
       auto SyntacticRenameRanges =
           swift::ide::findLocalRenameRanges(&SF, Range);
@@ -1485,7 +1481,7 @@ SourceFile *SwiftLangSupport::getSyntacticSourceFile(
   unsigned BufferID = ParseCI.getInputBufferIDs().back();
   for (auto Unit : ParseCI.getMainModule()->getFiles()) {
     if (auto Current = dyn_cast<SourceFile>(Unit)) {
-      if (Current->getBufferID().value() == BufferID) {
+      if (Current->getBufferID() == BufferID) {
         SF = Current;
         break;
       }

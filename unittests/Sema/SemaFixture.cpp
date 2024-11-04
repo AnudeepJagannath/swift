@@ -29,9 +29,9 @@ using namespace swift::unittest;
 using namespace swift::constraints::inference;
 
 SemaTest::SemaTest()
-    : Context(*ASTContext::get(LangOpts, TypeCheckerOpts, SILOpts,
-                               SearchPathOpts, ClangImporterOpts,
-                               SymbolGraphOpts, CASOpts, SourceMgr, Diags)) {
+    : Context(*ASTContext::get(
+          LangOpts, TypeCheckerOpts, SILOpts, SearchPathOpts, ClangImporterOpts,
+          SymbolGraphOpts, CASOpts, SerializationOpts, SourceMgr, Diags)) {
   INITIALIZE_LLVM();
 
   registerParseRequestFunctions(Context.evaluator);
@@ -47,8 +47,9 @@ SemaTest::SemaTest()
   auto *module =
       ModuleDecl::create(Context.getIdentifier("SemaTests"), Context);
 
+  auto bufferID = Context.SourceMgr.addMemBufferCopy("// nothing\n");
   MainFile = new (Context) SourceFile(*module, SourceFileKind::Main,
-                                      /*buffer=*/std::nullopt);
+                                      bufferID);
 
   AttributedImport<ImportedModule> stdlibImport{{ImportPath::Access(), stdlib},
                                                 /*options=*/{}};

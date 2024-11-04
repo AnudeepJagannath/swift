@@ -39,7 +39,6 @@
 #include "swift/IRGen/TBDGen.h"
 #include "swift/Migrator/MigratorOptions.h"
 #include "swift/Parse/IDEInspectionCallbacks.h"
-#include "swift/Parse/Parser.h"
 #include "swift/Sema/SourceLoader.h"
 #include "swift/Serialization/Validation.h"
 #include "swift/Subsystems.h"
@@ -52,9 +51,9 @@
 #include "llvm/Option/ArgList.h"
 #include "llvm/Support/BLAKE3.h"
 #include "llvm/Support/HashingOutputBackend.h"
-#include "llvm/TargetParser/Host.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/VirtualOutputBackend.h"
+#include "llvm/TargetParser/Host.h"
 
 #include <memory>
 
@@ -104,6 +103,7 @@ class CompilerInvocation {
   TBDGenOptions TBDGenOpts;
   ModuleInterfaceOptions ModuleInterfaceOpts;
   CASOptions CASOpts;
+  SerializationOptions SerializationOpts;
   llvm::MemoryBuffer *IDEInspectionTargetBuffer = nullptr;
 
   /// The offset that IDEInspection wants to further examine in offset of bytes
@@ -250,6 +250,16 @@ public:
   /// If we haven't explicitly passed -blocklist-paths, set it to the default value.
   void setDefaultBlocklistsIfNecessary();
 
+  /// If we haven't explicitly passed '-in-process-plugin-server-path', infer
+  /// it as a default value.
+  ///
+  /// FIXME: Remove this after all the clients start sending it.
+  void setDefaultInProcessPluginServerPathIfNecessary();
+
+  /// Determine which C++ stdlib should be used for this compilation, and which
+  /// C++ stdlib is the default for the specified target.
+  void computeCXXStdlibOptions();
+
   /// Computes the runtime resource path relative to the given Swift
   /// executable.
   static void computeRuntimeResourcePathFromExecutablePath(
@@ -316,6 +326,11 @@ public:
 
   IRGenOptions &getIRGenOptions() { return IRGenOpts; }
   const IRGenOptions &getIRGenOptions() const { return IRGenOpts; }
+
+  SerializationOptions &getSerializationOptions() { return SerializationOpts; }
+  const SerializationOptions &getSerializationOptions() const {
+    return SerializationOpts;
+  }
 
   void setParseStdlib() {
     FrontendOpts.ParseStdlib = true;
@@ -779,7 +794,7 @@ private:
   /// Creates a new source file for the main module.
   SourceFile *createSourceFileForMainModule(ModuleDecl *mod,
                                             SourceFileKind FileKind,
-                                            std::optional<unsigned> BufferID,
+                                            unsigned BufferID,
                                             bool isMainBuffer = false) const;
 
   /// Creates all the files to be added to the main module, appending them to

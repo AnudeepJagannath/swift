@@ -33,6 +33,7 @@
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/TypeDifferenceVisitor.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/PrettyStackTrace.h"
@@ -379,10 +380,10 @@ SILFunction *SILGenModule::getOrCreateForeignAsyncCompletionHandlerImplFunction(
       bool checkedBridging = ctx.LangOpts.UseCheckedAsyncObjCBridging;
 
       ManagedValue continuation;
-      if (checkedBridging) {
+      {
         FormalEvaluationScope scope(SGF);
 
-        auto underlyingValueTy = OpenedArchetypeType::get(ctx.TheAnyType, sig);
+        auto underlyingValueTy = OpenedArchetypeType::get(ctx.TheAnyType);
 
         auto underlyingValueAddr = SGF.emitOpenExistential(
             loc, ManagedValue::forTrivialAddressRValue(continuationAddr),
@@ -392,11 +393,12 @@ SILFunction *SILGenModule::getOrCreateForeignAsyncCompletionHandlerImplFunction(
             loc, underlyingValueAddr,
             SILType::getPrimitiveAddressType(
                 F->mapTypeIntoContext(continuationType)->getCanonicalType()));
-      } else {
-        auto continuationVal = SGF.B.createLoad(
-            loc, continuationAddr, LoadOwnershipQualifier::Trivial);
-        continuation =
-            ManagedValue::forObjectRValueWithoutOwnership(continuationVal);
+
+        // If we are not using checked bridging, we load the continuation from
+        // memory since we are going to pass it in registers, not in memory to
+        // the intrinsic.
+        if (!checkedBridging)
+          continuation = SGF.B.createLoadTrivial(loc, continuation);
       }
 
       // Check for an error if the convention includes one.
@@ -481,7 +483,7 @@ SILFunction *SILGenModule::getOrCreateForeignAsyncCompletionHandlerImplFunction(
           = {F->mapTypeIntoContext(resumeType)->getCanonicalType()};
         auto subs = SubstitutionMap::get(errorIntrinsic->getGenericSignature(),
                                          replacementTypes,
-                                         LookUpConformanceInModule(SwiftModule));
+                                         LookUpConformanceInModule());
         SGF.emitApplyOfLibraryIntrinsic(loc, errorIntrinsic, subs,
                                         {continuation, nativeError},
                                         SGFContext());
@@ -579,7 +581,7 @@ SILFunction *SILGenModule::getOrCreateForeignAsyncCompletionHandlerImplFunction(
           = {F->mapTypeIntoContext(resumeType)->getCanonicalType()};
         auto subs = SubstitutionMap::get(resumeIntrinsic->getGenericSignature(),
                                          replacementTypes,
-                                         LookUpConformanceInModule(SwiftModule));
+                                         LookUpConformanceInModule());
         SGF.emitApplyOfLibraryIntrinsic(loc, resumeIntrinsic, subs,
                                         {continuation, resumeArg},
                                         SGFContext());

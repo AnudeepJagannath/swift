@@ -31,6 +31,7 @@
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/Consumption.h"
 #include "swift/SIL/InstructionUtils.h"
 #include "swift/SIL/MemAccessUtils.h"
@@ -1231,6 +1232,11 @@ namespace {
         return base;
       }
       auto result = SGF.B.createLoadBorrow(loc, base.getValue());
+      // Mark the load_borrow as unchecked. We can't stop the source code from
+      // trying to mutate or consume the same lvalue during this borrow, so
+      // we don't want verifiers to trip before the move checker gets a chance
+      // to diagnose these situations.
+      result->setUnchecked(true);
       return SGF.emitFormalEvaluationManagedBorrowedRValueWithCleanup(loc,
          base.getValue(), result);
     }
@@ -2221,7 +2227,7 @@ namespace {
       auto decl = cast<AccessorDecl>(Accessor.getFuncDecl());
 
       // 'modify' always returns an address of the right type.
-      if (decl->getAccessorKind() == AccessorKind::Modify) {
+      if (isYieldingDefaultMutatingAccessor(decl->getAccessorKind())) {
         assert(yields.size() == 1);
         return yields[0];
       }
@@ -2375,7 +2381,7 @@ namespace {
       }
 
       auto subs = SubstitutionMap::get(sig, replacementTypes,
-                  LookUpConformanceInModule{SGF.getModule().getSwiftModule()});
+                  LookUpConformanceInModule());
 
       base = makeBaseConsumableMaterializedRValue(SGF, loc, base);
 
@@ -2400,9 +2406,7 @@ namespace {
       }
 
       auto keyPathTy = keyPathValue.getType().castTo<BoundGenericType>();
-      auto subs = keyPathTy->getContextSubstitutionMap(
-          keyPathTy->getDecl()->getParentModule(),
-          keyPathTy->getDecl());
+      auto subs = keyPathTy->getContextSubstitutionMap();
 
       auto origType = AbstractionPattern::getOpaque();
       auto loweredTy = SGF.getLoweredType(origType, value.getSubstRValueType());
@@ -2476,9 +2480,7 @@ namespace {
       auto projectFnType = projectFn->getLoweredFunctionType();
 
       auto keyPathTy = keyPathValue.getType().castTo<BoundGenericType>();
-      auto subs = keyPathTy->getContextSubstitutionMap(
-          keyPathTy->getDecl()->getParentModule(),
-          keyPathTy->getDecl());
+      auto subs = keyPathTy->getContextSubstitutionMap();
 
       auto substFnType = projectFnType->substGenericArgs(
           SGF.SGM.M, subs, SGF.getTypeExpansionContext());
@@ -3042,9 +3044,6 @@ public:
         case ParamSpecifier::ImplicitlyCopyableConsuming:
           return false;
         }
-        if (pd->hasResultDependsOn()) {
-          return true;
-        }
       }
     }
     return false;
@@ -3253,7 +3252,9 @@ namespace {
       }
 
       case AccessorKind::Read:
-      case AccessorKind::Modify: {
+      case AccessorKind::Read2:
+      case AccessorKind::Modify:
+      case AccessorKind::Modify2: {
         auto typeData =
             getPhysicalStorageTypeData(SGF.getTypeExpansionContext(), SGF.SGM,
                                        AccessKind, Storage, Subs,
@@ -4565,10 +4566,19 @@ LValue SILGenLValue::visitABISafeConversionExpr(ABISafeConversionExpr *e,
                                     LValueOptions options) {
   LValue lval = visitRec(e->getSubExpr(), accessKind, options);
   auto typeData = getValueTypeData(SGF, accessKind, e);
+  auto subExprType = e->getSubExpr()->getType()->getRValueType();
+  auto loweredSubExprType = SGF.getLoweredType(subExprType);
+  
+  // Ensure the lvalue is re-abstracted to the substituted type, since that's
+  // the type with which we have ABI compatibility.
+  if (lval.getTypeOfRValue().getASTType() != loweredSubExprType.getASTType()) {
+    // Logical components always re-abstract back to the substituted
+    // type.
+    ASSERT(lval.isLastComponentPhysical());
+    lval.addOrigToSubstComponent(loweredSubExprType);
+  }
 
-  auto OrigType = e->getSubExpr()->getType();
-
-  lval.add<UncheckedConversionComponent>(typeData, OrigType);
+  lval.add<UncheckedConversionComponent>(typeData, subExprType);
 
   return lval;
 }
@@ -4585,8 +4595,7 @@ LValue SILGenFunction::emitPropertyLValue(SILLocation loc, ManagedValue base,
   LValue lv;
 
   auto baseType = base.getType().getASTType();
-  auto subMap = baseType->getContextSubstitutionMap(
-      SGM.M.getSwiftModule(), ivar->getDeclContext());
+  auto subMap = baseType->getContextSubstitutionMap(ivar->getDeclContext());
 
   AccessStrategy strategy =
     ivar->getAccessStrategy(semantics,

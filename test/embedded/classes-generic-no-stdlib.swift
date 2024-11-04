@@ -2,6 +2,7 @@
 // RUN: %target-swift-emit-ir %s -parse-stdlib -enable-experimental-feature Embedded -target arm64e-apple-none -wmo | %FileCheck %s --check-prefix CHECK-IR
 
 // REQUIRES: swift_in_compiler
+// REQUIRES: swift_feature_Embedded
 
 precedencegroup AssignmentPrecedence { assignment: true }
 
@@ -24,13 +25,13 @@ public func bar(t: T2) -> MyClass<T2> {
 // CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1txvgAA2T1V_Tg5 {{.*}}{
 // CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1txvsAA2T1V_Tg5 {{.*}}{
 // CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1txvMAA2T1V_Tg5 {{.*}}{
-// CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1tACyxGx_tcfCAA2T1V_Tgm5 {{.*}}{
+// CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1tACyxGx_tcfCAA2T1V_Tt0g5 {{.*}}{
 // CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassCfDAA2T1V_Tg5 {{.*}}{
 
 // CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1txvgAA2T2V_Tg5 {{.*}}{
 // CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1txvsAA2T2V_Tg5 {{.*}}{
 // CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1txvMAA2T2V_Tg5 {{.*}}{
-// CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1tACyxGx_tcfCAA2T2V_Tgm5 {{.*}}{
+// CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassC1tACyxGx_tcfCAA2T2V_Tt0g5 {{.*}}{
 // CHECK-SIL-DAG: sil {{.*}}@$s4main7MyClassCfDAA2T2V_Tg5 {{.*}}{
 
 // CHECK-SIL: sil_vtable MyClass {
@@ -57,8 +58,8 @@ public func bar(t: T2) -> MyClass<T2> {
 // CHECK-IR-DAG: define {{.*}}i1 @"$s4main7MyClassC1txvgAA2T2V_Tg5"(ptr swiftself %0)
 // CHECK-IR-DAG: define {{.*}}ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T1V_Tg5"(ptr swiftself %0)
 // CHECK-IR-DAG: define {{.*}}ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T2V_Tg5"(i1 %0, ptr swiftself %1)
-// CHECK-IR-DAG: define {{.*}}ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T1V_Tgm5"()
-// CHECK-IR-DAG: define {{.*}}ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T2V_Tgm5"(i1 %0)
+// CHECK-IR-DAG: define {{.*}}ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T1V_Tt0g5"()
+// CHECK-IR-DAG: define {{.*}}ptr @"$s4main7MyClassC1tACyxGx_tcfCAA2T2V_Tt0g5"(i1 %0)
 // CHECK-IR-DAG: define {{.*}}ptr @"$s4main7MyClassC1tACyxGx_tcfcAA2T1V_Tg5"(ptr swiftself %0)
 // CHECK-IR-DAG: define {{.*}}ptr @"$s4main7MyClassC1tACyxGx_tcfcAA2T2V_Tg5"(i1 %0, ptr swiftself %1)
 // CHECK-IR-DAG: define {{.*}}ptr @"$s4main7MyClassCfdAA2T1V_Tg5"(ptr swiftself %0)

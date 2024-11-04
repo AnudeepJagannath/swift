@@ -26,6 +26,7 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeResolutionStage.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "llvm/Support/ErrorHandling.h"
 
@@ -159,8 +160,8 @@ OpaqueResultTypeRequest::evaluate(Evaluator &evaluator,
         }
       }
 
-      auto *paramType = GenericTypeParamType::get(/*isParameterPack*/ false,
-                                                  opaqueSignatureDepth, i, ctx);
+      auto *paramType = GenericTypeParamType::getType(opaqueSignatureDepth, i,
+                                                      ctx);
       genericParamTypes.push_back(paramType);
     
       TypeRepr *constraint = currentRepr;
@@ -479,9 +480,11 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
   // Check that every generic parameter type from the signature is
   // among referencedGenericParams.
   for (auto *genParam : genericSig.getGenericParams()) {
-    auto *paramDecl = genParam->getDecl();
-    if (paramDecl->getDepth() != fnGenericParamsDepth)
+    if (genParam->getDepth() != fnGenericParamsDepth)
       continue;
+
+    auto *paramDecl = genericParams->getParams()[genParam->getIndex()];
+
     if (!referencedGenericParams.count(genParam->getCanonicalType())) {
       // Lazily search for generic params that are indirectly used in the
       // function signature. Do it only if there is a generic parameter
@@ -495,7 +498,7 @@ void TypeChecker::checkReferencedGenericParams(GenericContext *dc) {
           continue;
       }
       // Produce an error that this generic parameter cannot be bound.
-      if (paramDecl->isImplicit()) {
+      if (paramDecl->isOpaqueType()) {
         paramDecl->getASTContext().Diags
           .diagnose(paramDecl->getOpaqueTypeRepr()->getLoc(),
                     diag::unreferenced_generic_parameter,
@@ -684,6 +687,7 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
   SmallVector<TypeBase *, 2> inferenceSources;
   SmallVector<Requirement, 2> extraReqs;
   SourceLoc loc;
+  bool inferInvertibleReqs = true;
 
   if (auto VD = dyn_cast<ValueDecl>(GC->getAsDecl())) {
     loc = VD->getLoc();
@@ -781,9 +785,42 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
   } else if (auto *ext = dyn_cast<ExtensionDecl>(GC)) {
     loc = ext->getLoc();
 
+    // If the extension introduces conformance to invertible protocol IP, do not
+    // infer any conditional requirements that the generic parameters to conform
+    // to invertible protocols. This forces people to write out the conditions.
+    inferInvertibleReqs = !ext->isAddingConformanceToInvertible();
+
+    // FIXME: to workaround a reverse condfail, always infer the requirements if
+    //  the extension is in a swiftinterface file. This is temporary and should
+    //  be removed soon. (rdar://130424971)
+    if (auto *sf = ext->getOutermostParentSourceFile()) {
+      if (sf->Kind == SourceFileKind::Interface
+          && !ctx.LangOpts.hasFeature(Feature::SE427NoInferenceOnExtension))
+        inferInvertibleReqs = true;
+    }
+
     collectAdditionalExtensionRequirements(ext->getExtendedType(), extraReqs);
 
     auto *extendedNominal = ext->getExtendedNominal();
+
+    // Avoid building a generic signature if we have an unconstrained protocol
+    // extension of a protocol that does not suppress conformance to ~Copyable
+    // or ~Escapable. This avoids a request cycle when referencing a protocol
+    // extension type alias via an unqualified name from a `where` clause on
+    // the protocol.
+    if (auto *proto = dyn_cast<ProtocolDecl>(extendedNominal)) {
+      if (extraReqs.empty() &&
+          !ext->getTrailingWhereClause()) {
+        InvertibleProtocolSet protos;
+        for (auto *inherited : proto->getAllInheritedProtocols()) {
+          if (auto kind = inherited->getInvertibleProtocolKind())
+            protos.insert(*kind);
+        }
+
+        if (protos == InvertibleProtocolSet::allKnown())
+          return extendedNominal->getGenericSignatureOfContext();
+      }
+    }
 
     if (isa<BuiltinTupleDecl>(extendedNominal)) {
       genericParams = ext->getGenericParams();
@@ -800,7 +837,7 @@ GenericSignatureRequest::evaluate(Evaluator &evaluator,
       genericParams, WhereClauseOwner(GC),
       extraReqs, inferenceSources, loc,
       /*isExtension=*/isa<ExtensionDecl>(GC),
-      /*allowInverses=*/true};
+      /*allowInverses=*/inferInvertibleReqs};
   return evaluateOrDefault(ctx.evaluator, request,
                            GenericSignatureWithError()).getPointer();
 }
@@ -885,6 +922,13 @@ void TypeChecker::diagnoseRequirementFailure(
   Diag<Type, Type, StringRef> diagnosticNote;
 
   const auto reqKind = req.getKind();
+
+  Type secondTy, substSecondTy;
+  if (reqKind != RequirementKind::Layout) {
+    secondTy = req.getSecondType();
+    substSecondTy = substReq.getSecondType();
+  }
+
   switch (reqKind) {
   case RequirementKind::SameShape:
     diagnostic = diag::types_not_same_shape;
@@ -917,12 +961,6 @@ void TypeChecker::diagnoseRequirementFailure(
     diagnostic = diag::types_not_equal;
     diagnosticNote = diag::types_not_equal_requirement;
     break;
-  }
-
-  Type secondTy, substSecondTy;
-  if (req.getKind() != RequirementKind::Layout) {
-    secondTy = req.getSecondType();
-    substSecondTy = substReq.getSecondType();
   }
 
   ASTContext &ctx = module->getASTContext();
@@ -968,7 +1006,7 @@ CheckGenericArgumentsResult TypeChecker::checkGenericArgumentsForDiagnostics(
   SmallVector<WorklistItem, 4> worklist;
 
   for (auto req : llvm::reverse(requirements)) {
-    auto substReq = req.subst(substitutions, LookUpConformanceInModule(module));
+    auto substReq = req.subst(substitutions, LookUpConformanceInModule());
     worklist.emplace_back(req, substReq, ParentConditionalConformances{});
   }
 

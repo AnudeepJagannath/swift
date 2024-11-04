@@ -8,6 +8,7 @@
 
 import multiprocessing
 import os
+import platform
 
 import android.adb.commands
 
@@ -60,6 +61,10 @@ def _apply_default_arguments(args):
     if args.build_linux_static and args.build_libcxx is None:
         args.build_libcxx = True
 
+    # Previewing the stdlib docs requires building them.
+    if args.preview_stdlib_docs:
+        args.build_stdlib_docs = True
+
     # Set the default CMake generator.
     if args.cmake_generator is None:
         args.cmake_generator = 'Ninja'
@@ -98,9 +103,6 @@ def _apply_default_arguments(args):
 
     if args.libdispatch_build_variant is None:
         args.libdispatch_build_variant = args.build_variant
-
-    if args.libicu_build_variant is None:
-        args.libicu_build_variant = args.build_variant
 
     if args.libxml2_build_variant is None:
         args.libxml2_build_variant = args.build_variant
@@ -216,6 +218,7 @@ def _apply_default_arguments(args):
         args.test_android = False
         args.test_cmark = False
         args.test_swiftpm = False
+        args.test_foundation = False
         args.test_swift_driver = False
         args.test_swiftsyntax = False
         args.test_indexstoredb = False
@@ -811,6 +814,16 @@ def create_argument_parser():
     option(['--wasmkit'], toggle_true('build_wasmkit'),
            help='build WasmKit')
 
+    option('--swift-testing', toggle_true('build_swift_testing'),
+           help='build Swift Testing')
+    option('--install-swift-testing', toggle_true('install_swift_testing'),
+           help='install Swift Testing')
+    option('--swift-testing-macros', toggle_true('build_swift_testing_macros'),
+           help='build Swift Testing macro plugin')
+    option('--install-swift-testing-macros',
+           toggle_true('install_swift_testing_macros'),
+           help='install Swift Testing macro plugin')
+
     option('--xctest', toggle_true('build_xctest'),
            help='build xctest')
 
@@ -819,9 +832,6 @@ def create_argument_parser():
 
     option('--libdispatch', toggle_true('build_libdispatch'),
            help='build libdispatch')
-
-    option('--libicu', toggle_true('build_libicu'),
-           help='build libicu')
 
     option('--static-libxml2', toggle_true('build_libxml2'), default=False,
            help='build static libxml2')
@@ -945,10 +955,6 @@ def create_argument_parser():
     option('--debug-libdispatch', store('libdispatch_build_variant'),
            const='Debug',
            help='build the Debug variant of libdispatch')
-
-    option('--debug-libicu', store('libicu_build_variant'),
-           const='Debug',
-           help='build the Debug variant of libicu')
 
     option('--debug-libxml2', store('libxml2_build_variant'),
            const='Debug',
@@ -1135,7 +1141,7 @@ def create_argument_parser():
            help='build static variants of the Swift standard library')
 
     option('--build-swift-dynamic-sdk-overlay', toggle_true,
-           default=True,
+           default=platform.system() != "Darwin",
            help='build dynamic variants of the Swift SDK overlay')
 
     option('--build-swift-static-sdk-overlay', toggle_true,
@@ -1147,10 +1153,26 @@ def create_argument_parser():
     option('--build-swift-stdlib-static-print', toggle_true,
            help='Build constant-folding print() support')
 
+    option('--build-embedded-stdlib', toggle_true,
+           default=True,
+           help='Build embedded stdlib')
+
+    option('--build-embedded-stdlib-cross-compiling', toggle_true,
+           help='Build embedded stdlib for cross-compiling targets.')
+
     option('--build-swift-stdlib-unicode-data', toggle_true,
            default=True,
            help='Include Unicode data in the standard library.'
                 'Note: required for full String functionality')
+
+    option('--build-stdlib-docs', toggle_true,
+           default=False,
+           help='Build documentation for the standard library.'
+                'Note: this builds Swift-DocC to perform the docs build.')
+    option('--preview-stdlib-docs', toggle_true,
+           default=False,
+           help='Build and preview standard library documentation with Swift-DocC.'
+                'Note: this builds Swift-DocC to perform the docs build.')
 
     option('--build-swift-clang-overlays', toggle_true,
            default=True,
@@ -1319,6 +1341,8 @@ def create_argument_parser():
            help='skip testing cmark')
     option('--skip-test-swiftpm', toggle_false('test_swiftpm'),
            help='skip testing swiftpm')
+    option('--skip-test-foundation', toggle_false('test_foundation'),
+           help='skip testing Foundation')
     option('--skip-test-swift-driver', toggle_false('test_swift_driver'),
            help='skip testing Swift driver')
     option('--skip-test-swiftsyntax', toggle_false('test_swiftsyntax'),
@@ -1352,7 +1376,7 @@ def create_argument_parser():
            help='enable building llvm using modules')
 
     option('--llvm-targets-to-build', store,
-           default='X86;ARM;AArch64;PowerPC;SystemZ;Mips;RISCV;WebAssembly',
+           default='X86;ARM;AArch64;PowerPC;SystemZ;Mips;RISCV;WebAssembly;AVR',
            help='LLVM target generators to build')
 
     option('--llvm-ninja-targets', append,
@@ -1400,7 +1424,7 @@ def create_argument_parser():
 
     option('--android-arch', store,
            choices=['armv7', 'aarch64', 'x86_64'],
-           default='armv7',
+           default='aarch64',
            help='The target architecture when building for Android. '
                 'Currently, only armv7, aarch64, and x86_64 are supported. '
                 '%(default)s is the default.')
@@ -1465,8 +1489,12 @@ def create_argument_parser():
            default=True,
            help='Enable Swift Synchronization.')
 
+    option('--enable-volatile', toggle_true,
+           default=True,
+           help='Enable Volatile module.')
+
     option('--enable-experimental-parser-validation', toggle_true,
-           default=False,
+           default=True,
            help='Enable experimental Swift Parser validation by default.')
 
     # -------------------------------------------------------------------------
@@ -1576,7 +1604,6 @@ SWIFT_SOURCE_ROOT: a directory containing the source for LLVM, Clang, Swift.
                      /swift-corelibs-xctest      (optional)
                      /swift-corelibs-foundation  (optional)
                      /swift-corelibs-libdispatch (optional)
-                     /icu                        (optional)
                      /libxml2                    (optional)
                      /zlib                       (optional)
                      /curl                       (optional)

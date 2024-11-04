@@ -14,7 +14,9 @@
 
 #include "ArgsToFrontendInputsConverter.h"
 #include "ArgsToFrontendOutputsConverter.h"
+#include "clang/Driver/Driver.h"
 #include "swift/AST/DiagnosticsFrontend.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Platform.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/Option/Options.h"
@@ -27,6 +29,7 @@
 #include "llvm/Option/Arg.h"
 #include "llvm/Option/ArgList.h"
 #include "llvm/Option/Option.h"
+#include "llvm/Support/Process.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/LineIterator.h"
 #include "llvm/Support/Path.h"
@@ -64,11 +67,16 @@ bool ArgsToFrontendOptionsConverter::convert(
   if (const Arg *A = Args.getLastArg(OPT_prebuilt_module_cache_path)) {
     Opts.PrebuiltModuleCachePath = A->getValue();
   }
+  if (auto envPrebuiltModuleCachePath =
+      llvm::sys::Process::GetEnv("SWIFT_OVERLOAD_PREBUILT_MODULE_CACHE_PATH")) {
+    Opts.PrebuiltModuleCachePath = *envPrebuiltModuleCachePath;
+  }
+
   if (const Arg *A = Args.getLastArg(OPT_module_cache_path)) {
     Opts.ExplicitModulesOutputPath = A->getValue();
   } else {
     SmallString<128> defaultPath;
-    llvm::sys::path::cache_directory(defaultPath);
+    clang::driver::Driver::getDefaultModuleCachePath(defaultPath);
     Opts.ExplicitModulesOutputPath = defaultPath.str().str();
   }
   if (const Arg *A = Args.getLastArg(OPT_backup_module_interface_path)) {
@@ -142,7 +150,9 @@ bool ArgsToFrontendOptionsConverter::convert(
   Opts.SerializeDependencyScannerCache |= Args.hasArg(OPT_serialize_dependency_scan_cache);
   Opts.ReuseDependencyScannerCache |= Args.hasArg(OPT_reuse_dependency_scan_cache);
   Opts.EmitDependencyScannerCacheRemarks |= Args.hasArg(OPT_dependency_scan_cache_remarks);
-  Opts.ParallelDependencyScan |= Args.hasArg(OPT_parallel_scan);
+  Opts.ParallelDependencyScan = Args.hasArg(OPT_parallel_scan,
+                                            OPT_no_parallel_scan,
+                                            true);
   if (const Arg *A = Args.getLastArg(OPT_dependency_scan_cache_path)) {
     Opts.SerializedDependencyScannerCachePath = A->getValue();
   }
@@ -286,6 +296,16 @@ bool ArgsToFrontendOptionsConverter::convert(
       Opts.ExportAsName = exportAs;
   }
 
+  if (const Arg *A = Args.getLastArg(OPT_public_module_name))
+    Opts.PublicModuleName = A->getValue();
+
+  if (auto A = Args.getLastArg(OPT_swiftinterface_compiler_version)) {
+    if (Opts.SwiftInterfaceCompilerVersion.tryParse(A->getValue())) {
+      Diags.diagnose(SourceLoc(), diag::error_invalid_arg_value,
+                     A->getAsString(Args), A->getValue());
+    }
+  }
+
   // This must be called after computing module name, module abi name,
   // and module link name. If computing module aliases is unsuccessful,
   // return early.
@@ -393,7 +413,8 @@ void ArgsToFrontendOptionsConverter::computePrintStatsOptions() {
   using namespace options;
   Opts.PrintStats |= Args.hasArg(OPT_print_stats);
   Opts.PrintClangStats |= Args.hasArg(OPT_print_clang_stats);
-#if defined(NDEBUG) && !defined(LLVM_ENABLE_STATS)
+  Opts.PrintZeroStats |= Args.hasArg(OPT_print_zero_stats);
+#if defined(NDEBUG) && !LLVM_ENABLE_STATS
   if (Opts.PrintStats || Opts.PrintClangStats)
     Diags.diagnose(SourceLoc(), diag::stats_disabled);
 #endif
@@ -403,6 +424,9 @@ void ArgsToFrontendOptionsConverter::computeDebugTimeOptions() {
   using namespace options;
   if (const Arg *A = Args.getLastArg(OPT_stats_output_dir)) {
     Opts.StatsOutputDir = A->getValue();
+    if (Args.getLastArg(OPT_fine_grained_timers)) {
+      Opts.FineGrainedTimers = true;
+    }
     if (Args.getLastArg(OPT_trace_stats_events)) {
       Opts.TraceStats = true;
     }
@@ -523,6 +547,8 @@ ArgsToFrontendOptionsConverter::determineRequestedAction(const ArgList &args) {
     return FrontendOptions::ActionType::EmitSIL;
   if (Opt.matches(OPT_emit_silgen))
     return FrontendOptions::ActionType::EmitSILGen;
+  if (Opt.matches(OPT_emit_lowered_sil))
+    return FrontendOptions::ActionType::EmitLoweredSIL;
   if (Opt.matches(OPT_emit_sib))
     return FrontendOptions::ActionType::EmitSIB;
   if (Opt.matches(OPT_emit_sibgen))

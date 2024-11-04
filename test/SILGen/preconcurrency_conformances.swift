@@ -1,11 +1,11 @@
 // RUN: %empty-directory(%t/src)
 // RUN: split-file %s %t/src
 
-// RUN: %target-swift-emit-silgen -disable-availability-checking -module-name preconcurrency_conformances -enable-upcoming-feature DynamicActorIsolation %t/src/checks.swift -verify | %FileCheck %t/src/checks.swift
-// RUN: %target-swift-emit-silgen -swift-version 6 -disable-availability-checking -module-name preconcurrency_conformances -disable-dynamic-actor-isolation %t/src/checks_disabled.swift -verify | %FileCheck %t/src/checks_disabled.swift
+// RUN: %target-swift-emit-silgen -target %target-swift-5.1-abi-triple -module-name preconcurrency_conformances -enable-upcoming-feature DynamicActorIsolation %t/src/checks.swift -verify | %FileCheck %t/src/checks.swift
+// RUN: %target-swift-emit-silgen -swift-version 6 -target %target-swift-5.1-abi-triple -module-name preconcurrency_conformances -disable-dynamic-actor-isolation %t/src/checks_disabled.swift -verify | %FileCheck %t/src/checks_disabled.swift
 
-// REQUIRES: asserts
 // REQUIRES: concurrency
+// REQUIRES: swift_feature_DynamicActorIsolation
 
 //--- checks.swift
 protocol P {
@@ -276,6 +276,39 @@ extension MyActor : @preconcurrency Q {
 // CHECK: [[CHECK_EXEC_REF:%.*]] = function_ref @$ss22_checkExpectedExecutor14_filenameStart01_D6Length01_D7IsASCII5_line9_executoryBp_BwBi1_BwBetF
 // CHECK-NEXT: {{.*}} = apply [[CHECK_EXEC_REF]]({{.*}}, [[EXEC]])
 
+// https://github.com/apple/swift/issues/74294
+protocol Parent {
+  func a()
+}
+
+protocol Child : Parent {
+  func b()
+}
+
+@MainActor
+struct PreconcurrencyAppliesToParentToo : @preconcurrency Child {
+  func a() {
+  }
+
+  func b() {
+  }
+}
+
+// protocol witness for Child.b() in conformance PreconcurrencyAppliesToParentToo
+// CHECK-LABEL: sil private [transparent] [thunk] [ossa] @$s27preconcurrency_conformances32PreconcurrencyAppliesToParentTooVAA5ChildA2aDP1byyFTW : $@convention(witness_method: Child) (@in_guaranteed PreconcurrencyAppliesToParentToo) -> ()
+// CHECK: [[MAIN_ACTOR:%.*]] = begin_borrow {{.*}} : $MainActor
+// CHECK-NEXT: [[EXEC:%.*]] = extract_executor [[MAIN_ACTOR]] : $MainActor
+// CHECK: [[CHECK_EXEC_REF:%.*]] = function_ref @$ss22_checkExpectedExecutor14_filenameStart01_D6Length01_D7IsASCII5_line9_executoryBp_BwBi1_BwBetF
+// CHECK-NEXT: {{.*}} = apply [[CHECK_EXEC_REF]]({{.*}}, [[EXEC]])
+
+
+// protocol witness for Parent.a() in conformance PreconcurrencyAppliesToParentToo
+// CHECK-LABEL: sil private [transparent] [thunk] [ossa] @$s27preconcurrency_conformances32PreconcurrencyAppliesToParentTooVAA0F0A2aDP1ayyFTW : $@convention(witness_method: Parent) (@in_guaranteed PreconcurrencyAppliesToParentToo) -> ()
+// CHECK: [[MAIN_ACTOR:%.*]] = begin_borrow {{.*}} : $MainActor
+// CHECK-NEXT: [[EXEC:%.*]] = extract_executor [[MAIN_ACTOR]] : $MainActor
+// CHECK: [[CHECK_EXEC_REF:%.*]] = function_ref @$ss22_checkExpectedExecutor14_filenameStart01_D6Length01_D7IsASCII5_line9_executoryBp_BwBi1_BwBetF
+// CHECK-NEXT: {{.*}} = apply [[CHECK_EXEC_REF]]({{.*}}, [[EXEC]])
+
 //--- checks_disabled.swift
 protocol P {
   associatedtype T
@@ -438,4 +471,30 @@ extension MyActor : @preconcurrency Q {
 
 // protocol witness for static Q.data.modify in conformance MyActor
 // CHECK-LABEL: sil private [transparent] [thunk] [ossa] @$s27preconcurrency_conformances7MyActorCAA1QA2aDP4dataSaySiGSgvMZTW : $@yield_once @convention(witness_method: Q) @substituted <τ_0_0> (@thick τ_0_0.Type) -> @yields @inout Optional<Array<Int>> for <MyActor>
+// CHECK-NOT: [[CHECK_EXEC_REF:%.*]] = function_ref @$ss22_checkExpectedExecutor14_filenameStart01_D6Length01_D7IsASCII5_line9_executoryBp_BwBi1_BwBetF
+
+// https://github.com/apple/swift/issues/74294
+protocol Parent {
+  func a()
+}
+
+protocol Child : Parent {
+  func b()
+}
+
+@MainActor
+struct PreconcurrencyAppliesToParentToo : @preconcurrency Child {
+  func a() {
+  }
+
+  func b() {
+  }
+}
+
+// protocol witness for Child.b() in conformance PreconcurrencyAppliesToParentToo
+// CHECK-LABEL: sil private [transparent] [thunk] [ossa] @$s27preconcurrency_conformances32PreconcurrencyAppliesToParentTooVAA5ChildA2aDP1byyFTW : $@convention(witness_method: Child) (@in_guaranteed PreconcurrencyAppliesToParentToo) -> ()
+// CHECK-NOT: [[CHECK_EXEC_REF:%.*]] = function_ref @$ss22_checkExpectedExecutor14_filenameStart01_D6Length01_D7IsASCII5_line9_executoryBp_BwBi1_BwBetF
+
+// protocol witness for Parent.a() in conformance PreconcurrencyAppliesToParentToo
+// CHECK-LABEL: sil private [transparent] [thunk] [ossa] @$s27preconcurrency_conformances32PreconcurrencyAppliesToParentTooVAA0F0A2aDP1ayyFTW : $@convention(witness_method: Parent) (@in_guaranteed PreconcurrencyAppliesToParentToo) -> ()
 // CHECK-NOT: [[CHECK_EXEC_REF:%.*]] = function_ref @$ss22_checkExpectedExecutor14_filenameStart01_D6Length01_D7IsASCII5_line9_executoryBp_BwBi1_BwBetF

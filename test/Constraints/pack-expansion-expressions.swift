@@ -1,4 +1,4 @@
-// RUN: %target-typecheck-verify-swift -disable-availability-checking
+// RUN: %target-typecheck-verify-swift -target %target-swift-5.9-abi-triple
 
 func tuplify<each T>(_ t: repeat each T) -> (repeat each T) {
   return (repeat each t)
@@ -63,16 +63,14 @@ func outerArchetype<each T, U>(t: repeat each T, u: U) where repeat each T: P {
 }
 
 func sameElement<each T, U>(t: repeat each T, u: U) where repeat each T: P, repeat each T == U {
-// expected-error@-1{{same-element requirements are not yet supported}}
-
+  // expected-error@-1{{same-element requirements are not yet supported}}
   let _: (repeat each T) = (repeat (each t).f(u))
   // expected-error@-1 {{cannot convert value of type 'U' to expected argument type 'each T'}}
 }
 
 func forEachEach<each C, U>(c: repeat each C, function: (U) -> Void)
     where repeat each C: Collection, repeat (each C).Element == U {
-    // expected-error@-1{{same-element requirements are not yet supported}}
-
+  // expected-error@-1{{same-element requirements are not yet supported}}
   _ = (repeat (each c).forEach(function))
   // expected-error@-1 {{cannot convert value of type '(U) -> Void' to expected argument type '((each C).Element) throws -> Void'}}
 }
@@ -760,4 +758,11 @@ do {
   func f2<each T>(_ t: repeat each T) -> (repeat each T) {
     (repeat takesAutoclosure(each t)) // Ok
   }
+}
+
+// Crash-on-invalid - rdar://110711746
+func butt<T>(x: T) {}
+
+func rump<each T>(x: repeat each T) {
+  let x = (repeat { butt(each x) }()) // expected-error {{missing argument label 'x:' in call}}
 }

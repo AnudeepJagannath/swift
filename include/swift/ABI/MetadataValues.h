@@ -168,17 +168,18 @@ public:
   // flags for the struct. (The "non-inline" and "has-extra-inhabitants" bits
   // still require additional fixup.)
   enum : uint32_t {
-    AlignmentMask =       0x000000FF,
-    // unused             0x0000FF00,
-    IsNonPOD =            0x00010000,
-    IsNonInline =         0x00020000,
-    // unused             0x00040000,
-    HasSpareBits =        0x00080000,
-    IsNonBitwiseTakable = 0x00100000,
-    HasEnumWitnesses =    0x00200000,
-    Incomplete =          0x00400000,
-    IsNonCopyable =       0x00800000,
-    // unused             0xFF000000,
+    AlignmentMask =          0x000000FF,
+    // unused                0x0000FF00,
+    IsNonPOD =               0x00010000,
+    IsNonInline =            0x00020000,
+    // unused                0x00040000,
+    HasSpareBits =           0x00080000,
+    IsNonBitwiseTakable =    0x00100000,
+    HasEnumWitnesses =       0x00200000,
+    Incomplete =             0x00400000,
+    IsNonCopyable =          0x00800000,
+    IsNonBitwiseBorrowable = 0x01000000,
+    // unused                0xFE000000,
   };
 
   static constexpr const uint32_t MaxNumExtraInhabitants = 0x7FFFFFFF;
@@ -241,6 +242,27 @@ public:
   constexpr TargetValueWitnessFlags withBitwiseTakable(bool isBT) const {
     return TargetValueWitnessFlags((Data & ~IsNonBitwiseTakable) |
                                    (isBT ? 0 : IsNonBitwiseTakable));
+  }
+  
+  /// True if values of this type can be passed by value when borrowed.
+  /// If this bit is true, then borrows of the value are independent of the
+  /// value's address, so a value can be passed in registers or memcpy'd
+  /// while borrowed. This is in contrast to Rust, for instance, where a
+  /// `&T` type is always represented as a pointer, and borrowing a
+  /// value always moves the borrowed value into memory.
+  bool isBitwiseBorrowable() const {
+    /// This bit was introduced with Swift 6; prior to the introduction of
+    /// `Atomic` and `Mutex`, a type was always bitwise-borrowable if it
+    /// was bitwise-takable. Compilers and runtimes before Swift 6 would
+    /// never set the `IsNonBitwiseBorrowable` bit in the value witness
+    /// table, but any type that sets `IsNonBitwiseTakable` is definitely
+    /// not bitwise borrowable.
+    return isBitwiseTakable()
+      && !(Data & IsNonBitwiseBorrowable);
+  }
+  constexpr TargetValueWitnessFlags withBitwiseBorrowable(bool isBB) const {
+    return TargetValueWitnessFlags((Data & ~IsNonBitwiseBorrowable) |
+                                   (isBB ? 0 : IsNonBitwiseBorrowable));
   }
   
   /// True if values of this type can be copied.
@@ -350,6 +372,8 @@ public:
     Setter,
     ModifyCoroutine,
     ReadCoroutine,
+    Read2Coroutine,
+    Modify2Coroutine,
   };
 
 private:
@@ -572,6 +596,8 @@ public:
     ModifyCoroutine,
     AssociatedTypeAccessFunction,
     AssociatedConformanceAccessFunction,
+    Read2Coroutine,
+    Modify2Coroutine,
   };
 
 private:
@@ -1197,7 +1223,7 @@ class TargetExtendedFunctionTypeFlags {
     // Values for the enumerated isolation kinds
     IsolatedAny            = 0x00000002U,
 
-    // Values if we have a transferring result.
+    // Values if we have a sending result.
     HasSendingResult  = 0x00000010U,
 
     /// A InvertibleProtocolSet in the high bits.
@@ -1523,6 +1549,38 @@ static inline EnumLayoutFlags getLayoutAlgorithm(EnumLayoutFlags flags) {
 }
 static inline bool isValueWitnessTableMutable(EnumLayoutFlags flags) {
   return uintptr_t(flags) & uintptr_t(EnumLayoutFlags::IsVWTMutable);
+}
+
+/// Flags for raw layout.
+enum class RawLayoutFlags : uintptr_t {
+  /// Whether or not we're initializing an array like raw layout type.
+  IsArray = 0x1,
+
+  /// Whether or not this raw layout type was declared 'movesAsLike'.
+  MovesAsLike = 0x2,
+  
+  /// Whether this raw layout type is bitwise borrowable.
+  ///
+  /// No raw layout types are yet, but should we change our mind about that in the future,
+  /// this flag is here.
+  BitwiseBorrowable = 0x4,
+};
+static inline RawLayoutFlags operator|(RawLayoutFlags lhs,
+                                       RawLayoutFlags rhs) {
+  return RawLayoutFlags(uintptr_t(lhs) | uintptr_t(rhs));
+}
+static inline RawLayoutFlags &operator|=(RawLayoutFlags &lhs,
+                                         RawLayoutFlags rhs) {
+  return (lhs = (lhs | rhs));
+}
+static inline bool isRawLayoutArray(RawLayoutFlags flags) {
+  return uintptr_t(flags) & uintptr_t(RawLayoutFlags::IsArray);
+}
+static inline bool shouldRawLayoutMoveAsLike(RawLayoutFlags flags) {
+  return uintptr_t(flags) & uintptr_t(RawLayoutFlags::MovesAsLike);
+}
+static inline bool isRawLayoutBitwiseBorrowable(RawLayoutFlags flags) {
+  return uintptr_t(flags) & uintptr_t(RawLayoutFlags::BitwiseBorrowable);
 }
 
 namespace SpecialPointerAuthDiscriminators {
@@ -2003,12 +2061,12 @@ public:
     : Value(value) {}
 
   constexpr GenericContextDescriptorFlags(
-      bool hasTypePacks, bool hasConditionalInvertedProtocols
+      bool hasTypePacks, bool hasConditionalInvertedProtocols, bool hasValues
   ) : GenericContextDescriptorFlags(
         GenericContextDescriptorFlags((uint16_t)0)
           .withHasTypePacks(hasTypePacks)
-          .withConditionalInvertedProtocols(
-            hasConditionalInvertedProtocols)) {}
+          .withConditionalInvertedProtocols(hasConditionalInvertedProtocols)
+          .withHasValues(hasValues)) {}
 
   /// Whether this generic context has at least one type parameter
   /// pack, in which case the generic context will have a trailing
@@ -2024,6 +2082,12 @@ public:
     return (Value & 0x2) != 0;
   }
 
+  /// Whether this generic context has at least one value parameter, in which
+  /// case the generic context will have a trailing GenericValueHeader.
+  constexpr bool hasValues() const {
+    return (Value & 0x4) != 0;
+  }
+
   constexpr GenericContextDescriptorFlags
   withHasTypePacks(bool hasTypePacks) const {
     return GenericContextDescriptorFlags((uint16_t)(
@@ -2034,6 +2098,12 @@ public:
   withConditionalInvertedProtocols(bool value) const {
     return GenericContextDescriptorFlags((uint16_t)(
       (Value & ~0x2) | (value ? 0x2 : 0)));
+  }
+
+  constexpr GenericContextDescriptorFlags
+  withHasValues(bool hasValues) const {
+    return GenericContextDescriptorFlags((uint16_t)(
+      (Value & ~0x4) | (hasValues ? 0x4 : 0)));
   }
 
   constexpr uint16_t getIntValue() const {
@@ -2047,6 +2117,9 @@ enum class GenericParamKind : uint8_t {
 
   /// A type parameter pack.
   TypePack = 1,
+
+  /// A value type parameter.
+  Value = 2,
 
   Max = 0x3F,
 };
@@ -2151,16 +2224,14 @@ class GenericRequirementFlags {
 public:
   constexpr GenericRequirementFlags(GenericRequirementKind kind,
                                     bool hasKeyArgument,
-                                    bool isPackRequirement)
+                                    bool isPackRequirement,
+                                    bool isValueRequirement)
     : GenericRequirementFlags(GenericRequirementFlags(0)
                          .withKind(kind)
                          .withKeyArgument(hasKeyArgument)
-                         .withPackRequirement(isPackRequirement))
+                         .withPackRequirement(isPackRequirement)
+                         .withValueRequirement(isValueRequirement))
   {}
-
-  constexpr bool hasKeyArgument() const {
-    return (Value & 0x80u) != 0;
-  }
 
   /// If this is true, the subject type of the requirement is a pack.
   /// When the requirement is a conformance requirement, the corresponding
@@ -2169,14 +2240,27 @@ public:
     return (Value & 0x20u) != 0;
   }
 
+  constexpr bool hasKeyArgument() const {
+    return (Value & 0x80u) != 0;
+  }
+
+  /// If this is true, the subject type of the requirement is a value.
+  ///
+  /// Note: We could introduce a new SameValue requirement instead of burning a
+  /// a bit for value requirements, but if somehow an existing requirement makes
+  /// sense for values besides "SameType" then this would've been better.
+  constexpr bool isValueRequirement() const {
+    return (Value & 0x100u) != 0;
+  }
+
   constexpr GenericRequirementKind getKind() const {
     return GenericRequirementKind(Value & 0x1Fu);
   }
 
   constexpr GenericRequirementFlags
-  withKeyArgument(bool hasKeyArgument) const {
-    return GenericRequirementFlags((Value & 0x7Fu)
-      | (hasKeyArgument ? 0x80u : 0));
+  withKind(GenericRequirementKind kind) const {
+    return assert((uint8_t(kind) & 0x1Fu) == uint8_t(kind)),
+      GenericRequirementFlags((Value & 0xE0u) | uint8_t(kind));
   }
 
   constexpr GenericRequirementFlags
@@ -2186,9 +2270,15 @@ public:
   }
 
   constexpr GenericRequirementFlags
-  withKind(GenericRequirementKind kind) const {
-    return assert((uint8_t(kind) & 0x1Fu) == uint8_t(kind)),
-      GenericRequirementFlags((Value & 0xE0u) | uint8_t(kind));
+  withKeyArgument(bool hasKeyArgument) const {
+    return GenericRequirementFlags((Value & 0x7Fu)
+      | (hasKeyArgument ? 0x80u : 0));
+  }
+
+  constexpr GenericRequirementFlags
+  withValueRequirement(bool isValueRequirement) const {
+    return GenericRequirementFlags((Value & 0xFFu)
+      | (isValueRequirement ? 0x100u : 0));
   }
 
   constexpr uint32_t getIntValue() const {
@@ -2204,6 +2294,10 @@ enum class GenericRequirementLayoutKind : uint32_t {
 enum class GenericPackKind : uint16_t {
   Metadata = 0,
   WitnessTable = 1
+};
+
+enum class GenericValueType : uint32_t {
+  Int = 0,
 };
 
 class GenericEnvironmentFlags {
@@ -2490,7 +2584,8 @@ enum class JobKind : size_t {
   DefaultActorInline = First_Reserved,
   DefaultActorSeparate,
   DefaultActorOverride,
-  NullaryContinuation
+  NullaryContinuation,
+  IsolatedDeinit,
 };
 
 /// The priority of a job.  Higher priorities are larger values.
@@ -2509,6 +2604,32 @@ enum class JobPriority : size_t {
 inline int descendingPriorityOrder(JobPriority lhs,
                                    JobPriority rhs) {
   return (lhs == rhs ? 0 : lhs > rhs ? -1 : 1);
+}
+
+enum { PriorityBucketCount = 5 };
+
+inline int getPriorityBucketIndex(JobPriority priority) {
+  // Any unknown priorities will be rounded up to a known one.
+  // Priorities higher than UserInteractive are clamped to UserInteractive.
+  // Jobs of unknown priorities will end up in the same bucket as jobs of a
+  // corresponding known priority. Within the bucket they will be sorted in
+  // FIFO order.
+  if (priority > JobPriority::UserInitiated) {
+    // UserInteractive and higher
+    return 0;
+  } else if (priority > JobPriority::Default) {
+    // UserInitiated
+    return 1;
+  } else if (priority > JobPriority::Utility) {
+    // Default
+    return 2;
+  } else if (priority > JobPriority::Background) {
+    // Utility
+    return 3;
+  } else {
+    // Background and lower
+    return 4;
+  }
 }
 
 inline JobPriority withUserInteractivePriorityDowngrade(JobPriority priority) {
@@ -2671,7 +2792,8 @@ enum class TaskOptionRecordKind : uint8_t {
   /// Information about the result type of the task, used in embedded Swift.
   ResultTypeInfo = 4,
   /// Set the initial task executor preference of the task.
-  InitialTaskExecutor = 5,
+  InitialTaskExecutorUnowned = 5,
+  InitialTaskExecutorOwned = 6,
   /// Request a child task for swift_task_run_inline.
   RunInline = UINT8_MAX,
 };

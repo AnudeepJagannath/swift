@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import AST
 import SILBridging
 
 /// Argument conventions indexed on an apply's operand.
@@ -68,6 +69,12 @@ public struct ApplyOperandConventions : Collection {
   public subscript(resultDependsOn operandIndex: Int)
     -> LifetimeDependenceConvention? {
     return calleeArgumentConventions[resultDependsOn:
+      calleeArgumentIndex(ofOperandIndex: operandIndex)!]
+  }
+
+  public subscript(parameterDependencies operandIndex: Int)
+    -> FunctionConvention.LifetimeDependencies? {
+    return calleeArgumentConventions[parameterDependencies:
       calleeArgumentIndex(ofOperandIndex: operandIndex)!]
   }
 
@@ -176,7 +183,7 @@ extension ApplySite {
   }
 
   public var substitutionMap: SubstitutionMap {
-    SubstitutionMap(bridged.ApplySite_getSubstitutionMap())
+    SubstitutionMap(bridged: bridged.ApplySite_getSubstitutionMap())
   }
 
   public var calleeArgumentConventions: ArgumentConventions {
@@ -220,6 +227,16 @@ extension ApplySite {
 
   public var hasResultDependence: Bool {
     functionConvention.resultDependencies != nil
+  }
+
+  public var hasLifetimeDependence: Bool {
+    functionConvention.hasLifetimeDependencies()
+  }
+
+  public func parameterDependencies(target operand: Operand) -> FunctionConvention.LifetimeDependencies? {
+    let idx = operand.index
+    return idx < operandConventions.startIndex ? nil
+      : operandConventions[parameterDependencies: idx]
   }
 
   public var yieldConventions: YieldConventions {
@@ -268,9 +285,12 @@ extension ApplySite {
 }
 
 extension ApplySite {
-  private var functionConvention: FunctionConvention {
-    FunctionConvention(for: bridged.ApplySite_getSubstitutedCalleeType(),
-                       in: parentFunction)
+  public var functionConvention: FunctionConvention {
+    FunctionConvention(for: substitutedCalleeType, in: parentFunction)
+  }
+
+  public var substitutedCalleeType: CanonicalType {
+    CanonicalType(bridged: bridged.ApplySite_getSubstitutedCalleeType())
   }
 }
 
@@ -301,7 +321,7 @@ extension FullApplySite {
       beginApply.yieldedValues.forEach { values.push($0) }
     } else {
       let result = singleDirectResult!
-      if !result.type.isEmpty(in: parentFunction) {
+      if !result.type.isVoid {
         values.push(result)
       }
     }

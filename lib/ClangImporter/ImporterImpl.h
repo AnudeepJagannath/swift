@@ -23,12 +23,14 @@
 #include "ImportName.h"
 #include "SwiftLookupTable.h"
 #include "swift/AST/ASTContext.h"
+#include "swift/AST/Decl.h"
 #include "swift/AST/ForeignErrorConvention.h"
 #include "swift/AST/LazyResolver.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/RequirementSignature.h"
 #include "swift/AST/Type.h"
 #include "swift/Basic/FileTypes.h"
+#include "swift/Basic/SourceLoc.h"
 #include "swift/Basic/StringExtras.h"
 #include "swift/ClangImporter/ClangImporter.h"
 #include "swift/ClangImporter/ClangModule.h"
@@ -1062,7 +1064,16 @@ public:
 
   /// Retrieve the placeholder source file for use in parsing Swift attributes
   /// in the given module.
-  SourceFile &getClangSwiftAttrSourceFile(ModuleDecl &module);
+  SourceFile &getClangSwiftAttrSourceFile(ModuleDecl &module, unsigned bufferID);
+
+  /// Utility function to import Clang attributes from a source Swift decl to
+  /// synthesized Swift decl.
+  ///
+  /// \param SourceDecl The Swift decl to copy the atteribute from.
+  /// \param SynthesizedDecl The synthesized Swift decl to attach attributes to.
+  void
+  importAttributesFromClangDeclToSynthesizedSwiftDecl(Decl *SourceDecl,
+                                                      Decl *SynthesizedDecl);
 
   /// Import attributes from the given Clang declaration to its Swift
   /// equivalent.
@@ -1706,6 +1717,20 @@ public:
     if (auto ASD = dyn_cast<AbstractStorageDecl>(D))
       ASD->setSetterAccess(access);
 
+    if constexpr (std::is_base_of_v<NominalTypeDecl, DeclTy>) {
+      // Estimate brace locations.
+      auto begin = ClangN.getAsDecl()->getBeginLoc();
+      auto end = ClangN.getAsDecl()->getEndLoc();
+      SourceRange range;
+      if (begin.isValid() && end.isValid() && D->getNameLoc().isValid())
+        range = SourceRange(importSourceLoc(begin), importSourceLoc(end));
+      else {
+        range = SourceRange(D->getNameLoc(), D->getNameLoc());
+      }
+      assert(range.isValid() == D->getNameLoc().isValid());
+      D->setBraces(range);
+    }
+
     // SwiftAttrs on ParamDecls are interpreted by applyParamAttributes().
     if (!isa<ParamDecl>(D))
       importSwiftAttrAttributes(D);
@@ -2020,9 +2045,13 @@ inline std::string getPrivateOperatorName(const std::string &OperatorToken) {
 
 bool hasUnsafeAPIAttr(const clang::Decl *decl);
 
+bool hasNonEscapableAttr(const clang::RecordDecl *decl);
+
+bool hasEscapableAttr(const clang::RecordDecl *decl);
+
 bool isViewType(const clang::CXXRecordDecl *decl);
 
-}
-}
+} // end namespace importer
+} // end namespace swift
 
 #endif

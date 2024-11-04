@@ -16,6 +16,7 @@
 
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/PrettyStackTrace.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/IRGen/IRSymbolVisitor.h"
 #include "swift/IRGen/Linking.h"
 #include "swift/SIL/SILFunctionBuilder.h"
@@ -25,6 +26,7 @@
 #include "clang/AST/GlobalDecl.h"
 
 #include "GenDecl.h"
+#include "GenericArguments.h"
 #include "IRGenFunction.h"
 #include "IRGenModule.h"
 
@@ -35,9 +37,23 @@ using namespace irgen;
 /// additional types of entities that the main utility cannot.
 static llvm::Constant *getAddrOfLLVMVariable(IRGenModule &IGM,
                                              LinkEntity entity) {
-  if (entity.isTypeMetadataAccessFunction())
-    return IGM.getAddrOfTypeMetadataAccessFunction(entity.getType(),
-                                                   NotForDefinition);
+  if (entity.isTypeMetadataAccessFunction()) {
+    auto type = entity.getType();
+    auto nominal = type->getAnyNominal();
+    assert(nominal);
+
+    if (nominal->isGenericContext()) {
+      GenericArguments genericArgs;
+      genericArgs.collectTypes(IGM, nominal);
+
+      return IGM.getAddrOfGenericTypeMetadataAccessFunction(nominal,
+                                                            genericArgs.Types,
+                                                            NotForDefinition);
+    } else {
+      return IGM.getAddrOfTypeMetadataAccessFunction(type,
+                                                     NotForDefinition);
+    }
+  }
   if (entity.isDispatchThunk())
     return IGM.getAddrOfDispatchThunk(entity.getSILDeclRef(), NotForDefinition);
 

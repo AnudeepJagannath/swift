@@ -47,7 +47,7 @@ struct MockedPartitionOpEvaluator final
 
   // Just say that we always have a disconnected value.
   SILIsolationInfo getIsolationRegionInfo(Element elt) const {
-    return SILIsolationInfo::getDisconnected();
+    return SILIsolationInfo::getDisconnected(false /*isUnsafeNonIsolated*/);
   }
 
   bool shouldTryToSquelchErrors() const { return false; }
@@ -60,6 +60,14 @@ struct MockedPartitionOpEvaluator final
 
   static SILIsolationInfo getIsolationInfo(const PartitionOp &partitionOp) {
     return {};
+  }
+
+  static SILInstruction *getSourceInst(const PartitionOp &partitionOp) {
+    return nullptr;
+  }
+
+  static bool doesFunctionHaveSendingResult(const PartitionOp &partitionOp) {
+    return false;
   }
 };
 
@@ -82,14 +90,24 @@ struct MockedPartitionOpEvaluatorWithFailureCallback final
                                      operandToStateMap),
         failureCallback(failureCallback) {}
 
-  void handleLocalUseAfterTransfer(const PartitionOp &op, Element elt,
-                                   Operand *transferringOp) const {
-    failureCallback(op, elt, transferringOp);
+  void handleError(PartitionOpError error) {
+    switch (error.getKind()) {
+    case PartitionOpError::UnknownCodePattern:
+    case PartitionOpError::SentNeverSendable:
+    case PartitionOpError::AssignNeverSendableIntoSendingResult:
+    case PartitionOpError::InOutSendingNotInitializedAtExit:
+    case PartitionOpError::InOutSendingNotDisconnectedAtExit:
+      llvm_unreachable("Unsupported");
+    case PartitionOpError::LocalUseAfterSend: {
+      auto state = error.getLocalUseAfterSendError();
+      failureCallback(*state.op, state.sentElement, state.sendingOp);
+    }
+    }
   }
 
   // Just say that we always have a disconnected value.
   SILIsolationInfo getIsolationRegionInfo(Element elt) const {
-    return SILIsolationInfo::getDisconnected();
+    return SILIsolationInfo::getDisconnected(false /*nonisolated(unsafe)*/);
   }
 
   bool shouldTryToSquelchErrors() const { return false; }
@@ -102,6 +120,10 @@ struct MockedPartitionOpEvaluatorWithFailureCallback final
 
   static SILIsolationInfo getIsolationInfo(const PartitionOp &partitionOp) {
     return {};
+  }
+
+  static SILInstruction *getSourceInst(const PartitionOp &partitionOp) {
+    return nullptr;
   }
 };
 

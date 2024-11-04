@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/AST/Expr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Statistic.h"
 #include "swift/Basic/Unicode.h"
 #include "swift/AST/ASTContext.h"
@@ -478,6 +479,7 @@ ConcreteDeclRef Expr::getReferencedDecl(bool stopAtParenExpr) const {
   NO_REFERENCE(Tap);
   NO_REFERENCE(TypeJoin);
   SIMPLE_REFERENCE(MacroExpansion, getMacroRef);
+  NO_REFERENCE(TypeValue);
 
 #undef SIMPLE_REFERENCE
 #undef NO_REFERENCE
@@ -826,6 +828,7 @@ bool Expr::canAppendPostfixExpression(bool appendingPostfixOperator) const {
   case ExprKind::UnderlyingToOpaque:
   case ExprKind::Unreachable:
   case ExprKind::ActorIsolationErasure:
+  case ExprKind::TypeValue:
     // Implicit conversion nodes have no syntax of their own; defer to the
     // subexpression.
     return cast<ImplicitConversionExpr>(this)->getSubExpr()
@@ -916,6 +919,7 @@ bool Expr::isValidParentOfTypeExpr(Expr *typeExpr) const {
   case ExprKind::DotSyntaxBaseIgnored:
   case ExprKind::UnresolvedSpecialize:
   case ExprKind::OpenExistential:
+  case ExprKind::TypeValue:
     return true;
 
   // For these cases we need to ensure the type expr is the function or base.
@@ -1934,7 +1938,12 @@ unsigned AbstractClosureExpr::getDiscriminator() const {
         Bits.AbstractClosureExpr.Discriminator = discriminator;
   }
 
-  assert(getRawDiscriminator() != InvalidDiscriminator);
+  if (getRawDiscriminator() == InvalidDiscriminator) {
+    llvm::errs() << "Closure does not have an assigned discriminator:\n";
+    dump(llvm::errs());
+    abort();
+  }
+
   return getRawDiscriminator();
 }
 
@@ -1951,6 +1960,17 @@ BraceStmt * AbstractClosureExpr::getBody() const {
   if (const ClosureExpr *cls = dyn_cast<ClosureExpr>(this))
     return cls->getBody();
   llvm_unreachable("Unknown closure expression");
+}
+
+bool AbstractClosureExpr::bodyHasExplicitReturnStmt() const {
+  return AnyFunctionRef(const_cast<AbstractClosureExpr *>(this))
+      .bodyHasExplicitReturnStmt();
+}
+
+void AbstractClosureExpr::getExplicitReturnStmts(
+    SmallVectorImpl<ReturnStmt *> &results) const {
+  AnyFunctionRef(const_cast<AbstractClosureExpr *>(this))
+      .getExplicitReturnStmts(results);
 }
 
 Type AbstractClosureExpr::getResultType(
@@ -2286,36 +2306,6 @@ TypeExpr *TypeExpr::createForSpecializedDecl(DeclRefTypeRepr *ParentTR,
     specializedTR->setValue(boundDecl, ParentTR->getDeclContext());
   } else {
     auto *const qualIdentTR = cast<QualifiedIdentTypeRepr>(ParentTR);
-    if (isa<TypeAliasDecl>(boundDecl)) {
-      // If any of our parent types are unbound, bail out and let
-      // the constraint solver can infer generic parameters for them.
-      //
-      // This is because a type like GenericClass.GenericAlias<Int>
-      // cannot be represented directly.
-      //
-      // This also means that [GenericClass.GenericAlias<Int>]()
-      // won't parse correctly, whereas if we fully specialize
-      // GenericClass, it does.
-      //
-      // FIXME: Once we can model generic typealiases properly, rip
-      // this out.
-      QualifiedIdentTypeRepr *currTR = qualIdentTR;
-      while (auto *declRefBaseTR =
-                 dyn_cast<DeclRefTypeRepr>(currTR->getBase())) {
-        if (!declRefBaseTR->hasGenericArgList()) {
-          auto *decl =
-              dyn_cast_or_null<GenericTypeDecl>(declRefBaseTR->getBoundDecl());
-          if (decl && decl->isGeneric())
-            return nullptr;
-        }
-
-        currTR = dyn_cast<QualifiedIdentTypeRepr>(declRefBaseTR);
-        if (!currTR) {
-          break;
-        }
-      }
-    }
-
     specializedTR = QualifiedIdentTypeRepr::create(
         C, qualIdentTR->getBase(), ParentTR->getNameLoc(),
         ParentTR->getNameRef(), Args, AngleLocs);
@@ -2360,6 +2350,15 @@ bool Expr::isSelfExprOf(const AbstractFunctionDecl *AFD, bool sameBase) const {
     return DRE->getDecl() == AFD->getImplicitSelfDecl();
 
   return false;
+}
+
+TypeValueExpr *TypeValueExpr::createForDecl(DeclNameLoc Loc, TypeDecl *Decl,
+                                            DeclContext *DC) {
+  ASTContext &C = Decl->getASTContext();
+  assert(Loc.isValid());
+  auto *Repr = UnqualifiedIdentTypeRepr::create(C, Loc, Decl->createNameRef());
+  Repr->setValue(Decl, DC);
+  return new (C) TypeValueExpr(Repr);
 }
 
 OpenedArchetypeType *OpenExistentialExpr::getOpenedArchetype() const {
@@ -2750,12 +2749,49 @@ SourceRange TapExpr::getSourceRange() const {
                               Body->getSourceRange());
 }
 
-RegexLiteralExpr *
-RegexLiteralExpr::createParsed(ASTContext &ctx, SourceLoc loc,
-                               StringRef regexText, unsigned version,
-                               ArrayRef<uint8_t> serializedCaps) {
-  return new (ctx) RegexLiteralExpr(loc, regexText, version, serializedCaps,
-                                    /*implicit*/ false);
+RegexLiteralExpr *RegexLiteralExpr::createParsed(ASTContext &ctx, SourceLoc loc,
+                                                 StringRef regexText) {
+  return new (ctx) RegexLiteralExpr(&ctx, loc, regexText, /*implicit*/ false);
+}
+
+StringRef RegexLiteralExpr::getRegexToEmit() const {
+  auto &eval = getASTContext().evaluator;
+  return evaluateOrDefault(eval, RegexLiteralPatternInfoRequest{this}, {})
+      .RegexToEmit;
+}
+
+Type RegexLiteralExpr::getRegexType() const {
+  auto &eval = getASTContext().evaluator;
+  return evaluateOrDefault(eval, RegexLiteralPatternInfoRequest{this}, {})
+      .RegexType;
+}
+
+unsigned RegexLiteralExpr::getVersion() const {
+  auto &eval = getASTContext().evaluator;
+  return evaluateOrDefault(eval, RegexLiteralPatternInfoRequest{this}, {})
+      .Version;
+}
+
+ArrayRef<RegexLiteralPatternFeature>
+RegexLiteralExpr::getPatternFeatures() const {
+  auto &eval = getASTContext().evaluator;
+  return evaluateOrDefault(eval, RegexLiteralPatternInfoRequest{this}, {})
+      .Features;
+}
+
+StringRef
+RegexLiteralPatternFeatureKind::getDescription(ASTContext &ctx) const {
+  auto &eval = ctx.evaluator;
+  return evaluateOrDefault(
+      eval, RegexLiteralFeatureDescriptionRequest{*this, &ctx}, {});
+}
+
+AvailabilityRange
+RegexLiteralPatternFeatureKind::getAvailability(ASTContext &ctx) const {
+  auto &eval = ctx.evaluator;
+  return evaluateOrDefault(eval,
+                           RegexLiteralFeatureAvailabilityRequest{*this, &ctx},
+                           AvailabilityRange::alwaysAvailable());
 }
 
 TypeJoinExpr::TypeJoinExpr(llvm::PointerUnion<DeclRefExpr *, TypeBase *> result,
@@ -2795,8 +2831,10 @@ TypeJoinExpr::forBranchesOfSingleValueStmtExpr(ASTContext &ctx, Type joinType,
 }
 
 MacroExpansionExpr *MacroExpansionExpr::create(
-    DeclContext *dc, SourceLoc sigilLoc, DeclNameRef macroName,
-    DeclNameLoc macroNameLoc, SourceLoc leftAngleLoc,
+    DeclContext *dc, SourceLoc sigilLoc,
+    DeclNameRef moduleName, DeclNameLoc moduleNameLoc,
+    DeclNameRef macroName, DeclNameLoc macroNameLoc,
+    SourceLoc leftAngleLoc,
     ArrayRef<TypeRepr *> genericArgs, SourceLoc rightAngleLoc,
     ArgumentList *argList, MacroRoles roles, bool isImplicit,
     Type ty
@@ -2804,8 +2842,8 @@ MacroExpansionExpr *MacroExpansionExpr::create(
   ASTContext &ctx = dc->getASTContext();
   MacroExpansionInfo *info = new (ctx) MacroExpansionInfo{
       sigilLoc,
-      /*moduleName*/ DeclNameRef(),
-      /*moduleNameLoc*/ DeclNameLoc(),
+      moduleName,
+      moduleNameLoc,
       macroName,
       macroNameLoc,
       leftAngleLoc,
@@ -2859,11 +2897,7 @@ SourceLoc swift::extractNearestSourceLoc(const ClosureExpr *expr) {
   return expr->getLoc();
 }
 
-SourceLoc swift::extractNearestSourceLoc(const DefaultArgumentExpr *expr) {
-  return expr->getLoc();
-}
-
-SourceLoc swift::extractNearestSourceLoc(const MacroExpansionExpr *expr) {
+SourceLoc swift::extractNearestSourceLoc(const Expr *expr) {
   return expr->getLoc();
 }
 

@@ -68,7 +68,7 @@ function(_report_sdk prefix)
 endfunction()
 
 # Remove architectures not supported by the SDK from the given list.
-function(remove_sdk_unsupported_archs name os sdk_path architectures_var)
+function(remove_sdk_unsupported_archs name os sdk_path deployment_version architectures_var)
   execute_process(COMMAND
       /usr/libexec/PlistBuddy -c "Print :SupportedTargets:${os}:Archs" ${sdk_path}/SDKSettings.plist
     OUTPUT_VARIABLE sdk_supported_archs
@@ -168,6 +168,7 @@ endfunction()
 #   SWIFT_SDK_${prefix}_IS_SIMULATOR              Whether this is a simulator target.
 #   SWIFT_SDK_${prefix}_ARCH_${ARCH}_TRIPLE       Triple name
 #   SWIFT_SDK_${prefix}_ARCH_${ARCH}_MODULE       Module triple name for this SDK
+#   SWIFT_SDK_${prefix}_USE_BUILD_ID              Whether to pass --build-id to the linker
 macro(configure_sdk_darwin
     prefix name deployment_version xcrun_name
     triple_name module_name architectures)
@@ -216,6 +217,9 @@ macro(configure_sdk_darwin
   set(SWIFT_SDK_${prefix}_STATIC_ONLY FALSE)
   get_threading_package(${prefix} "darwin" SWIFT_SDK_${prefix}_THREADING_PACKAGE)
 
+  # On Darwin we get UUIDs automatically, without the --build-id flag
+  set(SWIFT_SDK_${prefix}_USE_BUILD_ID FALSE)
+
   set(SWIFT_SDK_${prefix}_ARCHITECTURES ${architectures})
   if(SWIFT_DARWIN_SUPPORTED_ARCHS)
     list_intersect(
@@ -225,7 +229,7 @@ macro(configure_sdk_darwin
   endif()
 
   # Remove any architectures not supported by the SDK.
-  remove_sdk_unsupported_archs(${name} ${xcrun_name} ${SWIFT_SDK_${prefix}_PATH} SWIFT_SDK_${prefix}_ARCHITECTURES)
+  remove_sdk_unsupported_archs(${name} ${xcrun_name} ${SWIFT_SDK_${prefix}_PATH} "${SWIFT_SDK_${prefix}_DEPLOYMENT_VERSION}" SWIFT_SDK_${prefix}_ARCHITECTURES)
 
   list_intersect(
     "${SWIFT_DARWIN_MODULE_ARCHS}"            # lhs
@@ -319,7 +323,7 @@ macro(configure_sdk_unix name architectures)
   endif()
   set(SWIFT_SDK_${prefix}_USE_ISYSROOT FALSE)
 
-  # Static linking is suported on Linux and WASI
+  # Static linking is supported on Linux and WASI
   if("${prefix}" STREQUAL "LINUX"
       OR "${prefix}" STREQUAL "LINUX_STATIC"
       OR "${prefix}" STREQUAL "WASI")
@@ -333,6 +337,15 @@ macro(configure_sdk_unix name architectures)
     set(SWIFT_SDK_${prefix}_STATIC_ONLY TRUE)
   else()
     set(SWIFT_SDK_${prefix}_STATIC_ONLY FALSE)
+  endif()
+
+  if("${prefix}" STREQUAL "LINUX"
+      OR "${prefix}" STREQUAL "ANDROID"
+      OR "${prefix}" STREQUAL "FREEBSD"
+      OR "${prefix}" STREQUAL "OPENBSD")
+    set(SWIFT_SDK_${prefix}_USE_BUILD_ID TRUE)
+  else()
+    set(SWIFT_SDK_${prefix}_USE_BUILD_ID FALSE)
   endif()
 
   # GCC on Linux is usually located under `/usr`.
@@ -494,6 +507,7 @@ macro(configure_sdk_windows name environment architectures)
   set(SWIFT_SDK_${prefix}_IMPORT_LIBRARY_SUFFIX ".lib")
   set(SWIFT_SDK_${prefix}_STATIC_LINKING_SUPPORTED FALSE)
   set(SWIFT_SDK_${prefix}_STATIC_ONLY FALSE)
+  set(SWIFT_SDK_${prefix}_USE_BUILD_ID FALSE)
   get_threading_package(${prefix} "win32" SWIFT_SDK_${prefix}_THREADING_PACKAGE)
 
   foreach(arch ${architectures})

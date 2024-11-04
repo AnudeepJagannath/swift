@@ -58,8 +58,7 @@ const uint16_t SWIFTMODULE_VERSION_MAJOR = 0;
 /// describe what change you made. The content of this comment isn't important;
 /// it just ensures a conflict if two people change the module format.
 /// Don't worry about adhering to the 80-column limit for this line.
-const uint16_t SWIFTMODULE_VERSION_MINOR =
-    875; // Add package field to SerializedKind_t
+const uint16_t SWIFTMODULE_VERSION_MINOR = 902; // merge_isolation_region
 
 /// A standard hash seed used for all string hashes in a serialized module.
 ///
@@ -206,6 +205,7 @@ enum class ReadImplKind : uint8_t {
   Inherited,
   Address,
   Read,
+  Read2,
 };
 using ReadImplKindField = BCFixed<3>;
 
@@ -219,6 +219,7 @@ enum class WriteImplKind : uint8_t {
   Set,
   MutableAddress,
   Modify,
+  Modify2,
 };
 using WriteImplKindField = BCFixed<3>;
 
@@ -230,6 +231,7 @@ enum class ReadWriteImplKind : uint8_t {
   MutableAddress,
   MaterializeToTemporary,
   Modify,
+  Modify2,
   StoredWithDidSet,
   InheritedWithDidSet,
 };
@@ -309,7 +311,8 @@ using SILFunctionTypeRepresentationField = BCFixed<5>;
 enum class SILCoroutineKind : uint8_t {
   None = 0,
   YieldOnce = 1,
-  YieldMany = 2,
+  YieldOnce2 = 2,
+  YieldMany = 3,
 };
 using SILCoroutineKindField = BCFixed<2>;
 
@@ -334,7 +337,9 @@ enum AccessorKind : uint8_t {
   Address,
   MutableAddress,
   Read,
+  Read2,
   Modify,
+  Modify2,
   Init,
   DistributedGet,
 };
@@ -389,6 +394,7 @@ enum class ParameterConvention : uint8_t {
   Pack_Owned,
   Pack_Inout,
   Pack_Guaranteed,
+  Indirect_In_CXX,
 };
 using ParameterConventionField = BCFixed<4>;
 
@@ -699,6 +705,15 @@ enum class FunctionTypeIsolation : uint8_t {
 };
 using FunctionTypeIsolationField = TypeIDField;
 
+// These IDs must \em not be renumbered or reordered without incrementing
+// the module version.
+enum class GenericParamKind : uint8_t {
+  Type   = 0,
+  Pack   = 1,
+  Value  = 2,
+};
+using GenericParamKindField = BCFixed<2>;
+
 // Encodes a VersionTuple:
 //
 //  Major
@@ -862,11 +877,11 @@ namespace control_block {
     MODULE_NAME,
     TARGET,
     SDK_NAME,
-    SDK_VERSION,
     REVISION,
-    CHANNEL,
     IS_OSSA,
     ALLOWABLE_CLIENT_NAME,
+    CHANNEL,
+    SDK_VERSION,
   };
 
   using MetadataLayout = BCRecordLayout<
@@ -897,18 +912,8 @@ namespace control_block {
     BCBlob
   >;
 
-  using SDKVersionLayout = BCRecordLayout<
-    SDK_VERSION,
-    BCBlob
-  >;
-
   using RevisionLayout = BCRecordLayout<
     REVISION,
-    BCBlob
-  >;
-
-  using ChannelLayout = BCRecordLayout<
-    CHANNEL,
     BCBlob
   >;
 
@@ -919,6 +924,16 @@ namespace control_block {
 
   using AllowableClientLayout = BCRecordLayout<
     ALLOWABLE_CLIENT_NAME,
+    BCBlob
+  >;
+
+  using ChannelLayout = BCRecordLayout<
+    CHANNEL,
+    BCBlob
+  >;
+
+  using SDKVersionLayout = BCRecordLayout<
+    SDK_VERSION,
     BCBlob
   >;
 }
@@ -949,6 +964,9 @@ namespace options_block {
     HAS_CXX_INTEROPERABILITY_ENABLED,
     ALLOW_NON_RESILIENT_ACCESS,
     SERIALIZE_PACKAGE_ENABLED,
+    CXX_STDLIB_KIND,
+    PUBLIC_MODULE_NAME,
+    SWIFT_INTERFACE_COMPILER_VERSION,
   };
 
   using SDKPathLayout = BCRecordLayout<
@@ -1032,12 +1050,27 @@ namespace options_block {
     HAS_CXX_INTEROPERABILITY_ENABLED
   >;
 
+  using CXXStdlibKindLayout = BCRecordLayout<
+    CXX_STDLIB_KIND,
+    BCFixed<2>
+  >;
+
   using AllowNonResilientAccess = BCRecordLayout<
     ALLOW_NON_RESILIENT_ACCESS
   >;
 
   using SerializePackageEnabled = BCRecordLayout<
     SERIALIZE_PACKAGE_ENABLED
+  >;
+
+  using PublicModuleNameLayout = BCRecordLayout<
+    PUBLIC_MODULE_NAME,
+    BCBlob
+  >;
+
+    using SwiftInterfaceCompilerVersionLayout = BCRecordLayout<
+    SWIFT_INTERFACE_COMPILER_VERSION,
+    BCBlob // version tuple
   >;
 }
 
@@ -1056,6 +1089,7 @@ namespace input_block {
     DEPENDENCY_DIRECTORY,
     MODULE_INTERFACE_PATH,
     IMPORTED_MODULE_SPIS,
+    EXTERNAL_MACRO,
   };
 
   using ImportedModuleLayout = BCRecordLayout<
@@ -1071,6 +1105,12 @@ namespace input_block {
   using ImportedModuleLayoutSPI = BCRecordLayout<
     IMPORTED_MODULE_SPIS,
     BCBlob // SPI names, separated by \0s
+  >;
+
+  using ExternalMacroLayout = BCRecordLayout<
+    EXTERNAL_MACRO,
+    ImportControlField, // import kind
+    BCBlob // ModuleName, Library Path, Executable Path, separated by \0s
   >;
 
   using LinkLibraryLayout = BCRecordLayout<
@@ -1196,6 +1236,12 @@ namespace decls_block {
     TypeIDField  // canonical type (a fallback)
   );
 
+  TYPE_LAYOUT(BuiltinFixedArrayTypeLayout,
+    BUILTIN_FIXED_ARRAY_TYPE,
+    TypeIDField, // count
+    TypeIDField  // element type
+  );
+
   TYPE_LAYOUT(TypeAliasTypeLayout,
     NAME_ALIAS_TYPE,
     DeclIDField,           // typealias decl
@@ -1207,10 +1253,12 @@ namespace decls_block {
 
   TYPE_LAYOUT(GenericTypeParamTypeLayout,
     GENERIC_TYPE_PARAM_TYPE,
-    BCFixed<1>,  // parameter pack?
-    DeclIDField, // generic type parameter decl or depth
-    BCVBR<4> // index + 1, or zero if we have a generic type
-            // parameter decl
+    GenericParamKindField, // param kind
+    BCFixed<1>,            // has decl?
+    BCFixed<15>,           // depth
+    BCFixed<16>,           // index
+    DeclIDField,           // generic type parameter decl or identifier
+    TypeIDField            // value type (if param kind == Value)
   );
 
   TYPE_LAYOUT(DependentMemberTypeLayout,
@@ -1222,11 +1270,6 @@ namespace decls_block {
     NOMINAL_TYPE,
     DeclIDField, // decl
     TypeIDField  // parent
-  );
-
-  TYPE_LAYOUT(ParenTypeLayout,
-    PAREN_TYPE,
-    TypeIDField // inner type
   );
 
   TYPE_LAYOUT(TupleTypeLayout,
@@ -1251,7 +1294,7 @@ namespace decls_block {
     TypeIDField,                     // thrown error
     DifferentiabilityKindField,      // differentiability kind
     FunctionTypeIsolationField,      // isolation
-    BCFixed<1>                       // has transferring result
+    BCFixed<1>                       // has sending result
     // trailed by parameters
     // Optionally lifetime dependence info
   );
@@ -1268,8 +1311,7 @@ namespace decls_block {
                      BCFixed<1>,              // isolated
                      BCFixed<1>,              // noDerivative?
                      BCFixed<1>,              // compileTimeConst
-                     BCFixed<1>,              // _resultDependsOn
-                     BCFixed<1>               // transferring
+                     BCFixed<1>               // sending
                      >;
 
   TYPE_LAYOUT(MetatypeTypeLayout,
@@ -1351,7 +1393,7 @@ namespace decls_block {
     TypeIDField,                     // thrown error
     DifferentiabilityKindField,      // differentiability kind
     FunctionTypeIsolationField,      // isolation
-    BCFixed<1>,                      // has transferring result
+    BCFixed<1>,                      // has sending result
     GenericSignatureIDField          // generic signature
 
     // trailed by parameters
@@ -1459,6 +1501,12 @@ namespace decls_block {
     BCArray<TypeIDField>// component types
   );
 
+  TYPE_LAYOUT(IntegerTypeLayout,
+    INTEGER_TYPE,
+    BCFixed<1>,   // is negative?
+    BCBlob        // integer value text
+  );
+
   using TypeAliasLayout = BCRecordLayout<
     TYPE_ALIAS_DECL,
     IdentifierIDField, // name
@@ -1473,12 +1521,10 @@ namespace decls_block {
   >;
 
   using GenericTypeParamDeclLayout = BCRecordLayout<GENERIC_TYPE_PARAM_DECL,
-    IdentifierIDField, // name
-    BCFixed<1>,        // implicit flag
-    BCFixed<1>,        // parameter pack?
-    BCVBR<4>,          // depth
-    BCVBR<4>,          // index
-    BCFixed<1>         // opaque type?
+    IdentifierIDField,     // name
+    BCFixed<1>,            // implicit flag
+    BCFixed<1>,            // is opaque?
+    TypeIDField            // interface type
   >;
 
   using AssociatedTypeDeclLayout = BCRecordLayout<
@@ -1671,7 +1717,7 @@ namespace decls_block {
     DeclIDField,  // opaque result type decl
     BCFixed<1>,   // isUserAccessible?
     BCFixed<1>,   // is distributed thunk
-    BCFixed<1>,   // has transferring result
+    BCFixed<1>,   // has sending result
     BCArray<IdentifierIDField> // name components,
                                // followed by TypeID dependencies
     // The record is trailed by:
@@ -2165,8 +2211,10 @@ namespace decls_block {
     RawLayout_DECL_ATTR,
     BCFixed<1>, // implicit
     TypeIDField, // like type
+    TypeIDField, // count type
     BCVBR<32>, // size
-    BCVBR<8> // alignment
+    BCVBR<8>, // alignment
+    BCFixed<1> // movesAsLike
   >;
   
   using SwiftNativeObjCRuntimeBaseDeclAttrLayout = BCRecordLayout<
@@ -2213,6 +2261,8 @@ namespace decls_block {
 
   using LifetimeDependenceLayout =
       BCRecordLayout<LIFETIME_DEPENDENCE,
+                     BCVBR<4>,           // targetIndex
+                     BCFixed<1>,         // isImmortal
                      BCFixed<1>,         // hasInheritLifetimeParamIndices
                      BCFixed<1>,         // hasScopeLifetimeParamIndices
                      BCArray<BCFixed<1>> // concatenated param indices
@@ -2296,6 +2346,7 @@ namespace decls_block {
     BCFixed<1>, // is unavailable from async?
     BCFixed<1>, // is this PackageDescription version-specific kind?
     BCFixed<1>, // is SPI?
+    BCFixed<1>, // is for Embedded
     BC_AVAIL_TUPLE, // Introduced
     BC_AVAIL_TUPLE, // Deprecated
     BC_AVAIL_TUPLE, // Obsoleted
@@ -2459,6 +2510,15 @@ namespace decls_block {
                                //   - argument labels
                                // trialed by introduced conformances
   >;
+
+  using LifetimeDeclAttrLayout =
+      BCRecordLayout<Lifetime_DECL_ATTR,
+                     BCVBR<4>,           // targetIndex
+                     BCFixed<1>,         // isImmortal
+                     BCFixed<1>,         // hasInheritLifetimeParamIndices
+                     BCFixed<1>,         // hasScopeLifetimeParamIndices
+                     BCArray<BCFixed<1>> // concatenated param indices
+                     >;
 
 #undef SYNTAX_SUGAR_TYPE_LAYOUT
 #undef TYPE_LAYOUT

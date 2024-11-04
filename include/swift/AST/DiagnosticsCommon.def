@@ -32,6 +32,9 @@ ERROR(error_opening_output,none,
 ERROR(error_closing_output,none,
       "error closing '%0' for output: %1", (StringRef, StringRef))
 
+ERROR(error_mccas,none,
+      "error trying to materialize MCCAS object file: %0", (StringRef))
+
 ERROR(cannot_find_group_info_file,none,
       "cannot find group info file at path: '%0'", (StringRef))
 
@@ -47,6 +50,10 @@ NOTE(brace_stmt_suggest_do,none,
 WARNING(error_in_future_swift_version,none,
         "%0; this is an error in the Swift %1 language mode",
         (DiagnosticInfo *, unsigned))
+
+WARNING(error_in_a_future_swift_version,none,
+        "%0; this will be an error in a future Swift language mode",
+        (DiagnosticInfo *))
 
 // Generic disambiguation
 NOTE(while_parsing_as_left_angle_bracket,none,
@@ -109,10 +116,6 @@ ERROR(generic_signature_not_valid,none,
 ERROR(generic_signature_not_equal,none,
       "generic signature %0 is not equal to new signature %1",
       (StringRef, StringRef))
-
-// Used in diagnostics that are split across requests implemented in several places.
-ERROR(concurrency_default_actor_not_found,none,
-      "broken standard library: cannot find default actor type '%0'", (StringRef))
 
 // FIXME: Used by swift-api-digester. Don't want to set up a separate diagnostics
 // file just for a few errors.
@@ -229,8 +232,6 @@ NOTE(in_macro_expansion,none,
 ERROR(macro_experimental,none,
       "%0 macros are an experimental feature that is not enabled %select{|(%1)}1",
       (StringRef, StringRef))
-ERROR(ambiguous_macro_reference,none,
-      "ambiguous reference to macro %0", (DeclName))
 
 //------------------------------------------------------------------------------
 // MARK: bridged diagnostics

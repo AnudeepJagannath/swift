@@ -28,6 +28,7 @@
 #include "swift/AST/TypeCheckRequests.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/QuotedString.h"
 #include "swift/Strings.h"
@@ -38,6 +39,7 @@
 using namespace swift;
 
 #define DECL_ATTR(_, Id, ...) \
+  static_assert(DeclAttrKind::Id <= DeclAttrKind::Last_DeclAttr); \
   static_assert(IsTriviallyDestructible<Id##Attr>::value, \
                 "Attrs are BumpPtrAllocated; the destructor is never called");
 #include "swift/AST/DeclAttr.def"
@@ -67,6 +69,10 @@ static_assert(DeclAttribute::isOptionSetFor##Id(DeclAttribute::DeclAttrOptions::
               DeclAttribute::isOptionSetFor##Id(DeclAttribute::DeclAttrOptions::APIStableToRemove),     \
               #Name " needs to specify either APIBreakingToRemove or APIStableToRemove");
 #include "swift/AST/DeclAttr.def"
+
+#define TYPE_ATTR(_, Id)                                                       \
+  static_assert(TypeAttrKind::Id <= TypeAttrKind::Last_TypeAttr);
+#include "swift/AST/TypeAttr.def"
 
 StringRef swift::getAccessLevelSpelling(AccessLevel value) {
   switch (value) {
@@ -143,6 +149,24 @@ const char *TypeAttribute::getAttrName(TypeAttrKind kind) {
 #include "swift/AST/TypeAttr.def"
   }
   llvm_unreachable("unknown type attribute kind");
+}
+
+bool TypeAttribute::isUserInaccessible(TypeAttrKind DK) {
+  // Currently we can base this off whether it is underscored or for SIL.
+  // TODO: We could introduce a similar options scheme to DECL_ATTR if we ever
+  // need a user-inaccessible non-underscored attribute.
+  switch (DK) {
+    // SIL attributes are always considered user-inaccessible.
+#define SIL_TYPE_ATTR(SPELLING, C)                                             \
+  case TypeAttrKind::C:                                                        \
+    return true;
+    // For non-SIL attributes, check whether the spelling is underscored.
+#define TYPE_ATTR(SPELLING, C)                                                 \
+  case TypeAttrKind::C:                                                        \
+    return StringRef(#SPELLING).starts_with("_");
+#include "swift/AST/TypeAttr.def"
+  }
+  llvm_unreachable("unhandled case in switch!");
 }
 
 TypeAttribute *TypeAttribute::createSimple(const ASTContext &context,
@@ -598,7 +622,8 @@ const AvailableAttr *DeclAttributes::getNoAsync(const ASTContext &ctx) const {
 }
 
 const BackDeployedAttr *
-DeclAttributes::getBackDeployed(const ASTContext &ctx) const {
+DeclAttributes::getBackDeployed(const ASTContext &ctx,
+                                bool forTargetVariant) const {
   const BackDeployedAttr *bestAttr = nullptr;
 
   for (auto attr : *this) {
@@ -607,7 +632,7 @@ DeclAttributes::getBackDeployed(const ASTContext &ctx) const {
       continue;
 
     if (backDeployedAttr->isInvalid() ||
-        !backDeployedAttr->isActivePlatform(ctx))
+        !backDeployedAttr->isActivePlatform(ctx, forTargetVariant))
       continue;
 
     // We have an attribute that is active for the platform, but
@@ -637,7 +662,7 @@ static bool isShortAvailable(const DeclAttribute *DA) {
   if (!AvailAttr)
     return false;
 
-  if (AvailAttr->IsSPI)
+  if (AvailAttr->isSPI())
     return false;
 
   if (!AvailAttr->Introduced.has_value())
@@ -953,6 +978,30 @@ static void printDifferentiableAttrArguments(
   printer << '(' << stream.str() << ')';
 }
 
+/// Returns the `PlatformKind` referenced by \p attr if applicable, or
+/// `std::nullopt` otherwise.
+static std::optional<PlatformKind>
+referencedPlatform(const DeclAttribute *attr) {
+  switch (attr->getKind()) {
+  case DeclAttrKind::Available:
+    return static_cast<const AvailableAttr *>(attr)->Platform;
+  case DeclAttrKind::BackDeployed:
+    return static_cast<const BackDeployedAttr *>(attr)->Platform;
+  case DeclAttrKind::OriginallyDefinedIn:
+    return static_cast<const OriginallyDefinedInAttr *>(attr)->Platform;
+  default:
+    return std::nullopt;
+  }
+}
+
+/// Returns true if \p attr contains a reference to a `PlatformKind` that should
+/// be considered SPI.
+static bool referencesSPIPlatform(const DeclAttribute *attr) {
+  if (auto platform = referencedPlatform(attr))
+    return isPlatformSPI(*platform);
+  return false;
+}
+
 void DeclAttributes::print(ASTPrinter &Printer, const PrintOptions &Options,
                            const Decl *D) const {
   if (!DeclAttrs)
@@ -975,6 +1024,8 @@ void DeclAttributes::print(ASTPrinter &Printer, const PrintOptions &Options,
   AttributeVector longAttributes;
   AttributeVector attributes;
   AttributeVector modifiers;
+  bool libraryLevelAPI =
+      D->getASTContext().LangOpts.LibraryLevel == LibraryLevel::API;
 
   for (auto DA : llvm::reverse(FlattenedAttrs)) {
     // Don't skip implicit custom attributes. Custom attributes like global
@@ -987,7 +1038,13 @@ void DeclAttributes::print(ASTPrinter &Printer, const PrintOptions &Options,
     if (!Options.PrintUserInaccessibleAttrs &&
         DeclAttribute::isUserInaccessible(DA->getKind()))
       continue;
-    if (Options.excludeAttrKind(DA->getKind()))
+    if (Options.excludeAttr(DA))
+      continue;
+
+    // In the public interfaces of -library-level=api modules, skip attributes
+    // that reference SPI platforms.
+    if (Options.printPublicInterface() && libraryLevelAPI &&
+        referencesSPIPlatform(DA))
       continue;
 
     // If we're supposed to suppress expanded macros, check whether this is
@@ -1314,7 +1371,7 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     auto Attr = cast<AvailableAttr>(this);
     if (Options.SuppressNoAsyncAvailabilityAttr && Attr->isNoAsync())
       return false;
-    if (Options.printPublicInterface() && Attr->IsSPI) {
+    if (Options.printPublicInterface() && Attr->isSPI()) {
       assert(Attr->hasPlatform());
       assert(Attr->Introduced.has_value());
       Printer.printAttrName("@available");
@@ -1323,7 +1380,14 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
       Printer << ", unavailable)";
       break;
     }
-    if (Attr->IsSPI) {
+    if (Attr->isForEmbedded()) {
+      std::string atUnavailableInEmbedded =
+          (llvm::Twine("@") + UNAVAILABLE_IN_EMBEDDED_ATTRNAME).str();
+      Printer.printAttrName(atUnavailableInEmbedded);
+      break;
+    }
+
+    if (Attr->isSPI()) {
       std::string atSPI = (llvm::Twine("@") + SPI_AVAILABLE_ATTRNAME).str();
       Printer.printAttrName(atSPI);
     } else {
@@ -1411,12 +1475,6 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     // Don't print the _specialize attribute if it is marked spi and we are
     // asked to skip SPI.
     if (Options.printPublicInterface() && !attr->getSPIGroups().empty())
-      return false;
-
-    // Don't print the _specialize attribute if we are asked to skip the ones
-    // with availability parameters.
-    if (!Options.PrintSpecializeAttributeWithAvailability &&
-        !attr->getAvailableAttrs().empty())
       return false;
 
     Printer << "@" << getAttrName() << "(";
@@ -1627,12 +1685,6 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
   case DeclAttrKind::MacroRole: {
     auto Attr = cast<MacroRoleAttr>(this);
 
-    // Suppress @attached(extension) if needed.
-    if (!Options.PrintExtensionMacroAttributes &&
-        Attr->getMacroRole() == MacroRole::Extension) {
-      break;
-    }
-
     switch (Attr->getMacroSyntax()) {
     case MacroSyntax::Freestanding:
       Printer.printAttrName("@freestanding");
@@ -1732,7 +1784,8 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
     } else if (auto array = attr->getArrayLikeTypeAndCount()) {
       Printer << "likeArrayOf: ";
       array->first->print(Printer, Options);
-      Printer << ", count: " << array->second;
+      Printer << ", count: ";
+      array->second->print(Printer, Options);
     } else {
       llvm_unreachable("unhandled @_rawLayout form");
     }
@@ -1763,6 +1816,12 @@ bool DeclAttribute::printImpl(ASTPrinter &Printer, const PrintOptions &Options,
       interleave(accesses, Printer, ", ");
     }
     Printer << ")";
+    break;
+  }
+
+  case DeclAttrKind::Lifetime: {
+    auto *attr = cast<LifetimeAttr>(this);
+    Printer << attr->getLifetimeEntry()->getString();
     break;
   }
 
@@ -1964,6 +2023,8 @@ StringRef DeclAttribute::getAttrName() const {
     } else {
       return "_allowFeatureSuppression";
     }
+  case DeclAttrKind::Lifetime:
+    return "lifetime";
   }
   llvm_unreachable("bad DeclAttrKind");
 }
@@ -2174,10 +2235,48 @@ Type TypeEraserAttr::getResolvedType(const ProtocolDecl *PD) const {
 Type RawLayoutAttr::getResolvedLikeType(StructDecl *sd) const {
   auto &ctx = sd->getASTContext();
   return evaluateOrDefault(ctx.evaluator,
-                           ResolveRawLayoutLikeTypeRequest{sd,
-                               const_cast<RawLayoutAttr *>(this)},
+                           ResolveRawLayoutTypeRequest{sd,
+                              const_cast<RawLayoutAttr *>(this),
+                              /*isLikeType*/ true},
                            ErrorType::get(ctx));
 }
+
+Type RawLayoutAttr::getResolvedCountType(StructDecl *sd) const {
+  auto &ctx = sd->getASTContext();
+  return evaluateOrDefault(ctx.evaluator,
+                           ResolveRawLayoutTypeRequest{sd,
+                              const_cast<RawLayoutAttr *>(this),
+                              /*isLikeType*/ false},
+                           ErrorType::get(ctx));
+}
+
+#define INIT_VER_TUPLE(X) X(X.empty() ? std::optional<llvm::VersionTuple>() : X)
+
+AvailableAttr::AvailableAttr(
+    SourceLoc AtLoc, SourceRange Range, PlatformKind Platform,
+    StringRef Message, StringRef Rename, ValueDecl *RenameDecl,
+    const llvm::VersionTuple &Introduced, SourceRange IntroducedRange,
+    const llvm::VersionTuple &Deprecated, SourceRange DeprecatedRange,
+    const llvm::VersionTuple &Obsoleted, SourceRange ObsoletedRange,
+    PlatformAgnosticAvailabilityKind PlatformAgnostic, bool Implicit,
+    bool IsSPI, bool IsForEmbedded)
+    : DeclAttribute(DeclAttrKind::Available, AtLoc, Range, Implicit),
+      Message(Message), Rename(Rename), RenameDecl(RenameDecl),
+      INIT_VER_TUPLE(Introduced), IntroducedRange(IntroducedRange),
+      INIT_VER_TUPLE(Deprecated), DeprecatedRange(DeprecatedRange),
+      INIT_VER_TUPLE(Obsoleted), ObsoletedRange(ObsoletedRange),
+      PlatformAgnostic(PlatformAgnostic), Platform(Platform) {
+  Bits.AvailableAttr.IsSPI = IsSPI;
+
+  if (IsForEmbedded) {
+    // FIXME: The IsForEmbedded bit should be removed when library availability
+    // conditions are implemented (rdar://138802876)
+    Bits.AvailableAttr.IsForEmbedded = true;
+    assert(Platform == PlatformKind::none);
+  }
+}
+
+#undef INIT_VER_TUPLE
 
 AvailableAttr *
 AvailableAttr::createPlatformAgnostic(ASTContext &C,
@@ -2213,8 +2312,9 @@ bool AvailableAttr::isActivePlatform(const ASTContext &ctx) const {
   return isPlatformActive(Platform, ctx.LangOpts);
 }
 
-bool BackDeployedAttr::isActivePlatform(const ASTContext &ctx) const {
-  return isPlatformActive(Platform, ctx.LangOpts);
+bool BackDeployedAttr::isActivePlatform(const ASTContext &ctx,
+                                        bool forTargetVariant) const {
+  return isPlatformActive(Platform, ctx.LangOpts, forTargetVariant);
 }
 
 AvailableAttr *AvailableAttr::clone(ASTContext &C, bool implicit) const {
@@ -2229,7 +2329,8 @@ AvailableAttr *AvailableAttr::clone(ASTContext &C, bool implicit) const {
                                implicit ? SourceRange() : ObsoletedRange,
                                PlatformAgnostic,
                                implicit,
-                               IsSPI);
+                               isSPI(),
+                               isForEmbedded());
 }
 
 std::optional<OriginallyDefinedInAttr::ActiveVersion>
@@ -2980,6 +3081,12 @@ AllowFeatureSuppressionAttr *AllowFeatureSuppressionAttr::create(
   auto *mem = ctx.Allocate(size, alignof(AllowFeatureSuppressionAttr));
   return new (mem)
       AllowFeatureSuppressionAttr(atLoc, range, implicit, inverted, features);
+}
+
+LifetimeAttr *LifetimeAttr::create(ASTContext &context, SourceLoc atLoc,
+                                   SourceRange baseRange, bool implicit,
+                                   LifetimeEntry *entry) {
+  return new (context) LifetimeAttr(atLoc, baseRange, implicit, entry);
 }
 
 void swift::simple_display(llvm::raw_ostream &out, const DeclAttribute *attr) {

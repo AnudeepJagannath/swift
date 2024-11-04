@@ -31,6 +31,7 @@
 #include "swift/AST/Stmt.h"
 #include "swift/AST/TypeRepr.h"
 #include "swift/Parse/Lexer.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Debug.h"
 #include "swift/Basic/STLExtras.h"
 #include "llvm/Support/Compiler.h"
@@ -271,7 +272,7 @@ ASTSourceFileScope::ASTSourceFileScope(SourceFile *SF,
 
     if (SF->Kind == SourceFileKind::DefaultArgument) {
       auto genInfo = *SF->getASTContext().SourceMgr.getGeneratedSourceInfo(
-          *SF->getBufferID());
+          SF->getBufferID());
       parentLoc = ASTNode::getFromOpaqueValue(genInfo.astNode).getStartLoc();
       if (auto parentScope =
               findStartingScopeForLookup(enclosingSF, parentLoc)) {
@@ -289,7 +290,11 @@ ASTSourceFileScope::ASTSourceFileScope(SourceFile *SF,
     switch (*macroRole) {
     case MacroRole::Expression:
     case MacroRole::Declaration:
-    case MacroRole::CodeItem:
+    case MacroRole::CodeItem: {
+      parentLoc = SF->getMacroInsertionRange().Start;
+      break;
+    }
+
     case MacroRole::Accessor:
     case MacroRole::MemberAttribute:
     case MacroRole::Conformance:
@@ -362,10 +367,6 @@ public:
   VISIT_AND_IGNORE(PoundDiagnosticDecl)
   VISIT_AND_IGNORE(MissingDecl)
   VISIT_AND_IGNORE(MissingMemberDecl)
-
-  // Only members of the active clause are in scope, and those
-  // are visited separately.
-  VISIT_AND_IGNORE(IfConfigDecl)
 
   // This declaration is handled from the PatternBindingDecl
   VISIT_AND_IGNORE(VarDecl)

@@ -24,6 +24,7 @@
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Parse/Lexer.h"
 
 using namespace swift;
@@ -48,10 +49,6 @@ static Type getArgListUniqueSugarType(ArgumentList *args, CanType resultTy) {
       if (argTy->getCanonicalType() != resultTy)
         return Type();
     }
-
-    // If this type is parenthesized, remove the parens.  We don't want to
-    // propagate parens from arguments to the result type.
-    argTy = argTy->getWithoutParens();
 
     // If this is the first match against the sugar type we found, use it.
     if (!uniqueSugarTy) {
@@ -190,58 +187,6 @@ TypeChecker::lookupPrecedenceGroupForInfixOperator(DeclContext *DC, Expr *E,
   return nullptr;
 }
 
-/// Find LHS as if we append binary operator to existing pre-folded expression.
-/// Returns found expression, or \c nullptr if the operator is not applicable.
-///
-/// For example, given '(== R (* A B))':
-/// 'findLHS(DC, expr, "+")' returns '(* A B)'.
-/// 'findLHS(DC, expr, "<<")' returns 'B'.
-/// 'findLHS(DC, expr, '==')' returns nullptr.
-Expr *TypeChecker::findLHS(DeclContext *DC, Expr *E, Identifier name) {
-  auto right = lookupPrecedenceGroupForOperator(DC, name, E->getEndLoc());
-  if (!right)
-    return nullptr;
-
-  while (true) {
-
-    // Look through implicit conversions.
-    if (auto ICE = dyn_cast<ImplicitConversionExpr>(E)) {
-      E = ICE->getSyntacticSubExpr();
-      continue;
-    }
-    if (auto ACE = dyn_cast<AutoClosureExpr>(E)) {
-      E = ACE->getSingleExpressionBody();
-      continue;
-    }
-
-    auto left = lookupPrecedenceGroupForInfixOperator(DC, E, /*diagnose=*/true);
-    if (!left)
-      // LHS is not binary expression.
-      return E;
-    switch (DC->getASTContext().associateInfixOperators(left, right)) {
-      case swift::Associativity::None:
-        return nullptr;
-      case swift::Associativity::Left:
-        return E;
-      case swift::Associativity::Right:
-        break;
-    }
-    // Find the RHS of the current binary expr.
-    if (auto *assignExpr = dyn_cast<AssignExpr>(E)) {
-      E = assignExpr->getSrc();
-    } else if (auto *ternary = dyn_cast<TernaryExpr>(E)) {
-      E = ternary->getElseExpr();
-    } else if (auto *binaryExpr = dyn_cast<BinaryExpr>(E)) {
-      E = binaryExpr->getRHS();
-    } else {
-      // E.g. 'fn() as Int << 2'.
-      // In this case '<<' has higher precedence than 'as', but the LHS should
-      // be 'fn() as Int' instead of 'Int'.
-      return E;
-    }
-  }
-}
-
 // The way we compute isEndOfSequence relies on the assumption that
 // the sequence-folding algorithm never recurses with a prefix of the
 // entire sequence.
@@ -265,17 +210,6 @@ static Expr *makeBinOp(ASTContext &Ctx, Expr *Op, Expr *LHS, Expr *RHS,
                          opPrecedence, isEndOfSequence);
     await->setSubExpr(sub);
     return await;
-  }
-  
-  // If this is an assignment operator, and the left operand is an optional
-  // evaluation, pull the operator into the chain.
-  if (opPrecedence && opPrecedence->isAssignment()) {
-    if (auto optEval = dyn_cast<OptionalEvaluationExpr>(LHS)) {
-      auto sub = makeBinOp(Ctx, Op, optEval->getSubExpr(), RHS,
-                           opPrecedence, isEndOfSequence);
-      optEval->setSubExpr(sub);
-      return optEval;
-    }
   }
 
   // If the right operand is a try or await, it's an error unless the operator
@@ -341,9 +275,9 @@ static Expr *makeBinOp(ASTContext &Ctx, Expr *Op, Expr *LHS, Expr *RHS,
   if (auto *ternary = dyn_cast<TernaryExpr>(Op)) {
     // Resolve the ternary expression.
     if (!Ctx.CompletionCallback) {
-      // In code completion we might call preCheckExpression twice - once for
+      // In code completion we might call preCheckTarget twice - once for
       // the first pass and once for the second pass. This is fine since
-      // preCheckExpression idempotent.
+      // preCheckTarget is idempotent.
       assert(!ternary->isFolded() && "already folded if expr in sequence?!");
     }
     ternary->setCondExpr(LHS);
@@ -354,9 +288,9 @@ static Expr *makeBinOp(ASTContext &Ctx, Expr *Op, Expr *LHS, Expr *RHS,
   if (auto *assign = dyn_cast<AssignExpr>(Op)) {
     // Resolve the assignment expression.
     if (!Ctx.CompletionCallback) {
-      // In code completion we might call preCheckExpression twice - once for
+      // In code completion we might call preCheckTarget twice - once for
       // the first pass and once for the second pass. This is fine since
-      // preCheckExpression idempotent.
+      // preCheckTarget is idempotent.
       assert(!assign->isFolded() && "already folded assign expr in sequence?!");
     }
     assign->setDest(LHS);
@@ -367,9 +301,9 @@ static Expr *makeBinOp(ASTContext &Ctx, Expr *Op, Expr *LHS, Expr *RHS,
   if (auto *as = dyn_cast<ExplicitCastExpr>(Op)) {
     // Resolve the 'as' or 'is' expression.
     if (!Ctx.CompletionCallback) {
-      // In code completion we might call preCheckExpression twice - once for
+      // In code completion we might call preCheckTarget twice - once for
       // the first pass and once for the second pass. This is fine since
-      // preCheckExpression idempotent.
+      // preCheckTarget is idempotent.
       assert(!as->isFolded() && "already folded 'as' expr in sequence?!");
     }
     assert(RHS == as && "'as' with non-type RHS?!");
@@ -380,9 +314,9 @@ static Expr *makeBinOp(ASTContext &Ctx, Expr *Op, Expr *LHS, Expr *RHS,
   if (auto *arrow = dyn_cast<ArrowExpr>(Op)) {
     // Resolve the '->' expression.
     if (!Ctx.CompletionCallback) {
-      // In code completion we might call preCheckExpression twice - once for
+      // In code completion we might call preCheckTarget twice - once for
       // the first pass and once for the second pass. This is fine since
-      // preCheckExpression idempotent.
+      // preCheckTarget is idempotent.
       assert(!arrow->isFolded() && "already folded '->' expr in sequence?!");
     }
     arrow->setArgsExpr(LHS);
@@ -469,12 +403,8 @@ static Expr *foldSequence(DeclContext *DC,
     }
     
     // Pull out the next binary operator.
-    Op op2{S[0], TypeChecker::lookupPrecedenceGroupForInfixOperator(
-                     DC, S[0], /*diagnose=*/true)};
-
-    // If the second operator's precedence is lower than the
-    // precedence bound, break out of the loop.
-    if (!precedenceBound.shouldConsider(op2.precedence)) break;
+    Op op2 = getNextOperator();
+    if (!op2) break;
 
     // If we're missing precedence info for either operator, treat them
     // as non-associative.
@@ -686,6 +616,15 @@ swift::DefaultTypeRequest::evaluate(Evaluator &evaluator,
 }
 
 Expr *TypeChecker::foldSequence(SequenceExpr *expr, DeclContext *dc) {
+  // First resolve any unresolved decl references in operator positions.
+  for (auto i : indices(expr->getElements())) {
+    if (i % 2 == 0)
+      continue;
+    auto *elt = expr->getElement(i);
+    if (auto *UDRE = dyn_cast<UnresolvedDeclRefExpr>(elt))
+      elt = TypeChecker::resolveDeclRefExpr(UDRE, dc);
+    expr->setElement(i, elt);
+  }
   ArrayRef<Expr*> Elts = expr->getElements();
   assert(Elts.size() > 1 && "inadequate number of elements in sequence");
   assert((Elts.size() & 1) == 1 && "even number of elements in sequence");

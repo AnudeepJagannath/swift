@@ -55,6 +55,8 @@ using ContextHashIDField = IdentifierIDField;
 using IsFrameworkField = BCFixed<1>;
 /// A bit that indicates whether or not a module is a system module
 using IsSystemField = BCFixed<1>;
+/// A bit that indicates whether or not a module is that of a static archive
+using IsStaticField = BCFixed<1>;
 
 /// Arrays of various identifiers, distinguished for readability
 using IdentifierIDArryField = llvm::BCArray<IdentifierIDField>;
@@ -140,14 +142,16 @@ using SwiftInterfaceModuleDetailsLayout =
                    FlagIDArrayIDField,                  // extraPCMArgs
                    ContextHashIDField,                  // contextHash
                    IsFrameworkField,                    // isFramework
+                   IsStaticField,                       // isStatic
                    FileIDField,                         // bridgingHeaderFile
                    FileIDArrayIDField,                  // sourceFiles
                    FileIDArrayIDField,                  // bridgingSourceFiles
-                   IdentifierIDField,                  // bridgingModuleDependencies
+                   IdentifierIDField,                   // bridgingModuleDependencies
                    DependencyIDArrayIDField,            // swiftOverlayDependencies
                    IdentifierIDField,                   // CASFileSystemRootID
                    IdentifierIDField,                   // bridgingHeaderIncludeTree
-                   IdentifierIDField                    // moduleCacheKey
+                   IdentifierIDField,                   // moduleCacheKey
+                   IdentifierIDField                    // UserModuleVersion
                    >;
 
 using SwiftSourceModuleDetailsLayout =
@@ -174,7 +178,9 @@ using SwiftBinaryModuleDetailsLayout =
                    IdentifierIDField,                // headerModuleDependencies
                    FileIDArrayIDField,               // headerSourceFiles
                    IsFrameworkField,                 // isFramework
-                   IdentifierIDField                 // moduleCacheKey
+                   IsStaticField,                    // isStatic
+                   IdentifierIDField,                // moduleCacheKey
+                   IdentifierIDField                 // UserModuleVersion
                    >;
 
 using SwiftPlaceholderModuleDetailsLayout =

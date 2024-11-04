@@ -864,7 +864,7 @@ static void setLocationInfoForClangNode(ClangNode ClangNode,
   std::pair<clang::FileID, unsigned> Decomp =
       ClangSM.getDecomposedLoc(CharRange.getBegin());
   if (!Decomp.first.isInvalid()) {
-    if (auto FE = ClangSM.getFileEntryForID(Decomp.first)) {
+    if (auto FE = ClangSM.getFileEntryRefForID(Decomp.first)) {
       Location.Filename = FE->getName();
 
       std::pair<clang::FileID, unsigned> EndDecomp =
@@ -1039,7 +1039,7 @@ fillSymbolInfo(CursorSymbolInfo &Symbol, const DeclInfo &DInfo,
     Options.MinimumAccessLevel = AccessLevel::Private;
     Options.IncludeSPISymbols = true;
     Options.IncludeClangDocs = true;
-    Options.PrintPrivateStdlibSymbols = true;
+    Options.PrintPrivateSystemSymbols = true;
 
     symbolgraphgen::printSymbolGraphForDecl(DInfo.VD, DInfo.BaseType,
                                             DInfo.InSynthesizedExtension,
@@ -1351,7 +1351,7 @@ getClangDeclarationName(const clang::NamedDecl *ND, NameTranslatingInfo &Info) {
       return clang::DeclarationName();
 
     ArrayRef<StringRef> Args = llvm::ArrayRef(Info.ArgNames);
-    std::vector<clang::IdentifierInfo *> Pieces;
+    std::vector<const clang::IdentifierInfo *> Pieces;
     for (unsigned i = 0; i < NumPieces; ++i) {
       if (i >= Info.ArgNames.size() || Info.ArgNames[i].empty()) {
         Pieces.push_back(OrigSel.getIdentifierInfoForSlot(i));
@@ -1628,7 +1628,7 @@ static void resolveCursor(
       }
 
       SourceManager &SM = CompIns.getSourceMgr();
-      unsigned BufferID = SF->getBufferID().value();
+      unsigned BufferID = SF->getBufferID();
       SourceLoc Loc =
         Lexer::getLocForStartOfToken(SM, BufferID, Offset);
       if (Loc.isInvalid()) {
@@ -1802,7 +1802,7 @@ static void computeDiagnostics(
         : Receiver(Receiver) {}
 
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
-      unsigned BufferID = *AstUnit->getPrimarySourceFile().getBufferID();
+      unsigned BufferID = AstUnit->getPrimarySourceFile().getBufferID();
       auto &DiagConsumer = AstUnit->getEditorDiagConsumer();
       auto Diagnostics = DiagConsumer.getDiagnosticsForBuffer(BufferID);
       Receiver(RequestResult<DiagnosticsResult>::fromResult(Diagnostics));
@@ -1810,6 +1810,11 @@ static void computeDiagnostics(
 
     void cancelled() override {
       Receiver(RequestResult<DiagnosticsResult>::cancelled());
+    }
+
+    void failed(StringRef Error) override {
+      LOG_WARN_FUNC("diagnostics failed: " << Error);
+      Receiver(RequestResult<DiagnosticsResult>::fromError(Error));
     }
   };
 
@@ -1858,7 +1863,7 @@ static void resolveName(
       }
 
       SourceLoc Loc = Lexer::getLocForStartOfToken(CompIns.getSourceMgr(),
-                                                   *SF->getBufferID(), Offset);
+                                                   SF->getBufferID(), Offset);
       if (Loc.isInvalid()) {
         Receiver(RequestResult<NameTranslatingInfo>::fromError(
           "Unable to resolve the start of the token."));
@@ -2099,7 +2104,7 @@ void SwiftLangSupport::getCursorInfo(
         } else {
           std::string Diagnostic; // Unused.
           ResolvedValueRefCursorInfoPtr Info = new ResolvedValueRefCursorInfo(
-              /*SourcFile=*/nullptr, SourceLoc(),
+              /*SourceFile=*/nullptr, SourceLoc(),
               const_cast<ValueDecl *>(Entity.Dcl),
               /*CtorTyRef=*/nullptr,
               /*ExtTyRef=*/nullptr, Entity.IsRef,
@@ -2330,7 +2335,7 @@ static void resolveCursorFromUSR(
 
   class CursorInfoConsumer : public SwiftASTConsumer {
     std::string InputFile;
-    StringRef USR;
+    std::string USR;
     SwiftLangSupport &Lang;
     SwiftInvocationRef ASTInvok;
     const bool TryExistingAST;
@@ -2371,7 +2376,7 @@ static void resolveCursorFromUSR(
     void handlePrimaryAST(ASTUnitRef AstUnit) override {
       auto &CompIns = AstUnit->getCompilerInstance();
 
-      if (USR.starts_with("c:")) {
+      if (StringRef(USR).starts_with("c:")) {
         LOG_WARN_FUNC("lookup for C/C++/ObjC USRs not implemented");
         CursorInfoData Info;
         Info.InternalDiagnostic = "Lookup for C/C++/ObjC USRs not implemented.";
@@ -2537,11 +2542,13 @@ void SwiftLangSupport::findRelatedIdentifiersInFile(
     std::function<void(const RequestResult<RelatedIdentsResult> &)> Receiver;
     SwiftInvocationRef Invok;
 
+    bool requiresDeepStack() override { return true; }
+
 #if SWIFT_BUILD_SWIFT_SYNTAX
     // FIXME: Don't silently eat errors here.
     RelatedIdentsResult getRelatedIdents(SourceFile *SrcFile,
                                          CompilerInstance &CompInst) {
-      unsigned BufferID = SrcFile->getBufferID().value();
+      unsigned BufferID = SrcFile->getBufferID();
       SourceLoc Loc = Lexer::getLocForStartOfToken(CompInst.getSourceMgr(),
                                                    BufferID, Offset);
       if (Loc.isInvalid())
@@ -2585,7 +2592,7 @@ void SwiftLangSupport::findRelatedIdentifiersInFile(
 #ifndef NDEBUG
       for (auto loc : Locs.getLocations()) {
         assert(loc.OldName == OldName &&
-               "Found related identfiers with different names?");
+               "Found related identifiers with different names?");
       }
 #endif
 
@@ -2715,7 +2722,7 @@ void SwiftLangSupport::findActiveRegionsInFile(
       }
 
       auto &SM = SF->getASTContext().SourceMgr;
-      auto BufferID = *SF->getBufferID();
+      auto BufferID = SF->getBufferID();
 
       SmallVector<IfConfigInfo> Configs;
       for (auto &range : SF->getIfConfigClauseRanges()) {
@@ -2805,7 +2812,7 @@ void SwiftLangSupport::semanticRefactoring(
         return;
       }
 
-      Opts.Range.BufferID = *SF->getBufferID();
+      Opts.Range.BufferID = SF->getBufferID();
       Opts.Range.Line = Info.Line;
       Opts.Range.Column = Info.Column;
       Opts.Range.Length = Info.Length;
@@ -2956,7 +2963,7 @@ void SwiftLangSupport::collectVariableTypes(
       SourceRange Range;
       if (Offset.has_value() && Length.has_value()) {
         auto &SM = CompInst.getSourceMgr();
-        unsigned BufferID = SF->getBufferID().value();
+        unsigned BufferID = SF->getBufferID();
         SourceLoc Start = Lexer::getLocForStartOfToken(SM, BufferID, *Offset);
         SourceLoc End =
             Lexer::getLocForStartOfToken(SM, BufferID, *Offset + *Length);

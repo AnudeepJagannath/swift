@@ -24,6 +24,7 @@
 #include "swift/AST/SILOptions.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/ProfileCounter.h"
 #include "swift/Basic/STLExtras.h"
@@ -457,7 +458,8 @@ public:
   void emitDestructiveCaseBlocks();
 
   JumpDest getSharedCaseBlockDest(CaseStmt *caseStmt);
-  void emitSharedCaseBlocks(llvm::function_ref<void(CaseStmt *)> bodyEmitter);
+  void emitSharedCaseBlocks(ValueOwnership ownership,
+                            llvm::function_ref<void(CaseStmt *)> bodyEmitter);
 
   void emitCaseBody(CaseStmt *caseBlock);
 
@@ -2206,8 +2208,7 @@ void PatternMatchEmission::emitEnumElementObjectDispatch(
       // Reabstract to the substituted type, if needed.
       CanType substEltTy =
           sourceType
-              ->getTypeOfMember(SGF.SGM.M.getSwiftModule(), elt,
-                                elt->getArgumentInterfaceType())
+              ->getTypeOfMember(elt, elt->getPayloadInterfaceType())
               ->getCanonicalType();
 
       AbstractionPattern origEltTy =
@@ -2468,8 +2469,8 @@ void PatternMatchEmission::emitEnumElementDispatch(
 
       // Reabstract to the substituted type, if needed.
       CanType substEltTy =
-        sourceType->getTypeOfMember(SGF.SGM.M.getSwiftModule(), eltDecl,
-                                    eltDecl->getArgumentInterfaceType())
+        sourceType->getTypeOfMember(eltDecl,
+                                    eltDecl->getPayloadInterfaceType())
                   ->getCanonicalType();
 
       AbstractionPattern origEltTy =
@@ -2790,8 +2791,13 @@ void PatternMatchEmission::emitDestructiveCaseBlocks() {
     // TODO: handle fallthroughs and multiple cases bindings
     // In those cases we'd need to forward bindings through the shared case
     // destination blocks.
-    assert(!stmt->hasFallthroughDest()
-           && stmt->getCaseLabelItems().size() == 1);
+    if (stmt->hasFallthroughDest()
+        || stmt->getCaseLabelItems().size() != 1) {
+      // This should already have been diagnosed as unsupported, so just emit
+      // an unreachable here.
+      SGF.B.createUnreachable(stmt);
+      continue;
+    }
 
     // Bind variables from the pattern.
     if (stmt->hasCaseBodyVariables()) {
@@ -2899,7 +2905,21 @@ emitAddressOnlyInitialization(VarDecl *dest, SILValue value) {
 
 /// Emit all the shared case statements.
 void PatternMatchEmission::emitSharedCaseBlocks(
+    ValueOwnership ownership,
     llvm::function_ref<void(CaseStmt *)> bodyEmitter) {
+  if (ownership >= ValueOwnership::Shared
+      && !SharedCases.empty()) {
+    SGF.SGM.diagnose(SharedCases.front().first,
+                     diag::noncopyable_shared_case_block_unimplemented);
+    
+    for (auto &entry : SharedCases) {
+      SILBasicBlock *caseBB = entry.second.first;
+      SGF.B.setInsertionPoint(caseBB);
+      SGF.B.createUnreachable(entry.first);
+    }
+    
+    return;
+  }
   for (auto &entry : SharedCases) {
     CaseStmt *caseBlock = entry.first;
     SILBasicBlock *caseBB = entry.second.first;
@@ -3079,7 +3099,7 @@ static void emitDiagnoseOfUnexpectedEnumCaseValue(SILGenFunction &SGF,
           llvm_unreachable("wrong generic signature for expected case value");
         }
       },
-      LookUpConformanceInSignature(genericSig.getPointer()));
+      LookUpConformanceInModule());
 
   SGF.emitApplyOfLibraryIntrinsic(
       loc, diagnoseFailure, subs,
@@ -3089,6 +3109,13 @@ static void emitDiagnoseOfUnexpectedEnumCaseValue(SILGenFunction &SGF,
 static void emitDiagnoseOfUnexpectedEnumCase(SILGenFunction &SGF,
                                              SILLocation loc,
                                              UnexpectedEnumCaseInfo ueci) {
+  if (ueci.subjectTy->isNoncopyable()) {
+    // TODO: The DiagnoseUnexpectedEnumCase intrinsic currently requires a
+    // Copyable parameter. For noncopyable enums it should be impossible to
+    // reach an unexpected case statically, so just emit a trap for now.
+    SGF.B.createUnconditionalFail(loc, "unexpected enum case");
+    return;
+  }
   ASTContext &ctx = SGF.getASTContext();
   auto diagnoseFailure = ctx.getDiagnoseUnexpectedEnumCase();
   if (!diagnoseFailure) {
@@ -3100,7 +3127,7 @@ static void emitDiagnoseOfUnexpectedEnumCase(SILGenFunction &SGF,
   auto genericArgsMap = SubstitutionMap::get(
       diagnoseSignature,
       [&](SubstitutableType *type) -> Type { return ueci.subjectTy; },
-      LookUpConformanceInSignature(diagnoseSignature.getPointer()));
+      LookUpConformanceInModule());
 
   SGF.emitApplyOfLibraryIntrinsic(loc, diagnoseFailure, genericArgsMap,
                                   ueci.metatype, SGFContext());
@@ -3308,7 +3335,9 @@ static bool isBorrowableSubject(SILGenFunction &SGF,
       // Get returns an owned value.
       return false;
     case AccessorKind::Read:
+    case AccessorKind::Read2:
     case AccessorKind::Modify:
+    case AccessorKind::Modify2:
     case AccessorKind::Address:
     case AccessorKind::MutableAddress:
       // Read, modify, and addressors yield a borrowable reference.
@@ -3742,7 +3771,7 @@ void SILGenFunction::emitSwitchStmt(SwitchStmt *S) {
   }
 
   // Then emit the case blocks shared by multiple pattern cases.
-  emission.emitSharedCaseBlocks(
+  emission.emitSharedCaseBlocks(ownership,
       [&](CaseStmt *caseStmt) { emission.emitCaseBody(caseStmt); });
 
   // Bookkeeping.
@@ -4015,7 +4044,8 @@ void SILGenFunction::emitCatchDispatch(DoCatchStmt *S, ManagedValue exn,
   stmtScope.pop();
 
   // Then emit the case blocks shared by multiple pattern cases.
-  emission.emitSharedCaseBlocks([&](CaseStmt *caseStmt) {
+  emission.emitSharedCaseBlocks(ValueOwnership::Default,
+  [&](CaseStmt *caseStmt) {
     emitStmt(caseStmt->getBody());
 
     // If we fell out of the catch clause, branch to the fallthrough dest.

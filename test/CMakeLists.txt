@@ -51,6 +51,7 @@ function(get_test_dependencies SDK result_var_name)
 
   if (SWIFT_INCLUDE_TOOLS)
     list(APPEND deps_binaries
+      libMockPlugin
       lldb-moduleimport-test
       swift-frontend
       swift-demangle
@@ -63,6 +64,10 @@ function(get_test_dependencies SDK result_var_name)
 
     if(SWIFT_BUILD_SOURCEKIT)
       list(APPEND deps_binaries sourcekitd-test complete-test)
+    endif()
+
+    if(SWIFT_BUILD_SWIFT_SYNTAX)
+      list(APPEND deps_binaries swift-plugin-server)
     endif()
   endif()
 
@@ -195,7 +200,6 @@ normalize_boolean_spelling(SWIFT_ENABLE_SOURCEKIT_TESTS)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_DIFFERENTIABLE_PROGRAMMING)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_CONCURRENCY)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_DISTRIBUTED)
-normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_NONESCAPABLE_TYPES)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING)
 normalize_boolean_spelling(SWIFT_ENABLE_EXPERIMENTAL_OBSERVATION)
 normalize_boolean_spelling(SWIFT_ENABLE_MACCATALYST)
@@ -215,6 +219,9 @@ normalize_boolean_spelling(SWIFT_STDLIB_ENABLE_OBJC_INTEROP)
 normalize_boolean_spelling(SWIFT_ENABLE_BACKTRACING)
 normalize_boolean_spelling(SWIFT_BUILD_SWIFT_SYNTAX)
 normalize_boolean_spelling(SWIFT_ENABLE_SYNCHRONIZATION)
+normalize_boolean_spelling(SWIFT_ENABLE_VOLATILE)
+normalize_boolean_spelling(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
+normalize_boolean_spelling(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING)
 normalize_boolean_spelling(SWIFT_BUILD_REMOTE_MIRROR)
 is_build_type_optimized("${SWIFT_STDLIB_BUILD_TYPE}" SWIFT_OPTIMIZED)
 
@@ -244,6 +251,16 @@ if(NOT "${COVERAGE_DB}" STREQUAL "")
   add_custom_target("touch-covering-tests"
       COMMAND "${SWIFT_SOURCE_DIR}/utils/coverage/coverage-touch-tests" "--swift-dir" "${SWIFT_SOURCE_DIR}" "--coverage-db" "${COVERAGE_DB}"
       COMMENT "Touching covering tests")
+endif()
+
+if(SWIFT_COMPILER_IS_MSVC_LIKE)
+  set(C_PREPROCESSOR_COMMAND
+    "${CMAKE_C_COMPILER}" "/P" "/EP" "/I" "${SWIFT_MAIN_INCLUDE_DIR}" "/TC"
+    "/Fi<<<OUTPUT_FILE>>>")
+else()
+  set(C_PREPROCESSOR_COMMAND
+    "${CMAKE_C_COMPILER}" "-E" "-P" "-I${SWIFT_MAIN_INCLUDE_DIR}" "-x" "c" "-o"
+    "<<<OUTPUT_FILE>>>")
 endif()
 
 foreach(SDK ${SWIFT_SDKS})
@@ -279,6 +296,9 @@ foreach(SDK ${SWIFT_SDKS})
         set(SWIFT_HAVE_LIBXML2 FALSE)
       endif()
 
+      set(VARIANT_EXTERNAL_EMBEDDED_PLATFORM FALSE)
+      set(VARIANT_EXTERNAL_EMBEDDED_DEVICE)
+
       swift_configure_lit_site_cfg(
           "${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.in"
           "${test_bin_dir}/lit.site.cfg"
@@ -293,6 +313,38 @@ foreach(SDK ${SWIFT_SDKS})
           "${CMAKE_CURRENT_SOURCE_DIR}/../validation-test/lit.site.cfg.in"
           "${validation_test_bin_dir}/lit.site.cfg"
           "validation-test${VARIANT_SUFFIX}.lit.site.cfg")
+
+      set(test_lit_swift_features_cmd ${C_PREPROCESSOR_COMMAND})
+      list(
+        TRANSFORM test_lit_swift_features_cmd
+        REPLACE "<<<OUTPUT_FILE>>>" "${test_bin_dir}/lit.swift-features.cfg")
+      add_custom_command(
+        OUTPUT "${test_bin_dir}/lit.swift-features.cfg"
+        COMMAND
+          ${test_lit_swift_features_cmd}
+          "${CMAKE_CURRENT_SOURCE_DIR}/lit.swift-features.cfg.inc"
+        DEPENDS
+          "lit.swift-features.cfg.inc"
+          "${SWIFT_MAIN_INCLUDE_DIR}/swift/Basic/Features.def"
+      )
+
+      set(validation_test_lit_swift_features_cmd ${C_PREPROCESSOR_COMMAND})
+      list(
+        TRANSFORM validation_test_lit_swift_features_cmd
+        REPLACE "<<<OUTPUT_FILE>>>" "${validation_test_bin_dir}/lit.swift-features.cfg")
+      add_custom_command(
+        OUTPUT "${validation_test_bin_dir}/lit.swift-features.cfg"
+        COMMAND
+          ${validation_test_lit_swift_features_cmd}
+          "${CMAKE_CURRENT_SOURCE_DIR}/lit.swift-features.cfg.inc"
+        DEPENDS
+          "lit.swift-features.cfg.inc"
+          "${SWIFT_MAIN_INCLUDE_DIR}/swift/Basic/Features.def"
+      )
+      add_custom_target(lit_swift_features_cfg_${VARIANT_SUFFIX}
+        DEPENDS
+          "${test_bin_dir}/lit.swift-features.cfg"
+          "${validation_test_bin_dir}/lit.swift-features.cfg")
 
       set(test_dependencies)
       get_test_dependencies("${SDK}" test_dependencies)
@@ -317,22 +369,8 @@ foreach(SDK ${SWIFT_SDKS})
         endif()
       endif()
 
-      if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB)
-        if(TARGET "embedded-stdlib")
-          list(APPEND test_dependencies "embedded-stdlib")
-        endif()
-       if(TARGET "embedded-darwin")
-          list(APPEND test_dependencies "embedded-darwin")
-        endif()
-        if(TARGET "embedded-concurrency")
-          list(APPEND test_dependencies "embedded-concurrency")
-        endif()
-        if(TARGET "embedded-synchronization")
-          list(APPEND test_dependencies "embedded-synchronization")
-        endif()
-        if(TARGET "embedded-volatile")
-          list(APPEND test_dependencies "embedded-volatile")
-        endif()
+      if(TARGET "embedded-libraries")
+        list(APPEND test_dependencies "embedded-libraries")
       endif()
 
       if(NOT "${COVERAGE_DB}" STREQUAL "")
@@ -344,6 +382,9 @@ foreach(SDK ${SWIFT_SDKS})
         "swiftStdlibUnicodeUnittest-${SWIFT_SDK_${SDK}_LIB_SUBDIR}")
 
       set(validation_test_dependencies)
+
+      list(APPEND test_dependencies lit_swift_features_cfg_${VARIANT_SUFFIX})
+      list(APPEND validation_test_dependencies lit_swift_features_cfg_${VARIANT_SUFFIX})
 
       set(command_upload_stdlib)
       set(command_upload_swift_reflection_test)
@@ -413,10 +454,6 @@ foreach(SDK ${SWIFT_SDKS})
           list(APPEND LIT_ARGS "--param" "distributed")
         endif()
 
-        if(SWIFT_ENABLE_EXPERIMENTAL_NONESCAPABLE_TYPES)
-          list(APPEND LIT_ARGS "--param" "nonescapable_types")
-        endif()
-
         if(SWIFT_ENABLE_EXPERIMENTAL_STRING_PROCESSING)
           list(APPEND LIT_ARGS "--param" "string_processing")
         endif()
@@ -431,6 +468,10 @@ foreach(SDK ${SWIFT_SDKS})
 
         if(SWIFT_ENABLE_SYNCHRONIZATION)
           list(APPEND LIT_ARGS "--param" "synchronization")
+        endif()
+
+        if(SWIFT_ENABLE_VOLATILE)
+          list(APPEND LIT_ARGS "--param" "volatile")
         endif()
 
         if(SWIFT_BUILD_REMOTE_MIRROR)
@@ -530,6 +571,38 @@ foreach(SDK ${SWIFT_SDKS})
     endforeach()
   endforeach()
 endforeach()
+
+if(SWIFT_SHOULD_BUILD_EMBEDDED_STDLIB_CROSS_COMPILING)
+  set(VARIANT_SUFFIX "-embedded-armv7")
+  set(VARIANT_TRIPLE "armv7em-none-none-eabi")
+  set(VARIANT_EXTERNAL_EMBEDDED_PLATFORM TRUE)
+  set(VARIANT_EXTERNAL_EMBEDDED_DEVICE "arm-qemu-stm32f4")
+  set(SWIFT_TEST_RESULTS_DIR "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}/swift-test-results/${VARIANT_TRIPLE}")
+  swift_configure_lit_site_cfg(
+      "${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.in"
+      "${CMAKE_CURRENT_BINARY_DIR}${VARIANT_SUFFIX}/lit.site.cfg"
+      "test${VARIANT_SUFFIX}.lit.site.cfg")
+
+  set(VARIANT_SUFFIX "-embedded-avr")
+  set(VARIANT_TRIPLE "avr-none-none-elf")
+  set(VARIANT_EXTERNAL_EMBEDDED_PLATFORM TRUE)
+  set(VARIANT_EXTERNAL_EMBEDDED_DEVICE "avr-qemu-atmega2560")
+  set(SWIFT_TEST_RESULTS_DIR "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}/swift-test-results/${VARIANT_TRIPLE}")
+  swift_configure_lit_site_cfg(
+      "${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.in"
+      "${CMAKE_CURRENT_BINARY_DIR}${VARIANT_SUFFIX}/lit.site.cfg"
+      "test${VARIANT_SUFFIX}.lit.site.cfg")
+
+  set(VARIANT_SUFFIX "-embedded-riscv32")
+  set(VARIANT_TRIPLE "riscv32-none-none-eabi")
+  set(VARIANT_EXTERNAL_EMBEDDED_PLATFORM TRUE)
+  set(VARIANT_EXTERNAL_EMBEDDED_DEVICE "riscv32-qemu-virt")
+  set(SWIFT_TEST_RESULTS_DIR "${CMAKE_BINARY_DIR}/${CMAKE_CFG_INTDIR}/swift-test-results/${VARIANT_TRIPLE}")
+  swift_configure_lit_site_cfg(
+      "${CMAKE_CURRENT_SOURCE_DIR}/lit.site.cfg.in"
+      "${CMAKE_CURRENT_BINARY_DIR}${VARIANT_SUFFIX}/lit.site.cfg"
+      "test${VARIANT_SUFFIX}.lit.site.cfg")
+endif()
 
 # Add shortcuts for the default variant.
 foreach(test_mode ${TEST_MODES})

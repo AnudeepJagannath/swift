@@ -12,6 +12,7 @@
 
 #include "swift/Frontend/CASOutputBackends.h"
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/FileTypes.h"
 #include "swift/Frontend/CachingUtils.h"
 #include "swift/Frontend/CompileJobCacheKey.h"
@@ -72,7 +73,7 @@ public:
     auto OutputType = ProducingInput->second.second;
 
     // Uncached output kind.
-    if (file_types::isProducedFromDiagnostics(OutputType))
+    if (!isStoredDirectly(OutputType))
       return std::make_unique<llvm::vfs::NullOutputFileImpl>();
 
     return std::make_unique<SwiftCASOutputFile>(
@@ -114,6 +115,11 @@ SwiftCASOutputBackend::SwiftCASOutputBackend(
 
 SwiftCASOutputBackend::~SwiftCASOutputBackend() { delete &Impl; }
 
+bool SwiftCASOutputBackend::isStoredDirectly(file_types::ID Kind) {
+  return !file_types::isProducedFromDiagnostics(Kind) &&
+         Kind != file_types::TY_Dependencies;
+}
+
 IntrusiveRefCntPtr<OutputBackend> SwiftCASOutputBackend::cloneImpl() const {
   return makeIntrusiveRefCnt<SwiftCASOutputBackend>(
       Impl.CAS, Impl.Cache, Impl.BaseKey, Impl.InputsAndOutputs, Impl.Action);
@@ -139,6 +145,33 @@ Error SwiftCASOutputBackend::storeCachedDiagnostics(unsigned InputIndex,
                                                     StringRef Bytes) {
   return storeImpl("<cached-diagnostics>", Bytes, InputIndex,
                    file_types::ID::TY_CachedDiagnostics);
+}
+
+Error SwiftCASOutputBackend::storeMakeDependenciesFile(StringRef OutputFilename,
+                                                       llvm::StringRef Bytes) {
+  auto Input = Impl.OutputToInputMap.find(OutputFilename);
+  if (Input == Impl.OutputToInputMap.end())
+    return llvm::createStringError("InputIndex for output file not found!");
+  auto InputIndex = Input->second.first;
+  assert(Input->second.second == file_types::TY_Dependencies &&
+         "wrong output type");
+  return storeImpl(OutputFilename, Bytes, InputIndex,
+                   file_types::TY_Dependencies);
+}
+
+Error SwiftCASOutputBackend::storeMCCASObjectID(StringRef OutputFilename,
+                                                llvm::cas::CASID ID) {
+  auto Input = Impl.OutputToInputMap.find(OutputFilename);
+  if (Input == Impl.OutputToInputMap.end())
+    return llvm::createStringError("InputIndex for output file not found!");
+  auto InputIndex = Input->second.first;
+  auto MCRef = Impl.CAS.getReference(ID);
+  if (!MCRef)
+    return createStringError("Invalid CASID: " + ID.toString() +
+                             ". No associated ObjectRef found!");
+
+  Impl.OutputRefs[InputIndex].insert({file_types::TY_Object, *MCRef});
+  return Impl.finalizeCacheKeysFor(InputIndex);
 }
 
 void SwiftCASOutputBackend::Implementation::initBackend(

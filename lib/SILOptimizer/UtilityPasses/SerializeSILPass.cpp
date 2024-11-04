@@ -167,6 +167,7 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::ClassifyBridgeObjectInst:
   case SILInstructionKind::ValueToBridgeObjectInst:
   case SILInstructionKind::MarkDependenceInst:
+  case SILInstructionKind::MergeIsolationRegionInst:
   case SILInstructionKind::CopyBlockInst:
   case SILInstructionKind::CopyBlockWithoutEscapingInst:
   case SILInstructionKind::CopyValueInst:
@@ -301,6 +302,7 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::MarkUnresolvedMoveAddrInst:
   case SILInstructionKind::DestroyAddrInst:
   case SILInstructionKind::EndLifetimeInst:
+  case SILInstructionKind::ExtendLifetimeInst:
   case SILInstructionKind::InjectEnumAddrInst:
   case SILInstructionKind::DeinitExistentialAddrInst:
   case SILInstructionKind::DeinitExistentialValueInst:
@@ -330,6 +332,7 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
   case SILInstructionKind::PackElementGetInst:
   case SILInstructionKind::PackElementSetInst:
   case SILInstructionKind::TuplePackElementAddrInst:
+  case SILInstructionKind::TypeValueInst:
     // Handle by operand and result check.
     break;
 
@@ -358,6 +361,15 @@ static bool hasOpaqueArchetype(TypeExpansionContext context,
       }
     });
     return wouldChange;
+  }
+
+  case SILInstructionKind::ThunkInst: {
+    auto subs = cast<ThunkInst>(&inst)->getSubstitutionMap();
+    for (auto ty : subs.getReplacementTypes()) {
+      if (opaqueArchetypeWouldChange(context, ty->getCanonicalType()))
+        return true;
+    }
+    break;
   }
 
   case SILInstructionKind::ApplyInst:
@@ -426,7 +438,7 @@ class SerializeSILPass : public SILModuleTransform {
   /// optimizations and for a better dead function elimination.
   void removeSerializedFlagFromAllFunctions(SILModule &M) {
     for (auto &F : M) {
-      bool wasSerialized = !F.isNotSerialized();
+      bool wasSerialized = F.isAnySerialized();
       F.setSerializedKind(IsNotSerialized);
 
       // We are removing [serialized] from the function. This will change how

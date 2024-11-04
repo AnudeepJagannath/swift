@@ -14,7 +14,7 @@ import ASTBridging
 import BasicBridging
 @_spi(RawSyntax) import SwiftSyntax
 
-protocol BridgedNullable: ExpressibleByNilLiteral {
+public protocol BridgedNullable: ExpressibleByNilLiteral {
   associatedtype RawPtr
   init(raw: RawPtr?)
 }
@@ -24,18 +24,19 @@ extension BridgedNullable {
   }
 }
 
-extension BridgedSourceLoc: BridgedNullable {}
-extension BridgedIdentifier: BridgedNullable {}
-extension BridgedNullableExpr: BridgedNullable {}
-extension BridgedNullableStmt: BridgedNullable {}
-extension BridgedNullableTypeRepr: BridgedNullable {}
-extension BridgedNullablePattern: BridgedNullable {}
-extension BridgedNullableGenericParamList: BridgedNullable {}
-extension BridgedNullableTrailingWhereClause: BridgedNullable {}
-extension BridgedNullableParameterList: BridgedNullable {}
-extension BridgedNullablePatternBindingInitializer: BridgedNullable {}
+extension BridgedSourceLoc: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedIdentifier: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableExpr: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableStmt: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableTypeRepr: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullablePattern: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableGenericParamList: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableTrailingWhereClause: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableParameterList: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullablePatternBindingInitializer: /*@retroactive*/ swiftASTGen.BridgedNullable {}
+extension BridgedNullableArgumentList: /*@retroactive*/ swiftASTGen.BridgedNullable {}
 
-extension BridgedIdentifier: Equatable {
+extension BridgedIdentifier: /*@retroactive*/ Swift.Equatable {
   public static func == (lhs: Self, rhs: Self) -> Bool {
     lhs.raw == rhs.raw
   }
@@ -79,6 +80,9 @@ extension BridgedParameterList: BridgedHasNullable {
 extension BridgedPatternBindingInitializer: BridgedHasNullable {
   typealias Nullable = BridgedNullablePatternBindingInitializer
 }
+extension BridgedArgumentList: BridgedHasNullable {
+  typealias Nullable = BridgedNullableArgumentList
+}
 
 public extension BridgedSourceLoc {
   /// Form a source location at the given absolute position in `buffer`.
@@ -91,7 +95,7 @@ public extension BridgedSourceLoc {
   }
 }
 
-extension BridgedLabeledStmtInfo: ExpressibleByNilLiteral {
+extension BridgedLabeledStmtInfo: /*@retroactive*/ Swift.ExpressibleByNilLiteral {
   public init(nilLiteral: ()) {
     self.init()
   }
@@ -105,7 +109,7 @@ extension String {
     )
   }
 
-  mutating func withBridgedString<R>(_ body: (BridgedStringRef) throws -> R) rethrows -> R {
+  public mutating func withBridgedString<R>(_ body: (BridgedStringRef) throws -> R) rethrows -> R {
     try withUTF8 { buffer in
       try body(BridgedStringRef(data: buffer.baseAddress, count: buffer.count))
     }
@@ -119,7 +123,7 @@ extension SyntaxText {
 }
 
 /// Allocate a copy of the given string as a null-terminated UTF-8 string.
-func allocateBridgedString(
+public func allocateBridgedString(
   _ string: String
 ) -> BridgedStringRef {
   var string = string
@@ -143,13 +147,7 @@ public func freeBridgedString(bridged: BridgedStringRef) {
   bridged.data?.deallocate()
 }
 
-extension BridgedStringRef {
-  var isEmptyInitialized: Bool {
-    return self.data == nil && self.count == 0
-  }
-}
-
-extension BridgedStringRef: ExpressibleByStringLiteral {
+extension BridgedStringRef: /*@retroactive*/ Swift.ExpressibleByStringLiteral {
   public init(stringLiteral str: StaticString) {
     self.init(data: str.utf8Start, count: str.utf8CodeUnitCount)
   }

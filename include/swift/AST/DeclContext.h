@@ -496,6 +496,16 @@ public:
     return const_cast<DeclContext *>(this)->getTopmostDeclarationDeclContext();
   }
 
+  /// This routine looks through closure, initializer, and local function
+  /// contexts to find the outermost function declaration.
+  ///
+  /// \returns the outermost function, or null if there is no such context.
+  LLVM_READONLY
+  DeclContext *getOutermostFunctionContext();
+  const DeclContext *getOutermostFunctionContext() const {
+    return const_cast<DeclContext *>(this)->getOutermostFunctionContext();
+  }
+
   /// Returns the innermost context that is an AbstractFunctionDecl whose
   /// body has been skipped.
   LLVM_READONLY
@@ -670,6 +680,9 @@ public:
   /// Looks up a precedence group with a given \p name.
   PrecedenceGroupLookupResult lookupPrecedenceGroup(Identifier name) const;
 
+  /// Returns true if the parent module of \p decl is imported by this context.
+  bool isDeclImported(const Decl *decl) const;
+
   /// Return the ASTContext for a specified DeclContext by
   /// walking up to the enclosing module and returning its ASTContext.
   LLVM_READONLY
@@ -785,6 +798,10 @@ class IterableDeclContext {
   /// while skipping the body of this context.
   unsigned HasNestedClassDeclarations : 1;
 
+  /// Whether we were inside a freestanding macro argument when we were parsed.
+  /// We must restore this when delayed parsing the body.
+  unsigned InFreestandingMacroArgument : 1;
+
   template<class A, class B, class C>
   friend struct ::llvm::CastInfo;
 
@@ -801,6 +818,7 @@ public:
     AddedParsedMembers = 0;
     HasOperatorDeclarations = 0;
     HasNestedClassDeclarations = 0;
+    InFreestandingMacroArgument = 0;
   }
 
   /// Determine the kind of iterable context we have.
@@ -826,6 +844,15 @@ public:
   void setMaybeHasNestedClassDeclarations() {
     assert(hasUnparsedMembers());
     HasNestedClassDeclarations = 1;
+  }
+
+  bool inFreestandingMacroArgument() const {
+    return InFreestandingMacroArgument;
+  }
+
+  void setInFreestandingMacroArgument() {
+    assert(hasUnparsedMembers());
+    InFreestandingMacroArgument = 1;
   }
 
   /// Retrieve the current set of members in this context.
@@ -997,6 +1024,20 @@ namespace llvm {
 
     static inline ::swift::DeclContext *doCast(const FromTy &val) {
       return ::swift::DeclContext::castDeclToDeclContext(val);
+    }
+  };
+
+  template<class FromTy>
+  struct CastInfo<::swift::GenericContext, FromTy, std::enable_if_t<is_simple_type<FromTy>::value>>
+      : public CastIsPossible<::swift::GenericContext, FromTy>,
+        public DefaultDoCastIfPossible<::swift::GenericContext *, FromTy,
+                                       CastInfo<::swift::GenericContext, FromTy>> {
+    static inline ::swift::GenericContext *castFailed() { return nullptr; }
+
+    static inline ::swift::GenericContext *doCast(const FromTy &val) {
+      auto *genCtxt = val->getAsGenericContext();
+      assert(genCtxt);
+      return const_cast<::swift::GenericContext *>(genCtxt);
     }
   };
 

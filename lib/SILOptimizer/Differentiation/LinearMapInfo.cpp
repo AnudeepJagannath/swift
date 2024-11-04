@@ -23,6 +23,7 @@
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/LoopInfo.h"
 
 namespace swift {
@@ -41,7 +42,7 @@ static GenericParamList *cloneGenericParameters(ASTContext &ctx,
   for (auto paramType : sig.getGenericParams()) {
     auto *clonedParam = GenericTypeParamDecl::createImplicit(
         dc, paramType->getName(), paramType->getDepth(), paramType->getIndex(),
-        paramType->isParameterPack());
+        paramType->getParamKind());
     clonedParam->setDeclContext(dc);
     clonedParams.push_back(clonedParam);
   }
@@ -270,8 +271,7 @@ Type LinearMapInfo::getLinearMapType(ADContext &context, FullApplySite fai) {
       remappedOrigFnSubstTy
           ->getAutoDiffDerivativeFunctionType(
               parameters, results, derivativeFnKind, context.getTypeConverter(),
-              LookUpConformanceInModule(
-                  derivative->getModule().getSwiftModule()))
+              LookUpConformanceInModule())
           ->getUnsubstitutedType(original->getModule());
 
   auto linearMapSILType = derivativeFnType->getAllResultsInterfaceType();

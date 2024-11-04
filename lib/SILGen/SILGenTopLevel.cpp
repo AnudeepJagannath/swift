@@ -14,6 +14,7 @@
 #include "SILGenFunction.h"
 #include "Scope.h"
 #include "swift/AST/DiagnosticsSIL.h"
+#include "swift/Basic/Assertions.h"
 
 #define DEBUG_TYPE "silgen"
 
@@ -69,8 +70,8 @@ void SILGenModule::emitEntryPoint(SourceFile *SF, SILFunction *TopLevel) {
     // Just set the main actor as the expected executor; we should
     // already be running on it.
     SILValue executor = TopLevelSGF.emitMainExecutor(prologueLoc);
-    TopLevelSGF.ExpectedExecutor = TopLevelSGF.B.createOptionalSome(
-        prologueLoc, executor, SILType::getOptionalType(executor->getType()));
+    TopLevelSGF.ExpectedExecutor.set(TopLevelSGF.B.createOptionalSome(
+        prologueLoc, executor, SILType::getOptionalType(executor->getType())));
   } else {
     // Create the argc and argv arguments.
     auto entry = TopLevelSGF.B.getInsertionBB();
@@ -302,7 +303,7 @@ void SILGenFunction::emitCallToMain(FuncDecl *mainFunc) {
       SubstitutionMap subMap = SubstitutionMap::get(
           genericSig, [&](SubstitutableType *dependentType) {
             return errorType.getASTType();
-          }, LookUpConformanceInModule(getModule().getSwiftModule()));
+          }, LookUpConformanceInModule());
 
       // Generic errors are passed indirectly.
       if (!error->getType().isAddress()) {

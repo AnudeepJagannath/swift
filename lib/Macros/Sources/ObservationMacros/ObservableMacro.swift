@@ -12,7 +12,6 @@
 import SwiftSyntax
 import SwiftSyntaxMacros
 import SwiftDiagnostics
-import SwiftOperators
 import SwiftSyntaxBuilder
 
 public struct ObservableMacro {
@@ -197,6 +196,7 @@ extension ObservableMacro: MemberMacro {
   >(
     of node: AttributeSyntax,
     providingMembersOf declaration: Declaration,
+    conformingTo protocols: [TypeSyntax],
     in context: Context
   ) throws -> [DeclSyntax] {
     guard let identified = declaration.asProtocol(NamedDeclSyntax.self) else {

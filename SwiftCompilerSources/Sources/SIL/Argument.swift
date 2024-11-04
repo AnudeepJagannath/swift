@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 import Basic
+import AST
 import SILBridging
 
 /// A basic block argument.
@@ -31,9 +32,9 @@ public class Argument : Value, Hashable {
 
   public var isReborrow: Bool { bridged.isReborrow() }
 
-  public var varDecl: VarDecl? { VarDecl(bridged: bridged.getVarDecl()) }
+  public var varDecl: VarDecl? { bridged.getVarDecl().getAs(VarDecl.self) }
 
-  public var sourceLoc: SourceLoc? { varDecl?.sourceLoc }
+  public var sourceLoc: SourceLoc? { varDecl?.nameLoc }
 
   public static func ==(lhs: Argument, rhs: Argument) -> Bool {
     lhs === rhs
@@ -60,10 +61,6 @@ final public class FunctionArgument : Argument {
     return index < parentFunction.numIndirectResultArguments
   }
 
-  public var hasResultDependsOn : Bool {
-    return bridged.hasResultDependsOn()
-  }
-
   /// If the function's result depends on this argument, return the
   /// kind of dependence.
   public var resultDependence: LifetimeDependenceConvention? {
@@ -87,11 +84,22 @@ public struct Phi {
   // is only included here for compatibility with .sil tests that have
   // not been migrated.
   public init?(_ value: Value) {
-    guard let argument = value as? Argument else { return nil }
+    guard let argument = value as? Argument else {
+      return nil
+    }
     var preds = argument.parentBlock.predecessors
-    guard let pred = preds.next() else { return nil }
-    let term = pred.terminator
-    guard term is BranchInst || term is CondBranchInst else { return nil }
+    if let pred = preds.next() {
+      let term = pred.terminator
+      guard term is BranchInst || term is CondBranchInst else {
+        return nil
+      }
+    } else {
+      // No predecessors indicates an unreachable block (except for function arguments).
+      // Treat this like a degenerate phi so we don't consider it a terminator result.
+      if argument is FunctionArgument {
+        return nil
+      }
+    }
     self.value = argument
   }
 
@@ -252,13 +260,22 @@ public struct ArgumentConventions : Collection, CustomStringConvertible {
     return convention.parameters[paramIdx]
   }
 
-  /// Return a dependence of the function results on the indexed parameter.
-  public subscript(resultDependsOn argumentIndex: Int)
-    -> LifetimeDependenceConvention? {
-    guard let paramIdx = parameterIndex(for: argumentIndex) else {
+  public subscript(parameterDependencies targetArgumentIndex: Int) -> FunctionConvention.LifetimeDependencies? {
+    guard let targetParamIdx = parameterIndex(for: targetArgumentIndex) else {
       return nil
     }
-    return convention.resultDependencies?[paramIdx]
+    return convention.parameterDependencies(for: targetParamIdx)
+  }
+
+  /// Return a dependence of the function results on the indexed parameter.
+  public subscript(resultDependsOn argumentIndex: Int) -> LifetimeDependenceConvention? {
+    findDependence(source: argumentIndex, in: convention.resultDependencies)
+  }
+
+  /// Return a dependence of the target argument on the source argument.
+  public func getDependence(target targetArgumentIndex: Int, source sourceArgumentIndex: Int)
+    -> LifetimeDependenceConvention? {
+    findDependence(source: sourceArgumentIndex, in: self[parameterDependencies: targetArgumentIndex])
   }
 
   /// Number of SIL arguments for the function type's results
@@ -279,15 +296,17 @@ public struct ArgumentConventions : Collection, CustomStringConvertible {
   }
 
   public var description: String {
-    let origTy = convention.bridgedFunctionType
-    var str = String(taking: origTy.getDebugDescription())
+    var str = convention.functionType.description
     for idx in startIndex..<indirectSILResultCount {
       str += "\n[\(idx)]  indirect result: " + self[idx].description
     }
     for idx in indirectSILResultCount..<endIndex {
       str += "\n[\(idx)]        parameter: " + self[idx].description
+      if let deps = self[parameterDependencies: idx] {
+        str += "\n          lifetime: \(deps)"
+      }
       if let dep = self[resultDependsOn: idx] {
-        str += "resultDependsOn: " + dep.description
+        str += "\n   result dependence: " + dep.description
       }
     }
     return str
@@ -298,6 +317,14 @@ extension ArgumentConventions {
   private func parameterIndex(for argIdx: Int) -> Int? {
     let firstParamIdx = firstParameterIndex  // bridging call
     return argIdx < firstParamIdx ? nil : argIdx - firstParamIdx
+  }
+
+  private func findDependence(source argumentIndex: Int, in dependencies: FunctionConvention.LifetimeDependencies?)
+    -> LifetimeDependenceConvention? {
+    guard let paramIdx = parameterIndex(for: argumentIndex) else {
+      return nil
+    }
+    return dependencies?[paramIdx]
   }
 }
 
@@ -321,8 +348,7 @@ public struct YieldConventions : Collection, CustomStringConvertible {
   }
 
   public var description: String {
-    var str = String(
-      taking: convention.bridgedFunctionType.getDebugDescription())
+    var str = convention.functionType.description
     yields.forEach {
       str += "\n      yield: " + $0.description
     }
@@ -355,6 +381,12 @@ public enum ArgumentConvention : CustomStringConvertible {
   /// well-typed references, but is not allowed to be escaped. This is the
   /// convention used by mutable captures in @noescape closures.
   case indirectInoutAliasable
+
+  /// This argument is passed indirectly, i.e. by directly passing the address
+  /// of an object in memory. The callee may modify, but does not destroy the
+  /// object. This corresponds to the parameter-passing convention of the
+  /// Itanium C++ ABI, which is used ubiquitously on non-Windows targets.
+  case indirectInCXX
 
   /// This argument represents an indirect return value address. The callee stores
   /// the returned value to this argument. At the time when the function is called,
@@ -411,8 +443,9 @@ public enum ArgumentConvention : CustomStringConvertible {
   public var isIndirect: Bool {
     switch self {
     case .indirectIn, .indirectInGuaranteed,
-         .indirectInout, .indirectInoutAliasable, .indirectOut,
-         .packOut, .packInout, .packOwned, .packGuaranteed:
+         .indirectInout, .indirectInoutAliasable, .indirectInCXX,
+         .indirectOut, .packOut, .packInout, .packOwned,
+         .packGuaranteed:
       return true
     case .directOwned, .directUnowned, .directGuaranteed:
       return false
@@ -421,11 +454,12 @@ public enum ArgumentConvention : CustomStringConvertible {
 
   public var isIndirectIn: Bool {
     switch self {
-    case .indirectIn, .indirectInGuaranteed,
+    case .indirectIn, .indirectInGuaranteed, .indirectInCXX,
          .packOwned, .packGuaranteed:
       return true
     case .directOwned, .directUnowned, .directGuaranteed,
-         .indirectInout, .indirectInoutAliasable, .indirectOut,
+         .indirectInout, .indirectInoutAliasable,
+         .indirectOut,
          .packOut, .packInout:
       return false
     }
@@ -437,7 +471,7 @@ public enum ArgumentConvention : CustomStringConvertible {
       return true
     case .indirectInGuaranteed, .directGuaranteed, .packGuaranteed,
          .indirectIn, .directOwned, .directUnowned,
-         .indirectInout, .indirectInoutAliasable,
+         .indirectInout, .indirectInoutAliasable, .indirectInCXX,
          .packInout, .packOwned:
       return false
     }
@@ -448,15 +482,15 @@ public enum ArgumentConvention : CustomStringConvertible {
     case .indirectInGuaranteed, .directGuaranteed, .packGuaranteed:
       return true
     case .indirectIn, .directOwned, .directUnowned,
-         .indirectInout, .indirectInoutAliasable, .indirectOut,
-         .packOut, .packInout, .packOwned:
+         .indirectInout, .indirectInoutAliasable, .indirectInCXX,
+         .indirectOut, .packOut, .packInout, .packOwned:
       return false
     }
   }
 
   public var isConsumed: Bool {
     switch self {
-    case .indirectIn, .directOwned, .packOwned:
+    case .indirectIn, .indirectInCXX, .directOwned, .packOwned:
       return true
     case .indirectInGuaranteed, .directGuaranteed, .packGuaranteed,
           .indirectInout, .indirectInoutAliasable, .indirectOut,
@@ -471,6 +505,7 @@ public enum ArgumentConvention : CustomStringConvertible {
          .indirectOut,
          .indirectInGuaranteed,
          .indirectInout,
+         .indirectInCXX,
          .packOut,
          .packInout,
          .packOwned,
@@ -495,6 +530,7 @@ public enum ArgumentConvention : CustomStringConvertible {
     case .indirectIn,
          .indirectOut,
          .indirectInGuaranteed,
+         .indirectInCXX,
          .directUnowned,
          .directGuaranteed,
          .directOwned,
@@ -515,6 +551,8 @@ public enum ArgumentConvention : CustomStringConvertible {
       return "indirectInout"
     case .indirectInoutAliasable:
       return "indirectInoutAliasable"
+    case .indirectInCXX:
+      return "indirectInCXX"
     case .indirectOut:
       return "indirectOut"
     case .directOwned:
@@ -542,6 +580,12 @@ extension BridgedArgument {
   public var functionArgument: FunctionArgument { obj.getAs(FunctionArgument.self) }
 }
 
+extension Optional where Wrapped == Argument {
+  public var bridged: OptionalBridgedArgument {
+    OptionalBridgedArgument(obj: self?.bridged.obj)
+  }
+}
+
 extension BridgedArgumentConvention {
   var convention: ArgumentConvention {
     switch self {
@@ -549,6 +593,7 @@ extension BridgedArgumentConvention {
       case .Indirect_In_Guaranteed:  return .indirectInGuaranteed
       case .Indirect_Inout:          return .indirectInout
       case .Indirect_InoutAliasable: return .indirectInoutAliasable
+      case .Indirect_In_CXX:         return .indirectInCXX
       case .Indirect_Out:            return .indirectOut
       case .Direct_Owned:            return .directOwned
       case .Direct_Unowned:          return .directUnowned
@@ -570,6 +615,7 @@ extension ArgumentConvention {
       case .indirectInGuaranteed:   return .Indirect_In_Guaranteed
       case .indirectInout:          return .Indirect_Inout
       case .indirectInoutAliasable: return .Indirect_InoutAliasable
+      case .indirectInCXX:          return .Indirect_In_CXX
       case .indirectOut:            return .Indirect_Out
       case .directOwned:            return .Direct_Owned
       case .directUnowned:          return .Direct_Unowned

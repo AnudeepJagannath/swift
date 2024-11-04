@@ -25,6 +25,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Types.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/SourceManager.h"
 #include "swift/Basic/Statistic.h"
 #include "llvm/ADT/DenseMap.h"
@@ -250,6 +251,22 @@ Decl *DeclContext::getTopmostDeclarationDeclContext() {
     dc = decl->getDeclContext();
   }
   return topmost;
+}
+
+DeclContext *DeclContext::getOutermostFunctionContext() {
+  AbstractFunctionDecl *result = nullptr;
+  auto dc = this;
+  do {
+    if (auto afd = dyn_cast<AbstractFunctionDecl>(dc))
+      result = afd;
+
+    // If we've found a non-local context, we don't have to keep walking up
+    // the hierarchy.
+    if (!dc->isLocalContext())
+      break;
+  } while ((dc = dc->getParent()));
+
+  return result;
 }
 
 DeclContext *DeclContext::getInnermostSkippedFunctionContext() {
@@ -486,7 +503,7 @@ swift::FragileFunctionKindRequest::evaluate(Evaluator &evaluator,
       auto effectiveAccess =
           VD->getFormalAccessScope(/*useDC=*/nullptr,
                                    /*treatUsableFromInlineAsPublic=*/true);
-      if (effectiveAccess.isPublicOrPackage()) {
+      if (effectiveAccess.isPublic()) {
         return {FragileFunctionKind::DefaultArgument};
       }
 
@@ -518,7 +535,7 @@ swift::FragileFunctionKindRequest::evaluate(Evaluator &evaluator,
 
       // If the function is not externally visible, we will not be serializing
       // its body.
-      if (!funcAccess.isPublicOrPackage()) {
+      if (!funcAccess.isPublic()) {
         return {FragileFunctionKind::None};
       }
 
@@ -953,13 +970,6 @@ void IterableDeclContext::addMemberPreservingSourceOrder(Decl *member) {
     if (isa<EnumCaseDecl>(existingMember))
       continue;
 
-    // The elements of the active clause of an IfConfigDecl
-    // are added to the parent type. We ignore the IfConfigDecl
-    // since its source range overlaps with the source ranges
-    // of the active elements.
-    if (isa<IfConfigDecl>(existingMember))
-      continue;
-
     if (!SM.isBeforeInBuffer(existingMember->getEndLoc(), start))
       break;
 
@@ -1008,14 +1018,11 @@ void IterableDeclContext::addMemberSilently(Decl *member, Decl *hint,
       return;
 
     auto shouldSkip = [](Decl *d) {
-      // PatternBindingDecl source ranges overlap with VarDecls,
-      // EnumCaseDecl source ranges overlap with EnumElementDecls,
-      // and IfConfigDecl source ranges overlap with the elements
-      // of the active clause. Skip them all here to avoid
-      // spurious assertions.
+      // PatternBindingDecl source ranges overlap with VarDecls and
+      // EnumCaseDecl source ranges overlap with EnumElementDecls.
+      // Skip them all here to avoid spurious assertions.
       if (isa<PatternBindingDecl>(d) ||
-          isa<EnumCaseDecl>(d) ||
-          isa<IfConfigDecl>(d))
+          isa<EnumCaseDecl>(d))
         return true;
 
       // Ignore source location information of implicit declarations.
@@ -1532,11 +1539,10 @@ bool DeclContext::isAlwaysAvailableConformanceContext() const {
 
   auto &ctx = getASTContext();
 
-  AvailabilityContext conformanceAvailability{
-      AvailabilityInference::availableRange(ext, ctx)};
+  AvailabilityRange conformanceAvailability{
+      AvailabilityInference::availableRange(ext)};
 
-  auto deploymentTarget =
-      AvailabilityContext::forDeploymentTarget(ctx);
+  auto deploymentTarget = AvailabilityRange::forDeploymentTarget(ctx);
 
   return deploymentTarget.isContainedIn(conformanceAvailability);
 }

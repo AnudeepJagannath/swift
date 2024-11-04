@@ -1,4 +1,4 @@
-// RUN: %target-swift-frontend -emit-sil -strict-concurrency=complete -disable-availability-checking -swift-version 6 -verify %s -o /dev/null
+// RUN: %target-swift-frontend -emit-sil -strict-concurrency=complete -target %target-swift-5.1-abi-triple -swift-version 6 -verify %s -o /dev/null
 
 // REQUIRES: concurrency
 // REQUIRES: asserts
@@ -50,7 +50,13 @@ actor ActorWithSynchronousNonIsolatedInit {
     }
   }
 
+  init(ns: NonSendableKlass) async {
+    self.k = NonSendableKlass()
+    self.isolatedHelper(ns)
+  }
+
   nonisolated func helper(_ newK: NonSendableKlass) {}
+  func isolatedHelper(_ newK: NonSendableKlass) {}
 }
 
 func initActorWithSyncNonIsolatedInit() {

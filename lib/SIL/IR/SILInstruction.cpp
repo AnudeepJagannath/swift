@@ -15,6 +15,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SIL/SILInstruction.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/AssertImplements.h"
 #include "swift/Basic/Unicode.h"
 #include "swift/Basic/type_traits.h"
@@ -125,7 +126,7 @@ void SILInstruction::moveBefore(SILInstruction *Later) {
 }
 
 namespace swift::test {
-FunctionTest MoveBeforeTest("instruction-move-before",
+FunctionTest MoveBeforeTest("instruction_move_before",
                             [](auto &function, auto &arguments, auto &test) {
                               auto *inst = arguments.takeInstruction();
                               auto *other = arguments.takeInstruction();
@@ -537,7 +538,7 @@ namespace {
     bool visitStringLiteralInst(const StringLiteralInst *RHS) {
       auto LHS_ = cast<StringLiteralInst>(LHS);
       return LHS_->getEncoding() == RHS->getEncoding()
-        && LHS_->getValue().equals(RHS->getValue());
+        && LHS_->getValue() == RHS->getValue();
     }
 
     bool visitStructInst(const StructInst *RHS) {
@@ -1282,6 +1283,10 @@ bool SILInstruction::isAllocatingStack() const {
       && !PA->getFunction()->hasOwnership();
   }
 
+  if (auto *BAI = dyn_cast<BeginApplyInst>(this)) {
+    return BAI->isCalleeAllocated();
+  }
+
   if (auto *BI = dyn_cast<BuiltinInst>(this)) {
     if (BI->getBuiltinKind() == BuiltinValueKind::StackAlloc ||
         BI->getBuiltinKind() == BuiltinValueKind::UnprotectedStackAlloc) {
@@ -1290,6 +1295,17 @@ bool SILInstruction::isAllocatingStack() const {
   }
 
   return false;
+}
+
+SILValue SILInstruction::getStackAllocation() const {
+  if (!isAllocatingStack()) {
+    return {};
+  }
+
+  if (auto *bai = dyn_cast<BeginApplyInst>(this)) {
+    return bai->getCalleeAllocationResult();
+  }
+  return cast<SingleValueInstruction>(this);
 }
 
 bool SILInstruction::isDeallocatingStack() const {
@@ -1417,8 +1433,10 @@ bool SILInstruction::isTriviallyDuplicatable() const {
 
   if (isa<OpenExistentialAddrInst>(this) || isa<OpenExistentialRefInst>(this) ||
       isa<OpenExistentialMetatypeInst>(this) ||
-      isa<OpenExistentialValueInst>(this) || isa<OpenExistentialBoxInst>(this) ||
-      isa<OpenExistentialBoxValueInst>(this)) {
+      isa<OpenExistentialValueInst>(this) ||
+      isa<OpenExistentialBoxInst>(this) ||
+      isa<OpenExistentialBoxValueInst>(this) ||
+      isa<OpenPackElementInst>(this)) {
     // Don't know how to duplicate these properly yet. Inst.clone() per
     // instruction does not work. Because the follow-up instructions need to
     // reuse the same archetype uuid which would only work if we used a
@@ -1673,22 +1691,21 @@ const ValueBase *SILInstructionResultArray::back() const {
 
 bool SILInstruction::definesLocalArchetypes() const {
   bool definesAny = false;
-  forEachDefinedLocalArchetype([&](CanLocalArchetypeType type,
-                                   SILValue dependency) {
+  forEachDefinedLocalEnvironment([&](GenericEnvironment *genericEnv,
+                                     SILValue dependency) {
     definesAny = true;
   });
   return definesAny;
 }
 
-void SILInstruction::forEachDefinedLocalArchetype(
-      llvm::function_ref<void(CanLocalArchetypeType, SILValue)> fn) const {
+void SILInstruction::forEachDefinedLocalEnvironment(
+      llvm::function_ref<void(GenericEnvironment *, SILValue)> fn) const {
   switch (getKind()) {
 #define SINGLE_VALUE_SINGLE_OPEN(TYPE)                                    \
   case SILInstructionKind::TYPE: {                                        \
     auto I = cast<TYPE>(this);                                            \
     auto archetype = I->getDefinedOpenedArchetype();                      \
-    assert(archetype);                                                    \
-    return fn(archetype, I);                                              \
+    return fn(archetype->getGenericEnvironment(), I);                     \
   }
   SINGLE_VALUE_SINGLE_OPEN(OpenExistentialAddrInst)
   SINGLE_VALUE_SINGLE_OPEN(OpenExistentialRefInst)
@@ -1697,20 +1714,13 @@ void SILInstruction::forEachDefinedLocalArchetype(
   SINGLE_VALUE_SINGLE_OPEN(OpenExistentialMetatypeInst)
   SINGLE_VALUE_SINGLE_OPEN(OpenExistentialValueInst)
 #undef SINGLE_VALUE_SINGLE_OPEN
-  case SILInstructionKind::OpenPackElementInst:
-    return cast<OpenPackElementInst>(this)->forEachDefinedLocalArchetype(fn);
+  case SILInstructionKind::OpenPackElementInst: {
+    auto I = cast<OpenPackElementInst>(this);
+    return fn(I->getOpenedGenericEnvironment(), I);
+  }
   default:
     return;
   }
-}
-
-void OpenPackElementInst::forEachDefinedLocalArchetype(
-      llvm::function_ref<void(CanLocalArchetypeType, SILValue)> fn) const {
-  getOpenedGenericEnvironment()->forEachPackElementBinding(
-                                  [&](ElementArchetypeType *elementType,
-                                      PackType *packSubstitution) {
-    fn(CanElementArchetypeType(elementType), this);
-  });
 }
 
 //===----------------------------------------------------------------------===//
@@ -1810,7 +1820,7 @@ visitRecursivelyLifetimeEndingUses(
     }
     if (auto *ret = dyn_cast<ReturnInst>(use->getUser())) {
       auto fnTy = ret->getFunction()->getLoweredFunctionType();
-      assert(!fnTy->getLifetimeDependenceInfo().empty());
+      assert(!fnTy->getLifetimeDependencies().empty());
       if (!visitScopeEnd(use)) {
         return false;
       }
@@ -1962,6 +1972,26 @@ UncheckedTakeEnumDataAddrInst::isDestructive(EnumDecl *forEnum, SILModule &M) {
   }
   
   return false;
+}
+
+SILInstructionContext SILInstructionContext::forFunctionInModule(SILFunction *F,
+                                                                 SILModule &M) {
+  if (F) {
+    assert(&F->getModule() == &M);
+    return forFunction(*F);
+  }
+  return forModule(M);
+}
+
+SILFunction *SILInstructionContext::getFunction() {
+  return *storage.dyn_cast<SILFunction *>();
+}
+
+SILModule &SILInstructionContext::getModule() {
+  if (auto *m = storage.dyn_cast<SILModule *>()) {
+    return **m;
+  }
+  return storage.get<SILFunction *>()->getModule();
 }
 
 #ifndef NDEBUG

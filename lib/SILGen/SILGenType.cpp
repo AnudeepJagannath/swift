@@ -22,6 +22,7 @@
 #include "SILGenFunctionBuilder.h"
 #include "Scope.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/GenericEnvironment.h"
 #include "swift/AST/PrettyStackTrace.h"
 #include "swift/AST/PropertyWrappers.h"
@@ -29,6 +30,7 @@
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/SubstitutionMap.h"
 #include "swift/AST/TypeMemberVisitor.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/FormalLinkage.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILArgument.h"
@@ -400,14 +402,6 @@ template<typename T> class SILGenWitnessTable : public SILWitnessVisitor<T> {
 
 public:
   void addMethod(SILDeclRef requirementRef) {
-    // TODO: here the requirement is thunk_decl of the protocol; it is a FUNC
-    // detect here that it is a func dec + thunk.
-    // walk up to DC, and find storage.
-    // e  requirementRef->getDecl()->dump()
-    //(func_decl implicit "distributedVariable()" interface type="<Self where Self : WorkerProtocol> (Self) -> () async throws -> String" access=internal nonisolated distributed_thunk
-    //  (parameter "self")
-    //  (parameter_list))
-
     auto reqDecl = requirementRef.getDecl();
 
     // Static functions can be witnessed by enum cases with payload
@@ -472,7 +466,6 @@ public:
     // Here we notice a `distributed var` thunk requirement,
     // and witness it with the distributed thunk -- the "getter thunk".
     if (requirementRef.isDistributedThunk()) {
-
       return addMethodImplementation(
           requirementRef, getWitnessRef(requirementRef, witnessStorage->getDistributedThunk()),
           witness);
@@ -682,7 +675,7 @@ public:
 
     SGM.useConformance(assocConformance);
 
-    Entries.push_back(SILWitnessTable::AssociatedTypeProtocolWitness{
+    Entries.push_back(SILWitnessTable::AssociatedConformanceWitness{
         req.getAssociation(), req.getAssociatedRequirement(),
         assocConformance});
   }
@@ -690,9 +683,8 @@ public:
   void addConditionalRequirements() {
     SILWitnessTable::enumerateWitnessTableConditionalConformances(
         Conformance, [&](unsigned, CanType type, ProtocolDecl *protocol) {
-          auto conformance =
-              Conformance->getGenericSignature()->lookupConformance(type,
-                                                                    protocol);
+          auto conformance = lookupConformance(type, protocol,
+                                               /*allowMissing=*/true);
           assert(conformance &&
                  "unable to find conformance that should be known");
 
@@ -910,8 +902,7 @@ static SILFunction *emitSelfConformanceWitness(SILGenModule &SGM,
 
   // Open the protocol type.
   auto openedType = OpenedArchetypeType::get(
-      protocol->getDeclaredExistentialType()->getCanonicalType(),
-      GenericSignature());
+      protocol->getDeclaredExistentialType()->getCanonicalType());
 
   // Form the substitutions for calling the witness.
   auto witnessSubs = SubstitutionMap::getProtocolSubstitutions(protocol,
@@ -1093,7 +1084,7 @@ public:
     if (witness.isInvalid())
       return addMissingDefault();
 
-    auto entry = SILWitnessTable::AssociatedTypeProtocolWitness{
+    auto entry = SILWitnessTable::AssociatedConformanceWitness{
         req.getAssociation(), req.getAssociatedRequirement(), witness};
     DefaultWitnesses.push_back(entry);
   }
@@ -1123,7 +1114,7 @@ void SILGenModule::emitNonCopyableTypeDeinitTable(NominalTypeDecl *nom) {
   auto serialized = SerializedKind_t::IsNotSerialized;
   bool nomIsPublic = nom->getEffectiveAccess() >= AccessLevel::Public;
   // We only serialize the deinit if the type is public and not resilient.
-  if (nomIsPublic && !nom->isResilient()) // pcmo TODO: isFragile()?
+  if (nomIsPublic && !nom->isResilient())
     serialized = IsSerialized;
   SILMoveOnlyDeinit::create(f->getModule(), nom, serialized, f);
 }
@@ -1256,10 +1247,10 @@ public:
 
   void visitVarDecl(VarDecl *vd) {
     // Collect global variables for static properties.
-    // FIXME: We can't statically emit a global variable for generic properties.
     if (vd->isStatic() && vd->hasStorage()) {
       emitTypeMemberGlobalVariable(SGM, vd);
       visitAccessors(vd);
+      SGM.tryEmitPropertyDescriptor(vd);
       return;
     }
 

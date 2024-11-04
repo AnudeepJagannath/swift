@@ -14,6 +14,7 @@
 
 #include "SILCombiner.h"
 #include "swift/AST/SemanticAttrs.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/STLExtras.h"
 #include "swift/SIL/BasicBlockBits.h"
 #include "swift/SIL/DebugUtils.h"
@@ -844,6 +845,15 @@ SILInstruction *SILCombiner::visitCondFailInst(CondFailInst *CFI) {
   ValueSet DefinedValues(CFI->getFunction());
   for (auto Iter = std::next(CFI->getIterator());
        Iter != CFI->getParent()->end(); ++Iter) {
+
+    if (isBeginScopeMarker(&*Iter)) {
+      for (auto *scopeUse : cast<SingleValueInstruction>(&*Iter)->getUses()) {
+        auto *scopeEnd = scopeUse->getUser();
+        if (isEndOfScopeMarker(scopeEnd)) {
+          ToRemove.push_back(scopeEnd);
+        }
+      }
+    }
     if (!CFI->getFunction()->hasOwnership()) {
       ToRemove.push_back(&*Iter);
       continue;
@@ -870,6 +880,9 @@ SILInstruction *SILCombiner::visitCondFailInst(CondFailInst *CFI) {
     return nullptr;
 
   for (auto *Inst : ToRemove) {
+    if (Inst->isDeleted())
+      continue;
+
     // Replace any still-remaining uses with undef and erase.
     Inst->replaceAllUsesOfAllResultsWithUndef();
     eraseInstFromFunction(*Inst);
@@ -1119,6 +1132,8 @@ SILCombiner::visitInjectEnumAddrInst(InjectEnumAddrInst *IEAI) {
                           IEAI->getOperand()->getType().getObjectType());
     auto storeQual = !func->hasOwnership()
                          ? StoreOwnershipQualifier::Unqualified
+                     : IEAI->getOperand()->getType().isMoveOnly()
+                         ? StoreOwnershipQualifier::Init
                          : StoreOwnershipQualifier::Trivial;
     Builder.createStore(IEAI->getLoc(), E, IEAI->getOperand(), storeQual);
     return eraseInstFromFunction(*IEAI);
@@ -1791,7 +1806,7 @@ shouldReplaceCallByContiguousArrayStorageAnyObject(SILFunction &F,
 
   // On SwiftStdlib 5.7 we can replace the call.
   auto &ctxt = storageMetaTy->getASTContext();
-  auto deployment = AvailabilityContext::forDeploymentTarget(ctxt);
+  auto deployment = AvailabilityRange::forDeploymentTarget(ctxt);
   if (!deployment.isContainedIn(ctxt.getSwift57Availability()))
     return std::nullopt;
 
@@ -1988,24 +2003,6 @@ SILInstruction *SILCombiner::visitMarkDependenceInst(MarkDependenceInst *mdi) {
     // a literal is replace by the string_literal itself.
     replaceInstUsesWith(*mdi, mdi->getValue());
     return eraseInstFromFunction(*mdi);
-  }
-
-  return nullptr;
-}
-
-SILInstruction *
-SILCombiner::visitClassifyBridgeObjectInst(ClassifyBridgeObjectInst *cboi) {
-  auto *urc = dyn_cast<UncheckedRefCastInst>(cboi->getOperand());
-  if (!urc)
-    return nullptr;
-
-  auto type = urc->getOperand()->getType().getASTType();
-  if (ClassDecl *cd = type->getClassOrBoundGenericClass()) {
-    if (!cd->isObjC()) {
-      auto int1Ty = SILType::getBuiltinIntegerType(1, Builder.getASTContext());
-      SILValue zero = Builder.createIntegerLiteral(cboi->getLoc(), int1Ty, 0);
-      return Builder.createTuple(cboi->getLoc(), {zero, zero});
-    }
   }
 
   return nullptr;

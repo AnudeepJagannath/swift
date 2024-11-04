@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+import AST
 import SIL
 import OptimizerBridging
 
@@ -59,6 +60,26 @@ extension Context {
     name._withBridgedStringRef {
       _bridged.lookupFunction($0).function
     }
+  }
+
+  func lookupWitnessTable(for conformance: Conformance) -> WitnessTable? {
+    return _bridged.lookupWitnessTable(conformance.bridged).witnessTable
+  }
+
+  func lookupVTable(for classDecl: NominalTypeDecl) -> VTable? {
+    return _bridged.lookupVTable(classDecl.bridged).vTable
+  }
+
+  func lookupSpecializedVTable(for classType: Type) -> VTable? {
+    return _bridged.lookupSpecializedVTable(classType.bridged).vTable
+  }
+
+  func getSpecializedConformance(of genericConformance: Conformance,
+                                 for type: AST.`Type`,
+                                 substitutions: SubstitutionMap) -> Conformance
+  {
+    let c = _bridged.getSpecializedConformance(genericConformance.bridged, type.bridged, substitutions.bridged)
+    return Conformance(bridged: c)
   }
 
   func notifyNewFunction(function: Function, derivedFrom: Function) {
@@ -184,7 +205,7 @@ extension MutatingContext {
   }
 
   func inlineFunction(apply: FullApplySite, mandatoryInline: Bool) {
-    // This is only a best-effort attempt to notity the new cloned instructions as changed.
+    // This is only a best-effort attempt to notify the new cloned instructions as changed.
     // TODO: get a list of cloned instructions from the `inlineFunction`
     let instAfterInling: Instruction?
     switch apply {
@@ -221,7 +242,7 @@ extension MutatingContext {
   }
 
   func getContextSubstitutionMap(for type: Type) -> SubstitutionMap {
-    SubstitutionMap(_bridged.getContextSubstitutionMap(type.bridged))
+    SubstitutionMap(bridged: _bridged.getContextSubstitutionMap(type.bridged))
   }
 
   func notifyInstructionsChanged() {
@@ -258,11 +279,6 @@ struct FunctionPassContext : MutatingContext {
     SimplifyContext(_bridged: _bridged, notifyInstructionChanged: notifyInstructionChanged, preserveDebugInfo: preserveDebugInfo)
   }
 
-  var aliasAnalysis: AliasAnalysis {
-    let bridgedAA = _bridged.getAliasAnalysis()
-    return AliasAnalysis(bridged: bridgedAA)
-  }
-
   var deadEndBlocks: DeadEndBlocksAnalysis {
     let bridgeDEA = _bridged.getDeadEndBlocksAnalysis()
     return DeadEndBlocksAnalysis(bridged: bridgeDEA)
@@ -279,7 +295,7 @@ struct FunctionPassContext : MutatingContext {
   }
 
   var swiftArrayDecl: NominalTypeDecl {
-    NominalTypeDecl(_bridged: _bridged.getSwiftArrayDecl())
+    _bridged.getSwiftArrayDecl().getAs(NominalTypeDecl.self)
   }
 
   func loadFunction(name: StaticString, loadCalleesRecursively: Bool) -> Function? {
@@ -332,15 +348,17 @@ struct FunctionPassContext : MutatingContext {
     return false
   }
 
-  func specializeVTable(for type: Type, in function: Function) -> VTable? {
-    guard let vtablePtr = _bridged.specializeVTableForType(type.bridged, function.bridged) else {
-      return nil
-    }
-    return VTable(bridged: BridgedVTable(vTable: vtablePtr))
-  }
-
   func specializeClassMethodInst(_ cm: ClassMethodInst) -> Bool {
     if _bridged.specializeClassMethodInst(cm.bridged) {
+      notifyInstructionsChanged()
+      notifyCallsChanged()
+      return true
+    }
+    return false
+  }
+
+  func specializeWitnessMethodInst(_ wm: WitnessMethodInst) -> Bool {
+    if _bridged.specializeWitnessMethodInst(wm.bridged) {
       notifyInstructionsChanged()
       notifyCallsChanged()
       return true
@@ -404,6 +422,14 @@ struct FunctionPassContext : MutatingContext {
 
       return buildFn(specializedFunction, nestedFunctionPassContext)
   }
+
+  /// Makes sure that the lifetime of `value` ends at all control flow paths, even in dead-end blocks.
+  /// Inserts destroys in dead-end blocks if those are missing.
+  func completeLifetime(of value: Value) {
+    if _bridged.completeLifetime(value.bridged) {
+      notifyInstructionsChanged()
+    }
+  }
 }
 
 struct SimplifyContext : MutatingContext {
@@ -433,6 +459,34 @@ extension Type {
 //                          Builder initialization
 //===----------------------------------------------------------------------===//
 
+private extension Instruction {
+  /// Returns self, unless self is a meta instruction, in which case the next
+  /// non-meta instruction is returned. Returns nil if there are no non-meta
+  /// instructions in the basic block.
+  var nextNonMetaInstruction: Instruction? {
+    for inst in InstructionList(first: self) where !(inst is MetaInstruction) {
+      return inst
+    }
+    return nil
+  }
+
+  /// Returns the next interesting location. As it is impossible to set a
+  /// breakpoint on a meta instruction, those are skipped.
+  /// However, we don't want to take a location with different inlining
+  /// information than this instruction, so in that case, we will return the
+  /// location of the meta instruction. If the meta instruction is the only
+  /// instruction in the basic block, we also take its location.
+  var locationOfNextNonMetaInstruction: Location {
+    let location = self.location
+    guard !location.isInlined,
+          let nextLocation = nextNonMetaInstruction?.location,
+          !nextLocation.isInlined else {
+      return location
+    }
+    return nextLocation
+  }
+}
+
 extension Builder {
   /// Creates a builder which inserts _before_ `insPnt`, using a custom `location`.
   init(before insPnt: Instruction, location: Location, _ context: some MutatingContext) {
@@ -441,29 +495,48 @@ extension Builder {
               context.notifyInstructionChanged, context._bridged.asNotificationHandler())
   }
 
-  /// Creates a builder which inserts _before_ `insPnt`, using the location of `insPnt`.
+  /// Creates a builder which inserts before `insPnt`, using `insPnt`'s next
+  /// non-meta instruction's location.
+  /// This function should be used when moving code to an unknown insert point,
+  /// when we want to inherit the location of the closest non-meta instruction.
+  /// For replacing an existing meta instruction with another, use
+  /// ``Builder.init(replacing:_:)``.
   init(before insPnt: Instruction, _ context: some MutatingContext) {
+    context.verifyIsTransforming(function: insPnt.parentFunction)
+    self.init(insertAt: .before(insPnt),
+              location: insPnt.locationOfNextNonMetaInstruction,
+              context.notifyInstructionChanged, context._bridged.asNotificationHandler())
+  }
+
+  /// Creates a builder which inserts _before_ `insPnt`, using the exact location of `insPnt`,
+  /// for the purpose of replacing that meta instruction with an equivalent instruction.
+  /// This function does not delete `insPnt`.
+  init(replacing insPnt: MetaInstruction, _ context: some MutatingContext) {
     context.verifyIsTransforming(function: insPnt.parentFunction)
     self.init(insertAt: .before(insPnt), location: insPnt.location,
               context.notifyInstructionChanged, context._bridged.asNotificationHandler())
   }
 
   /// Creates a builder which inserts _after_ `insPnt`, using a custom `location`.
+  ///
+  /// TODO: this is usually incorrect for terminator instructions. Instead use
+  /// `Builder.insert(after:location:_:insertFunc)` from OptUtils.swift. Rename this to afterNonTerminator.
   init(after insPnt: Instruction, location: Location, _ context: some MutatingContext) {
     context.verifyIsTransforming(function: insPnt.parentFunction)
-    if let nextInst = insPnt.next {
-      self.init(insertAt: .before(nextInst), location: location,
-                context.notifyInstructionChanged, context._bridged.asNotificationHandler())
-    } else {
-      self.init(insertAt: .atEndOf(insPnt.parentBlock), location: location,
-                context.notifyInstructionChanged, context._bridged.asNotificationHandler())
+    guard let nextInst = insPnt.next else {
+      fatalError("cannot insert an instruction after a block terminator.")
     }
+    self.init(insertAt: .before(nextInst), location: location,
+              context.notifyInstructionChanged, context._bridged.asNotificationHandler())
   }
 
-  /// Creates a builder which inserts _after_ `insPnt`, using the location of `insPnt`.
+  /// Creates a builder which inserts _after_ `insPnt`, using `insPnt`'s next
+  /// non-meta instruction's location.
+  ///
+  /// TODO: this is incorrect for terminator instructions. Instead use `Builder.insert(after:location:_:insertFunc)`
+  /// from OptUtils.swift. Rename this to afterNonTerminator.
   init(after insPnt: Instruction, _ context: some MutatingContext) {
-    context.verifyIsTransforming(function: insPnt.parentFunction)
-    self.init(after: insPnt, location: insPnt.location, context)
+    self.init(after: insPnt, location: insPnt.locationOfNextNonMetaInstruction, context)
   }
 
   /// Creates a builder which inserts at the end of `block`, using a custom `location`.
@@ -482,11 +555,12 @@ extension Builder {
   }
 
   /// Creates a builder which inserts at the begin of `block`, using the location of the first
-  /// instruction of `block`.
+  /// non-meta instruction of `block`.
   init(atBeginOf block: BasicBlock, _ context: some MutatingContext) {
     context.verifyIsTransforming(function: block.parentFunction)
     let firstInst = block.instructions.first!
-    self.init(insertAt: .before(firstInst), location: firstInst.location,
+    self.init(insertAt: .before(firstInst),
+              location: firstInst.locationOfNextNonMetaInstruction,
               context.notifyInstructionChanged, context._bridged.asNotificationHandler())
   }
 
@@ -573,6 +647,12 @@ extension Sequence where Element == Operand {
 extension Operand {
   func set(to value: Value, _ context: some MutatingContext) {
     instruction.setOperand(at: index, to: value, context)
+  }
+
+  func changeOwnership(from: Ownership, to: Ownership, _ context: some MutatingContext) {
+    context.notifyInstructionsChanged()
+    bridged.changeOwnership(from._bridged, to._bridged)
+    context.notifyInstructionChanged(instruction)
   }
 }
 

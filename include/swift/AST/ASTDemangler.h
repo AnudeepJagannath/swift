@@ -68,6 +68,15 @@ class ASTBuilder {
   /// For saving and restoring generic parameters.
   llvm::SmallVector<decltype(ParameterPacks), 2> ParameterPackStack;
 
+  /// The depth and index of each value parameter in the current generic
+  /// signature. We need this becasue the mangling for a type parameter
+  /// doesn't record whether it is a value or not; we find the correct
+  /// depth and index in this array, and use its value-ness.
+  llvm::SmallVector<std::tuple<std::pair<unsigned, unsigned>, Type>, 1> ValueParameters;
+
+  /// For saving and restoring generic parameters.
+  llvm::SmallVector<decltype(ValueParameters), 1> ValueParametersStack;
+
   /// This builder doesn't perform "on the fly" substitutions, so we preserve
   /// all pack expansions. We still need an active expansion stack though,
   /// for the dummy implementation of these methods:
@@ -93,6 +102,12 @@ public:
     for (auto *paramTy : genericSig.getGenericParams()) {
       if (paramTy->isParameterPack())
         ParameterPacks.emplace_back(paramTy->getDepth(), paramTy->getIndex());
+
+      if (paramTy->isValue()) {
+        auto pair = std::make_pair(paramTy->getDepth(), paramTy->getIndex());
+        auto tuple = std::make_tuple(pair, paramTy->getValueType());
+        ValueParameters.emplace_back(tuple);
+      }
     }
   }
 
@@ -229,7 +244,11 @@ public:
 
   Type createDictionaryType(Type key, Type value);
 
-  Type createParenType(Type base);
+  Type createIntegerType(intptr_t value);
+
+  Type createNegativeIntegerType(intptr_t value);
+
+  Type createBuiltinFixedArrayType(Type size, Type element);
 
   BuiltGenericSignature
   createGenericSignature(ArrayRef<BuiltType> params,
@@ -254,7 +273,13 @@ private:
       NominalTypeDecl *nominalDecl,
       NodePointer node);
   DeclContext *findDeclContext(NodePointer node);
-  ModuleDecl *findModule(NodePointer node);
+
+  /// Find all the ModuleDecls that correspond to a module node's identifier.
+  /// The module name encoded in the node is either the module's real or ABI
+  /// name. Multiple modules can share the same name. This function returns
+  /// all modules that contain that name.
+  llvm::ArrayRef<ModuleDecl *> findPotentialModules(NodePointer node);
+
   Demangle::NodePointer findModuleNode(NodePointer node);
 
   enum class ForeignModuleKind {

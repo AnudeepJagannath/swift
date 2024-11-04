@@ -35,6 +35,8 @@
 // RUN: %target-swift-frontend -typecheck %t/Client_Swift5.swift -I %t \
 // RUN:   -swift-version 5 -verify
 
+// REQUIRES: swift_feature_InternalImportsByDefault
+
 //--- DepUsedFromInlinableCode.swift
 public struct TypeUsedFromInlinableCode {}
 public func funcUsedFromInlinableCode() {}
@@ -123,10 +125,8 @@ public struct Extended {
 
 //--- Client_Swift5.swift
 /// No diagnostics should be raised on the implicit access level.
-import UnusedImport // expected-error {{ambiguous implicit access level for import of 'UnusedImport'; it is imported as 'public' elsewhere}}
-// expected-note @-1 {{silence these warnings by adopting the upcoming feature 'InternalImportsByDefault'}}
+import UnusedImport
 public import UnusedImport // expected-warning {{public import of 'UnusedImport' was not used in public declarations or inlinable code}} {{1-7=internal}}
-// expected-note @-1 {{imported 'public' here}}
 
 //--- Client.swift
 public import DepUsedFromInlinableCode
@@ -237,9 +237,7 @@ internal func internalFunc(a: NotAnAPIType = notAnAPIFunc()) {}
 func implicitlyInternalFunc(a: NotAnAPIType = notAnAPIFunc()) {}
 
 // For package decls we only remark on types used in signatures, not for inlinable code.
-package func packageFunc(a: PackageType = packageFunc()) {} 
-// expected-remark@-1 {{struct 'PackageType' is imported via 'ImportUsedInPackage'}}
-// expected-remark@-2 {{global function 'packageFunc()' is imported via 'ImportUsedInPackage'}}
+package func packageFunc(a: PackageType = packageFunc()) {} // expected-remark {{struct 'PackageType' is imported via 'ImportUsedInPackage'}}
 
 @_spi(X)
 public func spiFunc(a: ToUseFromSPI) {} // expected-remark {{struct 'ToUseFromSPI' is imported via 'SPIOnlyUsedInSPI'}}
@@ -251,7 +249,7 @@ public protocol Countable {
 extension Extended: Countable { // expected-remark {{struct 'Extended' is imported via 'RetroactiveConformance'}}
 }
 
-extension ExtendedPackageType { // expected-remark 2 {{struct 'ExtendedPackageType' is imported via 'ExtendedPackageTypeImport'}}
+extension ExtendedPackageType { // expected-remark {{struct 'ExtendedPackageType' is imported via 'ExtendedPackageTypeImport'}}
   package func useExtendedPackageType() { }
 }
 

@@ -15,10 +15,12 @@
 //
 //===----------------------------------------------------------------------===//
 #include "TypeChecker.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/ParameterList.h"
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/TypeCheckRequests.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Sema/ConstraintSystem.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/Compiler.h"
@@ -108,6 +110,14 @@ static bool shouldIgnoreScoreIncreaseForCodeCompletion(
   return false;
 }
 
+void ConstraintSystem::increaseScore(ScoreKind kind, unsigned value) {
+  unsigned index = static_cast<unsigned>(kind);
+  CurrentScore.Data[index] += value;
+
+  if (solverState && value > 0)
+    recordChange(SolverTrail::Change::IncreasedScore(kind, value));
+}
+
 void ConstraintSystem::increaseScore(ScoreKind kind,
                                      ConstraintLocatorBuilder Locator,
                                      unsigned value) {
@@ -133,8 +143,28 @@ void ConstraintSystem::increaseScore(ScoreKind kind,
     llvm::errs() << ")\n";
   }
 
-  unsigned index = static_cast<unsigned>(kind);
-  CurrentScore.Data[index] += value;
+  increaseScore(kind, value);
+}
+
+void ConstraintSystem::replayScore(const Score &score) {
+  if (solverState) {
+    for (unsigned i = 0; i < NumScoreKinds; ++i) {
+      if (unsigned value = score.Data[i])
+        recordChange(
+          SolverTrail::Change::IncreasedScore(ScoreKind(i), value));
+    }
+  }
+  CurrentScore += score;
+}
+
+void ConstraintSystem::clearScore() {
+  for (unsigned i = 0; i < NumScoreKinds; ++i) {
+    if (unsigned value = CurrentScore.Data[i]) {
+      recordChange(
+        SolverTrail::Change::DecreasedScore(ScoreKind(i), value));
+    }
+  }
+  CurrentScore = Score();
 }
 
 bool ConstraintSystem::worseThanBestSolution() const {
@@ -296,7 +326,7 @@ computeSelfTypeRelationship(DeclContext *dc, ValueDecl *decl1,
 
   // If the model type does not conform to the protocol, the bases are
   // unrelated.
-  auto conformance = dc->getParentModule()->lookupConformance(modelTy, proto);
+  auto conformance = lookupConformance(modelTy, proto);
   if (conformance.isInvalid())
     return {SelfTypeRelationship::Unrelated, conformance};
 
@@ -810,10 +840,10 @@ Comparison TypeChecker::compareDeclarations(DeclContext *dc,
 }
 
 static Type getUnlabeledType(Type type, ASTContext &ctx) {
-  return type.transform([&](Type type) -> Type {
-    if (auto *tupleType = dyn_cast<TupleType>(type.getPointer())) {
+  return type.transformRec([&](TypeBase *type) -> std::optional<Type> {
+    if (auto *tupleType = dyn_cast<TupleType>(type)) {
       if (tupleType->getNumElements() == 1)
-        return ParenType::get(ctx, tupleType->getElementType(0));
+        return tupleType->getElementType(0);
 
       SmallVector<TupleTypeElt, 8> elts;
       for (auto elt : tupleType->getElements()) {
@@ -823,7 +853,7 @@ static Type getUnlabeledType(Type type, ASTContext &ctx) {
       return TupleType::get(elts, ctx);
     }
 
-    return type;
+    return std::nullopt;
   });
 }
 
@@ -961,7 +991,7 @@ SolutionCompareResult ConstraintSystem::compareSolutions(
              ? SolutionCompareResult::Better
              : SolutionCompareResult::Worse;
   }
-  
+
   // Compute relative score.
   unsigned score1 = 0;
   unsigned score2 = 0;
@@ -1036,18 +1066,9 @@ SolutionCompareResult ConstraintSystem::compareSolutions(
     if (cs.isForCodeCompletion()) {
       // Don't rank based on overload choices of function calls that contain the
       // code completion token.
-      ASTNode anchor = simplifyLocatorToAnchor(overload.locator);
-      if (auto expr = getAsExpr(anchor)) {
-        // If the anchor is a called function, also don't rank overload choices
-        // if any of the arguments contain the code completion token.
-        if (auto apply = dyn_cast_or_null<ApplyExpr>(cs.getParentExpr(expr))) {
-          if (apply->getFn() == expr) {
-            anchor = apply;
-          }
-        }
-      }
-      if (anchor && cs.containsIDEInspectionTarget(anchor)) {
-        continue;
+      if (auto anchor = simplifyLocatorToAnchor(overload.locator)) {
+        if (cs.containsIDEInspectionTarget(cs.includingParentApply(anchor)))
+          continue;
       }
     }
 

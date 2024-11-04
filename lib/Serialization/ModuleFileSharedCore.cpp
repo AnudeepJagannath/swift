@@ -14,6 +14,10 @@
 #include "BCReadingExtras.h"
 #include "DeserializationErrors.h"
 #include "ModuleFileCoreTableInfo.h"
+#include "ModuleFormat.h"
+#include "SerializationFormat.h"
+#include "swift/AST/Module.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LangOptions.h"
 #include "swift/Parse/ParseVersion.h"
 #include "swift/Serialization/SerializedModuleLoader.h"
@@ -197,11 +201,22 @@ static bool readOptionsBlock(llvm::BitstreamCursor &cursor,
     case options_block::HAS_CXX_INTEROPERABILITY_ENABLED:
       extendedInfo.setHasCxxInteroperability(true);
       break;
+    case options_block::CXX_STDLIB_KIND:
+      unsigned rawKind;
+      options_block::CXXStdlibKindLayout::readRecord(scratch, rawKind);
+      extendedInfo.setCXXStdlibKind(static_cast<CXXStdlibKind>(rawKind));
+      break;
     case options_block::ALLOW_NON_RESILIENT_ACCESS:
       extendedInfo.setAllowNonResilientAccess(true);
       break;
     case options_block::SERIALIZE_PACKAGE_ENABLED:
       extendedInfo.setSerializePackageEnabled(true);
+      break;
+    case options_block::PUBLIC_MODULE_NAME:
+      extendedInfo.setPublicModuleName(blobData);
+      break;
+    case options_block::SWIFT_INTERFACE_COMPILER_VERSION:
+      extendedInfo.setSwiftInterfaceCompilerVersion(blobData);
       break;
     default:
       // Unknown options record, possibly for use by a future version of the
@@ -334,6 +349,12 @@ static ValidationInfo validateControlBlock(
         LLVM_FALLTHROUGH;
       case 3:
         result.shortVersion = blobData.slice(0, scratch[2]);
+
+        // If the format version doesn't match, give up after also getting the
+        // compiler version. This provides better diagnostics.
+        if (result.status != Status::Valid)
+          return result;
+
         LLVM_FALLTHROUGH;
       case 2:
       case 1:
@@ -696,7 +717,7 @@ void ModuleFileSharedCore::outputDiagnosticInfo(llvm::raw_ostream &os) const {
      << " against SDK " << SDKVersion
      << ", " << (resilient? "resilient": "non-resilient");
   if (Bits.AllowNonResilientAccess)
-    os << ", built with -experimental-allow-non-resilient-access";
+    os << ", built with -allow-non-resilient-access";
   if (Bits.IsAllowModuleWithCompilerErrorsEnabled)
     os << ", built with -experimental-allow-module-with-compiler-errors";
   if (ModuleInputBuffer)
@@ -1008,9 +1029,9 @@ ModuleFileSharedCore::readGroupTable(ArrayRef<uint64_t> Fields,
                                      StringRef BlobData) const {
   auto pMap = std::make_unique<llvm::DenseMap<unsigned, StringRef>>();
   auto Data = reinterpret_cast<const uint8_t *>(BlobData.data());
-  unsigned GroupCount = endian::readNext<uint32_t, little, unaligned>(Data);
+  unsigned GroupCount = readNext<uint32_t>(Data);
   for (unsigned I = 0; I < GroupCount; ++I) {
-    auto RawSize = endian::readNext<uint32_t, little, unaligned>(Data);
+    auto RawSize = readNext<uint32_t>(Data);
     auto RawText = StringRef(reinterpret_cast<const char *>(Data), RawSize);
     Data += RawSize;
     (*pMap)[I] = RawText;
@@ -1110,6 +1131,22 @@ getActualImportControl(unsigned rawValue) {
     return ModuleDecl::ImportFilterKind::InternalOrBelow;
   case static_cast<unsigned>(serialization::ImportControl::PackageOnly):
     return ModuleDecl::ImportFilterKind::PackageOnly;
+  default:
+    return std::nullopt;
+  }
+}
+
+static std::optional<ExternalMacroPlugin::Access>
+getActualMacroAccess(unsigned rawValue) {
+  // We switch on the raw value rather than the enum in order to handle future
+  // values.
+  switch (rawValue) {
+  case static_cast<unsigned>(serialization::AccessLevel::Public):
+    return ExternalMacroPlugin::Public;
+  case static_cast<unsigned>(serialization::AccessLevel::Package):
+    return ExternalMacroPlugin::Package;
+  case static_cast<unsigned>(serialization::AccessLevel::Internal):
+    return ExternalMacroPlugin::Internal;
   default:
     return std::nullopt;
   }
@@ -1454,6 +1491,7 @@ ModuleFileSharedCore::ModuleFileSharedCore(
           extInfo.isAllowModuleWithCompilerErrorsEnabled();
       Bits.IsConcurrencyChecked = extInfo.isConcurrencyChecked();
       Bits.HasCxxInteroperability = extInfo.hasCxxInteroperability();
+      Bits.CXXStdlibKind = static_cast<uint8_t>(extInfo.getCXXStdlibKind());
       Bits.AllowNonResilientAccess = extInfo.allowNonResilientAccess();
       Bits.SerializePackageEnabled = extInfo.serializePackageEnabled();
       MiscVersion = info.miscVersion;
@@ -1461,6 +1499,9 @@ ModuleFileSharedCore::ModuleFileSharedCore(
       ModuleABIName = extInfo.getModuleABIName();
       ModulePackageName = extInfo.getModulePackageName();
       ModuleExportAsName = extInfo.getExportAsName();
+      PublicModuleName = extInfo.getPublicModuleName();
+      SwiftInterfaceCompilerVersion =
+          extInfo.getSwiftInterfaceCompilerVersion();
 
       hasValidControlBlock = true;
       break;
@@ -1572,6 +1613,18 @@ ModuleFileSharedCore::ModuleFileSharedCore(
         }
         case input_block::MODULE_INTERFACE_PATH: {
           ModuleInterfacePath = blobData;
+          break;
+        }
+        case input_block::EXTERNAL_MACRO: {
+          uint8_t rawKind;
+          input_block::ExternalMacroLayout::readRecord(scratch, rawKind);
+          auto accessKind = getActualMacroAccess(rawKind);
+          if (!accessKind) {
+            info.status = error(Status::Malformed);
+            return;
+          }
+
+          MacroModuleNames.push_back({blobData.str(), *accessKind});
           break;
         }
         default:
@@ -1778,10 +1831,23 @@ bool ModuleFileSharedCore::hasSourceInfo() const {
   return !!DeclUSRsTable;
 }
 
+std::string ModuleFileSharedCore::resolveModuleDefiningFilePath(const StringRef SDKPath) const {
+  if (!ModuleInterfacePath.empty()) {
+    std::string interfacePath = ModuleInterfacePath.str();
+    if (llvm::sys::path::is_relative(interfacePath) && !ModuleInterfacePath.starts_with(SDKPath)) {
+      SmallString<128> absoluteInterfacePath(SDKPath);
+      llvm::sys::path::append(absoluteInterfacePath, interfacePath);
+      return absoluteInterfacePath.str().str();
+    } else
+      return interfacePath;
+  } else
+    return ModuleInputBuffer->getBufferIdentifier().str();
+}
+
 ModuleLoadingBehavior
 ModuleFileSharedCore::getTransitiveLoadingBehavior(
                                           const Dependency &dependency,
-                                          bool debuggerMode,
+                                          bool importNonPublicDependencies,
                                           bool isPartialModule,
                                           StringRef packageName,
                                           bool forTestable) const {
@@ -1797,7 +1863,7 @@ ModuleFileSharedCore::getTransitiveLoadingBehavior(
   if (dependency.isImplementationOnly()) {
     // Implementation-only dependencies are not usually loaded from
     // transitive imports.
-    if (debuggerMode || forTestable) {
+    if (importNonPublicDependencies || forTestable) {
       // In the debugger, try to load the module if possible.
       // Same in the case of a testable import, try to load the dependency
       // but don't fail if it's missing as this could be source breaking.
@@ -1815,7 +1881,7 @@ ModuleFileSharedCore::getTransitiveLoadingBehavior(
     // on testable imports.
     if (forTestable || !moduleIsResilient) {
       return ModuleLoadingBehavior::Required;
-    } else if (debuggerMode) {
+    } else if (importNonPublicDependencies) {
       return ModuleLoadingBehavior::Optional;
     } else {
       return ModuleLoadingBehavior::Ignored;
@@ -1829,7 +1895,7 @@ ModuleFileSharedCore::getTransitiveLoadingBehavior(
         forTestable ||
         !moduleIsResilient) {
       return ModuleLoadingBehavior::Required;
-    } else if (debuggerMode) {
+    } else if (importNonPublicDependencies) {
       return ModuleLoadingBehavior::Optional;
     } else {
       return ModuleLoadingBehavior::Ignored;

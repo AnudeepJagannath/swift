@@ -31,6 +31,7 @@
 
 #define DEBUG_TYPE "sil-function-signature-opt"
 #include "FunctionSignatureOpts.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/SILCloner.h"
 #include "swift/SIL/SILFunction.h"
@@ -287,6 +288,11 @@ static bool usesGenerics(SILFunction *F,
         for (auto Ty : Subs.getReplacementTypes()) {
           Ty.visit(FindArchetypesAndGenericTypes);
         }
+      }
+
+      // Scan the parameter type of a 'type_value'.
+      if (auto tvi = dyn_cast<TypeValueInst>(&I)) {
+        tvi->getParamType().visit(FindArchetypesAndGenericTypes);
       }
 
       // Scan the result type of the instruction.

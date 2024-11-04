@@ -5,6 +5,7 @@
 // RUN: %target-swift-frontend -emit-ir     -I %t                      %t/Main.swift     -parse-stdlib -enable-experimental-feature Embedded | %FileCheck %s
 
 // REQUIRES: swift_in_compiler
+// REQUIRES: swift_feature_Embedded
 
 // BEGIN MyModule.swift
 
@@ -57,6 +58,6 @@ public func main() {
 // CHECK: define {{.*}}void @"$s8MyModule14nonGenericFuncyyF"()
 // CHECK: define {{.*}}void @"$s8MyModule11genericFuncyxxlF4Main4BoolV_Tg5"()
 // CHECK: define {{.*}}void @"$s8MyModule14NonGenericTypeVACycfC"()
-// CHECK: define {{.*}}void @"$s8MyModule11GenericTypeVyACyxGxcfC4Main4BoolV_Tgm5"()
+// CHECK: define {{.*}}void @"$s8MyModule11GenericTypeVyACyxGxcfC4Main4BoolV_Tt1g5"()
 // CHECK: define {{.*}}void @"$s8MyModule17protocolBoundFuncyyxAA8ProtocolRzlF4Main4BoolV_Tg5"()
 // CHECK: define {{.*}}void @"$s8MyModule17protocolBoundFuncyyxAA8ProtocolRzlFAA11GenericTypeVy4Main4BoolVG_Tg5"()

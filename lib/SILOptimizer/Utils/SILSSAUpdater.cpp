@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "swift/SILOptimizer/Utils/SILSSAUpdater.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Malloc.h"
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/SILArgument.h"
@@ -325,7 +326,7 @@ public:
     llvm::copy(block->getPredecessorBlocks(), std::back_inserter(*predBlocks));
   }
 
-  static SILValue GetUndefVal(SILBasicBlock *block, SILSSAUpdater *ssaUpdater) {
+  static SILValue GetPoisonVal(SILBasicBlock *block, SILSSAUpdater *ssaUpdater) {
     return SILUndef::get(block->getParent(), ssaUpdater->type);
   }
 

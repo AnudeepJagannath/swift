@@ -11,6 +11,7 @@
 //===----------------------------------------------------------------------===//
 
 #define DEBUG_TYPE "sil-dce"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DebugUtils.h"
 #include "swift/SIL/OwnershipUtils.h"
 #include "swift/SIL/SILArgument.h"
@@ -54,6 +55,10 @@ static bool seemsUseful(SILInstruction *I) {
       isa<EndBorrowInst>(I))
     return false;
 
+  if (isa<UnconditionalCheckedCastInst>(I)) {
+    return false;
+  }
+
   // A load [copy] is okay to be DCE'ed if there are no useful dependencies
   if (auto *load = dyn_cast<LoadInst>(I)) {
     if (load->getOwnershipQualifier() == LoadOwnershipQualifier::Copy)
@@ -62,6 +67,11 @@ static bool seemsUseful(SILInstruction *I) {
 
   if (I->mayHaveSideEffects())
     return true;
+
+  if (llvm::any_of(I->getResults(),
+                   [](auto result) { return result->isLexical(); })) {
+    return true;
+  }
 
   if (auto *BI = dyn_cast<BuiltinInst>(I)) {
     // Although the onFastPath builtin has no side-effects we don't want to

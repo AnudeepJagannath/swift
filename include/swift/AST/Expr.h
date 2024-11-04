@@ -71,6 +71,7 @@ namespace swift {
   class KeyPathExpr;
   class CaptureListExpr;
   class ThenStmt;
+  class ReturnStmt;
 
 enum class ExprKind : uint8_t {
 #define EXPR(Id, Parent) Id,
@@ -266,7 +267,7 @@ protected:
     Kind : 2
   );
 
-  SWIFT_INLINE_BITFIELD(ClosureExpr, AbstractClosureExpr, 1+1+1+1,
+  SWIFT_INLINE_BITFIELD(ClosureExpr, AbstractClosureExpr, 1+1+1+1+1+1+1,
     /// True if closure parameters were synthesized from anonymous closure
     /// variables.
     HasAnonymousClosureVars : 1,
@@ -281,7 +282,20 @@ protected:
 
     /// True if this closure's actor isolation behavior was determined by an
     /// \c \@preconcurrency declaration.
-    IsolatedByPreconcurrency : 1
+    IsolatedByPreconcurrency : 1,
+
+    /// True if this is a closure literal that is passed to a sending parameter.
+    IsPassedToSendingParameter : 1,
+
+    /// True if we're in the common case where the GlobalActorAttributeRequest
+    /// request returned a pair of null pointers.
+    NoGlobalActorAttribute : 1,
+
+    /// Indicates whether this closure literal would require dynamic actor 
+    /// isolation checks when it either specifies or inherits isolation
+    /// and was passed as an argument to a function that is not fully 
+    /// concurrency checked.
+    RequiresDynamicIsolationChecking : 1
   );
 
   SWIFT_INLINE_BITFIELD_FULL(BindOptionalExpr, Expr, 16,
@@ -978,41 +992,81 @@ public:
   }
 };
 
-/// A regular expression literal e.g '(a|c)*'.
-class RegexLiteralExpr : public LiteralExpr {
-  SourceLoc Loc;
-  StringRef RegexText;
-  unsigned Version;
-  ArrayRef<uint8_t> SerializedCaptureStructure;
-
-  RegexLiteralExpr(SourceLoc loc, StringRef regexText, unsigned version,
-                   ArrayRef<uint8_t> serializedCaps,
-                   bool isImplicit)
-      : LiteralExpr(ExprKind::RegexLiteral, isImplicit), Loc(loc),
-        RegexText(regexText), Version(version),
-        SerializedCaptureStructure(serializedCaps) {}
+/// The opaque kind of a RegexLiteralExpr feature, which should only be
+/// interpreted by the compiler's regex parsing library.
+class RegexLiteralPatternFeatureKind final {
+  unsigned RawValue;
 
 public:
-  static RegexLiteralExpr *createParsed(
-      ASTContext &ctx, SourceLoc loc, StringRef regexText, unsigned version,
-      ArrayRef<uint8_t> serializedCaptureStructure);
+  RegexLiteralPatternFeatureKind(unsigned rawValue) : RawValue(rawValue) {}
 
-  typedef uint16_t CaptureStructureSerializationVersion;
+  unsigned getRawValue() const { return RawValue; }
 
-  static unsigned getCaptureStructureSerializationAllocationSize(
-      unsigned regexLength) {
-    return sizeof(CaptureStructureSerializationVersion) + regexLength + 1;
+  AvailabilityRange getAvailability(ASTContext &ctx) const;
+  StringRef getDescription(ASTContext &ctx) const;
+
+  friend llvm::hash_code
+  hash_value(const RegexLiteralPatternFeatureKind &kind) {
+    return llvm::hash_value(kind.getRawValue());
   }
 
-  /// Retrieve the raw regex text.
-  StringRef getRegexText() const { return RegexText; }
+  friend bool operator==(const RegexLiteralPatternFeatureKind &lhs,
+                         const RegexLiteralPatternFeatureKind &rhs) {
+    return lhs.getRawValue() == rhs.getRawValue();
+  }
+
+  friend bool operator!=(const RegexLiteralPatternFeatureKind &lhs,
+                         const RegexLiteralPatternFeatureKind &rhs) {
+    return !(lhs == rhs);
+  }
+};
+
+/// A specific feature used in a RegexLiteralExpr, needed for availability
+/// diagnostics.
+class RegexLiteralPatternFeature final {
+  RegexLiteralPatternFeatureKind Kind;
+  CharSourceRange Range;
+
+public:
+  RegexLiteralPatternFeature(RegexLiteralPatternFeatureKind kind,
+                             CharSourceRange range)
+      : Kind(kind), Range(range) {}
+
+  RegexLiteralPatternFeatureKind getKind() const { return Kind; }
+  CharSourceRange getRange() const { return Range; }
+};
+
+/// A regular expression literal e.g '(a|c)*'.
+class RegexLiteralExpr : public LiteralExpr {
+  ASTContext *Ctx;
+  SourceLoc Loc;
+  StringRef ParsedRegexText;
+
+  RegexLiteralExpr(ASTContext *ctx, SourceLoc loc, StringRef parsedRegexText,
+                   bool isImplicit)
+      : LiteralExpr(ExprKind::RegexLiteral, isImplicit), Ctx(ctx), Loc(loc),
+        ParsedRegexText(parsedRegexText) {}
+
+public:
+  static RegexLiteralExpr *createParsed(ASTContext &ctx, SourceLoc loc,
+                                        StringRef regexText);
+
+  ASTContext &getASTContext() const { return *Ctx; }
+
+  /// Retrieve the raw parsed regex text.
+  StringRef getParsedRegexText() const { return ParsedRegexText; }
+
+  /// Retrieve the regex pattern to emit.
+  StringRef getRegexToEmit() const;
+
+  /// Retrieve the computed type for the regex.
+  Type getRegexType() const;
 
   /// Retrieve the version of the regex string.
-  unsigned getVersion() const { return Version; }
+  unsigned getVersion() const;
 
-  ArrayRef<uint8_t> getSerializedCaptureStructure() {
-    return SerializedCaptureStructure;
-  }
+  /// Retrieve any features used in the regex pattern.
+  ArrayRef<RegexLiteralPatternFeature> getPatternFeatures() const;
 
   SourceRange getSourceRange() const { return Loc; }
 
@@ -1372,8 +1426,47 @@ public:
     return E->getKind() == ExprKind::Type;
   }
 };
-  
-  
+
+class TypeValueExpr : public Expr {
+  TypeLoc paramTypeLoc;
+
+public:
+  /// Create a \c TypeValueExpr from an underlying parameter \c TypeRepr.
+  TypeValueExpr(TypeRepr *paramRepr) :
+      Expr(ExprKind::TypeValue, /*implicit*/ false), paramTypeLoc(paramRepr) {}
+
+  /// Create a \c TypeValueExpr for a given \c TypeDecl at the specified
+  /// location.
+  ///
+  /// The given location must be valid. If it is not, you must use
+  /// \c TypeExpr::createImplicitForDecl instead.
+  static TypeValueExpr *createForDecl(DeclNameLoc Loc, TypeDecl *D,
+                                      DeclContext *DC);
+
+  TypeRepr *getParamTypeRepr() const {
+    return paramTypeLoc.getTypeRepr();
+  }
+
+  /// Retrieves the corresponding parameter type of the value referenced by this
+  /// expression.
+  ArchetypeType *getParamType() const {
+    return paramTypeLoc.getType()->castTo<ArchetypeType>();
+  }
+
+  /// Sets the corresponding parameter type of the value referenced by this
+  /// expression.
+  void setParamType(Type paramType) {
+    paramTypeLoc.setType(paramType);
+  }
+
+  SourceRange getSourceRange() const {
+    return paramTypeLoc.getSourceRange();
+  }
+
+  static bool classof(const Expr *E) {
+    return E->getKind() == ExprKind::TypeValue;
+  }
+};
 
 /// A reference to another initializer from within a constructor body,
 /// either to a delegating initializer or to a super.init invocation.
@@ -3999,6 +4092,18 @@ public:
   /// returns nullptr if the closure doesn't have a body
   BraceStmt *getBody() const;
 
+  /// Returns a boolean value indicating whether the body, if any, contains
+  /// an explicit `return` statement.
+  ///
+  /// \returns `true` if the body contains an explicit `return` statement,
+  /// `false` otherwise.
+  bool bodyHasExplicitReturnStmt() const;
+
+  /// Finds occurrences of explicit `return` statements within the body, if any.
+  ///
+  /// \param results An out container to which the results are added.
+  void getExplicitReturnStmts(SmallVectorImpl<ReturnStmt *> &results) const;
+
   ActorIsolation getActorIsolation() const {
     return actorIsolation;
   }
@@ -4067,20 +4172,11 @@ class ClosureExpr : public AbstractClosureExpr {
 
 public:
   enum class BodyState {
-    /// The body was parsed, but not ready for type checking because
-    /// the closure parameters haven't been type checked.
+    /// The body was parsed.
     Parsed,
 
-    /// The type of the closure itself was type checked. But the body has not
-    /// been type checked yet.
-    ReadyForTypeChecking,
-
-    /// The body was typechecked with the enclosing closure.
-    /// i.e. single expression closure or result builder closure.
-    TypeCheckedWithSignature,
-
-    /// The body was type checked separately from the enclosing closure.
-    SeparatelyTypeChecked,
+    /// The body was type-checked.
+    TypeChecked,
   };
 
 private:
@@ -4121,6 +4217,16 @@ private:
   /// The body of the closure.
   BraceStmt *Body;
 
+  friend class GlobalActorAttributeRequest;
+
+  bool hasNoGlobalActorAttribute() const {
+    return Bits.ClosureExpr.NoGlobalActorAttribute;
+  }
+
+  void setHasNoGlobalActorAttribute() {
+    Bits.ClosureExpr.NoGlobalActorAttribute = true;
+  }
+
 public:
   ClosureExpr(const DeclAttributes &attributes,
               SourceRange bracketRange, VarDecl *capturedSelfDecl,
@@ -4139,6 +4245,9 @@ public:
     Bits.ClosureExpr.HasAnonymousClosureVars = false;
     Bits.ClosureExpr.ImplicitSelfCapture = false;
     Bits.ClosureExpr.InheritActorContext = false;
+    Bits.ClosureExpr.IsPassedToSendingParameter = false;
+    Bits.ClosureExpr.NoGlobalActorAttribute = false;
+    Bits.ClosureExpr.RequiresDynamicIsolationChecking = false;
   }
 
   SourceRange getSourceRange() const;
@@ -4175,7 +4284,8 @@ public:
   }
 
   /// Whether this closure should implicitly inherit the actor context from
-  /// where it was formed. This only affects @Sendable async closures.
+  /// where it was formed. This only affects @Sendable and sendable async
+  /// closures.
   bool inheritsActorContext() const {
     return Bits.ClosureExpr.InheritActorContext;
   }
@@ -4192,6 +4302,26 @@ public:
 
   void setIsolatedByPreconcurrency(bool value = true) {
     Bits.ClosureExpr.IsolatedByPreconcurrency = value;
+  }
+
+  /// Whether the closure is a closure literal that is passed to a sending
+  /// parameter.
+  bool isPassedToSendingParameter() const {
+    return Bits.ClosureExpr.IsPassedToSendingParameter;
+  }
+
+  void setIsPassedToSendingParameter(bool value = true) {
+    Bits.ClosureExpr.IsPassedToSendingParameter = value;
+  }
+
+  /// True if this is an isolated closure literal that is passed 
+  /// to a callee that has not been concurrency checked.
+  bool requiresDynamicIsolationChecking() const {
+    return Bits.ClosureExpr.RequiresDynamicIsolationChecking;
+  }
+
+  void setRequiresDynamicIsolationChecking(bool value = true) {
+    Bits.ClosureExpr.RequiresDynamicIsolationChecking = value;
   }
 
   /// Determine whether this closure expression has an
@@ -4283,13 +4413,6 @@ public:
   }
   void setBodyState(BodyState v) {
     ExplicitResultTypeAndBodyState.setInt(v);
-  }
-
-  /// Whether this closure's body is/was type checked separately from its
-  /// enclosing expression.
-  bool isSeparatelyTypeChecked() const {
-    return getBodyState() == BodyState::SeparatelyTypeChecked ||
-           getBodyState() == BodyState::ReadyForTypeChecking;
   }
 
   static bool classof(const Expr *E) {
@@ -6412,8 +6535,10 @@ public:
   }
 
   static MacroExpansionExpr *
-  create(DeclContext *dc, SourceLoc sigilLoc, DeclNameRef macroName,
-         DeclNameLoc macroNameLoc, SourceLoc leftAngleLoc,
+  create(DeclContext *dc, SourceLoc sigilLoc,
+         DeclNameRef moduleName, DeclNameLoc moduleNameLoc,
+         DeclNameRef macroName, DeclNameLoc macroNameLoc,
+         SourceLoc leftAngleLoc,
          ArrayRef<TypeRepr *> genericArgs, SourceLoc rightAngleLoc,
          ArgumentList *argList, MacroRoles roles, bool isImplicit = false,
          Type ty = Type());
@@ -6474,9 +6599,8 @@ void simple_display(llvm::raw_ostream &out, const ClosureExpr *CE);
 void simple_display(llvm::raw_ostream &out, const DefaultArgumentExpr *expr);
 void simple_display(llvm::raw_ostream &out, const Expr *expr);
 
-SourceLoc extractNearestSourceLoc(const DefaultArgumentExpr *expr);
-SourceLoc extractNearestSourceLoc(const MacroExpansionExpr *expr);
 SourceLoc extractNearestSourceLoc(const ClosureExpr *expr);
+SourceLoc extractNearestSourceLoc(const Expr *expr);
 
 } // end namespace swift
 

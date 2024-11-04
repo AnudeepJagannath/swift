@@ -19,6 +19,7 @@
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Parse/Parser.h"
 #include "swift/Subsystems.h"
@@ -69,11 +70,13 @@ ParseMembersRequest::evaluate(Evaluator &evaluator,
     return FingerprintAndMembers{fp, ctx.AllocateCopy(members)};
   }
 
-  unsigned bufferID = *sf->getBufferID();
+  unsigned bufferID = sf->getBufferID();
 
   // Lexer diagnostics have been emitted during skipping, so we disable lexer's
   // diagnostic engine here.
   Parser parser(bufferID, *sf, /*No Lexer Diags*/nullptr, nullptr, nullptr);
+  parser.InFreestandingMacroArgument = idc->inFreestandingMacroArgument();
+
   auto declsAndHash = parser.parseDeclListDelayed(idc);
   FingerprintAndMembers fingerprintAndMembers = {declsAndHash.second,
                                                  declsAndHash.first};
@@ -139,10 +142,6 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
   auto &ctx = SF->getASTContext();
   auto bufferID = SF->getBufferID();
 
-  // If there's no buffer, there's nothing to parse.
-  if (!bufferID)
-    return {};
-
   // If we've been asked to silence warnings, do so now. This is needed for
   // secondary files, which can be parsed multiple times.
   auto &diags = ctx.Diags;
@@ -160,13 +159,13 @@ SourceFileParsingResult ParseSourceFileRequest::evaluate(Evaluator &evaluator,
     SF->setDelayedParserState({state, &deletePersistentParserState});
   }
 
-  Parser parser(*bufferID, *SF, /*SIL*/ nullptr, state);
+  Parser parser(bufferID, *SF, /*SIL*/ nullptr, state);
   PrettyStackTraceParser StackTrace(parser);
 
   // If the buffer is generated source information, we might have more
   // context that we need to set up for parsing.
   SmallVector<ASTNode, 128> items;
-  if (auto generatedInfo = ctx.SourceMgr.getGeneratedSourceInfo(*bufferID)) {
+  if (auto generatedInfo = ctx.SourceMgr.getGeneratedSourceInfo(bufferID)) {
     if (generatedInfo->declContext)
       parser.CurDeclContext = generatedInfo->declContext;
 

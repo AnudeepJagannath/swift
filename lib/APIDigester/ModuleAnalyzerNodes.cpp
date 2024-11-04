@@ -1,9 +1,11 @@
-#include "llvm/ADT/STLExtras.h"
 #include "swift/AST/ASTMangler.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
+#include "swift/Parse/Lexer.h"
 #include "swift/Sema/IDETypeChecking.h"
-#include <swift/APIDigester/ModuleAnalyzerNodes.h>
+#include "llvm/ADT/STLExtras.h"
 #include <algorithm>
+#include <swift/APIDigester/ModuleAnalyzerNodes.h>
 
 using namespace swift;
 using namespace ide;
@@ -1070,9 +1072,6 @@ static StringRef getPrintedName(SDKContext &Ctx, Type Ty,
 
 static StringRef getTypeName(SDKContext &Ctx, Type Ty,
                              bool IsImplicitlyUnwrappedOptional) {
-  if (Ty->getKind() == TypeKind::Paren) {
-    return Ctx.buffer("Paren");
-  }
   if (Ty->isVoid()) {
     return Ctx.buffer("Void");
   }
@@ -1474,7 +1473,7 @@ SDKNodeInitInfo::SDKNodeInitInfo(SDKContext &Ctx, Decl *D):
       ObjCName(Ctx.getObjcName(D)),
       InitKind(Ctx.getInitKind(D)),
       IsImplicit(D->isImplicit()),
-      IsDeprecated(D->getAttrs().getDeprecated(D->getASTContext())),
+      IsDeprecated(D->getAttrs().isDeprecated(D->getASTContext())),
       IsABIPlaceholder(isABIPlaceholderRecursive(D)),
       IsFromExtension(isDeclaredInExtension(D)),
       DeclAttrs(collectDeclAttributes(D)) {
@@ -1661,12 +1660,6 @@ SwiftDeclCollector::constructTypeNode(Type T, TypeInitInfo Info) {
 
   SDKNode* Root = SDKNodeInitInfo(Ctx, T, Info).createSDKNode(SDKNodeKind::TypeNominal);
 
-  // Keep paren type as a stand-alone level.
-  if (auto *PT = dyn_cast<ParenType>(T.getPointer())) {
-    Root->addChild(constructTypeNode(PT->getSinglyDesugaredType()));
-    return Root;
-  }
-
   // Handle the case where Type has sub-types.
   if (auto BGT = T->getAs<BoundGenericType>()) {
     for (auto Arg : BGT->getGenericArgs()) {
@@ -1771,7 +1764,7 @@ SDKContext::shouldIgnore(Decl *D, const Decl* Parent) const {
     if (D->getAttrs().hasAttribute<AlwaysEmitIntoClientAttr>())
       return true;
   } else {
-    if (D->isPrivateStdlibDecl(false))
+    if (D->isPrivateSystemDecl(false))
       return true;
   }
   if (AvailableAttr::isUnavailable(D))
@@ -1942,8 +1935,6 @@ SwiftDeclCollector::addMembersToRoot(SDKNode *Root, IterableDeclContext *Context
       // All containing variables should have been handled.
     } else if (isa<EnumCaseDecl>(Member)) {
       // All containing variables should have been handled.
-    } else if (isa<IfConfigDecl>(Member)) {
-      // All containing members should have been handled.
     } else if (isa<PoundDiagnosticDecl>(Member)) {
       // All containing members should have been handled.
     } else if (isa<DestructorDecl>(Member)) {

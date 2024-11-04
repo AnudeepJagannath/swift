@@ -529,10 +529,22 @@ public:
     bool reflectionNameMatches(RemoteRef<char> reflectionName,
                                StringRef searchName);
 
+    std::optional<std::reference_wrapper<const ReflectionInfo>>
+    findReflectionInfoWithTypeRefContainingAddress(uint64_t remoteAddr);
+
     std::vector<ReflectionInfo> ReflectionInfos;
+
+    // Sorted indexes of elements in ReflectionInfos.
+    std::vector<uint32_t> ReflectionInfoIndexesSortedByTypeReferenceRange;
 
     /// Indexes of Reflection Infos we've already processed.
     llvm::DenseSet<size_t> ProcessedReflectionInfoIndexes;
+
+    /// Cache for capture descriptor lookups.
+    std::unordered_map<uint64_t /* remote address*/,
+                       RemoteRef<CaptureDescriptor>>
+        CaptureDescriptorsByAddress;
+    uint32_t CaptureDescriptorsByAddressLastReflectionInfoCache = 0;
 
     /// Cache for field info lookups.
     std::unordered_map<std::string, RemoteRef<FieldDescriptor>>
@@ -638,6 +650,8 @@ public:
               auto substitutedDemangleTree = Builder.demangleTypeRef(
                   substitutedTypeRef,
                   /* useOpaqueTypeSymbolicReferences */ true);
+              if (!substitutedDemangleTree)
+                continue;
 
               // If the substituted type is an opaque type, also gather info
               // about which protocols it is required to conform to and the
@@ -906,6 +920,22 @@ public:
 
   const TypeRef *createParenType(const TypeRef *base) {
     // TypeRefs don't contain sugared types
+    return nullptr;
+  }
+
+  const TypeRef *createIntegerType(intptr_t value) {
+    // FIXME: implement
+    return nullptr;
+  }
+
+  const TypeRef *createNegativeIntegerType(intptr_t value) {
+    // FIXME: implement
+    return nullptr;
+  }
+
+  const TypeRef *createBuiltinFixedArrayType(const TypeRef *size,
+                                             const TypeRef *element) {
+    // FIXME: implement
     return nullptr;
   }
 

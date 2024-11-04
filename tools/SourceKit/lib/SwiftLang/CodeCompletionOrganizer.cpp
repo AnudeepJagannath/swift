@@ -23,7 +23,6 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/ilist.h"
 #include "llvm/ADT/ilist_node.h"
-#include <deque>
 
 using namespace SourceKit;
 using namespace CodeCompletion;
@@ -175,6 +174,7 @@ bool SourceKit::CodeCompletion::addCustomCompletions(
         addCompletion(custom);
       }
       break;
+    case CompletionKind::TypePossibleFunctionParamBeginning:
     case CompletionKind::TypeDeclResultBeginning:
     case CompletionKind::TypeBeginning:
     case CompletionKind::TypeSimpleOrComposition:
@@ -452,6 +452,7 @@ void CodeCompletionOrganizer::Impl::addCompletionsWithFilter(
   if (filterText.empty()) {
     bool hideLowPriority =
         options.hideLowPriority &&
+        completionKind != CompletionKind::TypePossibleFunctionParamBeginning &&
         completionKind != CompletionKind::TypeDeclResultBeginning &&
         completionKind != CompletionKind::TypeBeginning &&
         completionKind != CompletionKind::TypeSimpleOrComposition &&

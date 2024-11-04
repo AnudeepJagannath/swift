@@ -28,6 +28,7 @@
 #include "swift/AST/ProtocolConformance.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/TypeVisitor.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/Basic/QuotedString.h"
 #include "swift/Basic/STLExtras.h"
@@ -227,6 +228,8 @@ static StringRef getDumpString(ReadImplKind kind) {
     return "addressor";
   case ReadImplKind::Read:
     return "read_coroutine";
+  case ReadImplKind::Read2:
+    return "read2_coroutine";
   }
   llvm_unreachable("bad kind");
 }
@@ -247,6 +250,8 @@ static StringRef getDumpString(WriteImplKind kind) {
     return "mutable_addressor";
   case WriteImplKind::Modify:
     return "modify_coroutine";
+  case WriteImplKind::Modify2:
+    return "modify2_coroutine";
   }
   llvm_unreachable("bad kind");
 }
@@ -263,6 +268,8 @@ static StringRef getDumpString(ReadWriteImplKind kind) {
     return "materialize_to_temporary";
   case ReadWriteImplKind::Modify:
     return "modify_coroutine";
+  case ReadWriteImplKind::Modify2:
+    return "modify2_coroutine";
   case ReadWriteImplKind::StoredWithDidSet:
     return "stored_with_didset";
   case ReadWriteImplKind::InheritedWithDidSet:
@@ -482,21 +489,22 @@ namespace {
     raw_ostream &OS;
     unsigned Indent;
   public:
+    bool ParseIfNeeded;
     llvm::function_ref<Type(Expr *)> GetTypeOfExpr;
     llvm::function_ref<Type(TypeRepr *)> GetTypeOfTypeRepr;
     llvm::function_ref<Type(KeyPathExpr *E, unsigned index)>
         GetTypeOfKeyPathComponent;
     char quote = '"';
 
-    explicit PrintBase(raw_ostream &os, unsigned indent = 0,
-                       llvm::function_ref<Type(Expr *)> getTypeOfExpr = defaultGetTypeOfExpr,
-                       llvm::function_ref<Type(TypeRepr *)> getTypeOfTypeRepr = nullptr,
-                       llvm::function_ref<Type(KeyPathExpr *E, unsigned index)>
-                          getTypeOfKeyPathComponent =
-                              defaultGetTypeOfKeyPathComponent)
-        : OS(os), Indent(indent), GetTypeOfExpr(getTypeOfExpr),
-          GetTypeOfTypeRepr(getTypeOfTypeRepr),
-          GetTypeOfKeyPathComponent(getTypeOfKeyPathComponent) { }
+    explicit PrintBase(
+        raw_ostream &os, unsigned indent = 0, bool parseIfNeeded = false,
+        llvm::function_ref<Type(Expr *)> getTypeOfExpr = defaultGetTypeOfExpr,
+        llvm::function_ref<Type(TypeRepr *)> getTypeOfTypeRepr = nullptr,
+        llvm::function_ref<Type(KeyPathExpr *E, unsigned index)>
+            getTypeOfKeyPathComponent = defaultGetTypeOfKeyPathComponent)
+        : OS(os), Indent(indent), ParseIfNeeded(parseIfNeeded),
+          GetTypeOfExpr(getTypeOfExpr), GetTypeOfTypeRepr(getTypeOfTypeRepr),
+          GetTypeOfKeyPathComponent(getTypeOfKeyPathComponent) {}
 
     bool hasNonStandardOutput() {
       return &OS != &llvm::errs() && &OS != &llvm::dbgs();
@@ -1174,6 +1182,19 @@ namespace {
       printCommon(decl, "generic_type_param", label);
       printField(decl->getDepth(), "depth");
       printField(decl->getIndex(), "index");
+
+      switch (decl->getParamKind()) {
+      case GenericTypeParamKind::Type:
+        printField((StringRef)"type", "param_kind");
+        break;
+      case GenericTypeParamKind::Pack:
+        printField((StringRef)"pack", "param_kind");
+        break;
+      case GenericTypeParamKind::Value:
+        printField((StringRef)"value", "param_kind");
+        break;
+      }
+
       printFoot();
     }
 
@@ -1301,7 +1322,9 @@ namespace {
         break;
       }
 
-      for (Decl *D : IDC->getMembers()) {
+      auto members = ParseIfNeeded ? IDC->getMembers()
+                                   : IDC->getCurrentMembersWithoutLoading();
+      for (Decl *D : members) {
         printRec(D);
       }
       printFoot();
@@ -1313,7 +1336,9 @@ namespace {
         OS << SF.getFilename();
       });
 
-      if (auto items = SF.getCachedTopLevelItems()) {
+      auto items =
+          ParseIfNeeded ? SF.getTopLevelItems() : SF.getCachedTopLevelItems();
+      if (items) {
         for (auto item : *items) {
           if (item.isImplicit())
             continue;
@@ -1341,6 +1366,14 @@ namespace {
       printStorageImpl(VD);
       printFlag(VD->getAttrs().hasAttribute<KnownToBeLocalAttr>(),
                 "known_to_be_local", DeclModifierColor);
+      if (auto *nonisolatedAttr =
+              VD->getAttrs().getAttribute<NonisolatedAttr>()) {
+        if (nonisolatedAttr->isUnsafe()) {
+          printFlag(true, "nonisolated(unsafe)", DeclModifierColor);
+        } else {
+          printFlag(true, "nonisolated", DeclModifierColor);
+        }
+      }
 
       printAccessors(VD);
       
@@ -1556,7 +1589,8 @@ namespace {
         });
       }
 
-      if (auto Body = D->getBody(/*canSynthesize=*/false)) {
+      auto canParse = ParseIfNeeded && !D->isBodySkipped();
+      if (auto Body = D->getBody(canParse)) {
         printRec(Body, &D->getASTContext());
       }
     }
@@ -1603,12 +1637,6 @@ namespace {
       if (TLCD->getBody()) {
         printRec(TLCD->getBody(), &static_cast<Decl *>(TLCD)->getASTContext());
       }
-      printFoot();
-    }
-
-    void visitIfConfigDecl(IfConfigDecl *ICD, StringRef label) {
-      printCommon(ICD, "if_config_decl", label);
-      printRecRange(ICD->getClauses(), &ICD->getASTContext(), "clauses");
       printFoot();
     }
 
@@ -1858,13 +1886,7 @@ void SourceFile::dump() const {
 }
 
 void SourceFile::dump(llvm::raw_ostream &OS, bool parseIfNeeded) const {
-  // If we're allowed to parse the SourceFile, do so now. We need to force the
-  // parsing request as by default the dumping logic tries not to kick any
-  // requests.
-  if (parseIfNeeded)
-    (void)getTopLevelItems();
-
-  PrintDecl(OS).visitSourceFile(*this);
+  PrintDecl(OS, /*indent*/ 0, parseIfNeeded).visitSourceFile(*this);
   llvm::errs() << '\n';
 }
 
@@ -1889,13 +1911,16 @@ public:
   using PrintBase::PrintBase;
   const ASTContext *Ctx;
 
-  PrintStmt(raw_ostream &os, const ASTContext *ctx, unsigned indent = 0,
-            llvm::function_ref<Type(Expr *)> getTypeOfExpr = defaultGetTypeOfExpr,
-            llvm::function_ref<Type(TypeRepr *)> getTypeOfTypeRepr = nullptr,
-            llvm::function_ref<Type(KeyPathExpr *E, unsigned index)>
-                getTypeOfKeyPathComponent = defaultGetTypeOfKeyPathComponent)
-    : PrintBase(os, indent, getTypeOfExpr, getTypeOfTypeRepr,
-                getTypeOfKeyPathComponent), Ctx(ctx) { }
+  PrintStmt(
+      raw_ostream &os, const ASTContext *ctx, unsigned indent = 0,
+      bool parseIfNeeded = false,
+      llvm::function_ref<Type(Expr *)> getTypeOfExpr = defaultGetTypeOfExpr,
+      llvm::function_ref<Type(TypeRepr *)> getTypeOfTypeRepr = nullptr,
+      llvm::function_ref<Type(KeyPathExpr *E, unsigned index)>
+          getTypeOfKeyPathComponent = defaultGetTypeOfKeyPathComponent)
+      : PrintBase(os, indent, parseIfNeeded, getTypeOfExpr, getTypeOfTypeRepr,
+                  getTypeOfKeyPathComponent),
+        Ctx(ctx) {}
 
   using PrintBase::printRec;
 
@@ -2255,8 +2280,8 @@ public:
   }
   void visitRegexLiteralExpr(RegexLiteralExpr *E, StringRef label) {
     printCommon(E, "regex_literal_expr", label);
-    
-    printFieldQuoted(E->getRegexText(), "text", LiteralValueColor);
+
+    printFieldQuoted(E->getParsedRegexText(), "text", LiteralValueColor);
     printInitializerField(E->getInitializer(), "initializer");
 
     printFoot();
@@ -3245,6 +3270,17 @@ public:
 
     printFoot();
   }
+
+  void visitTypeValueExpr(TypeValueExpr *E, StringRef label) {
+    printCommon(E, "type_value_expr", label);
+
+    PrintOptions PO;
+    PO.PrintTypesForDebugging = true;
+    printFieldQuoted(Type(E->getParamType()).getString(PO), "param_type",
+                     TypeColor);
+
+    printFoot();
+  }
 };
 
 } // end anonymous namespace
@@ -3259,8 +3295,8 @@ void Expr::dump(raw_ostream &OS, llvm::function_ref<Type(Expr *)> getTypeOfExpr,
                 llvm::function_ref<Type(KeyPathExpr *E, unsigned index)>
                     getTypeOfKeyPathComponent,
                 unsigned Indent) const {
-  PrintExpr(OS, Indent, getTypeOfExpr, getTypeOfTypeRepr,
-            getTypeOfKeyPathComponent)
+  PrintExpr(OS, Indent, /*parseIfNeeded*/ false, getTypeOfExpr,
+            getTypeOfTypeRepr, getTypeOfKeyPathComponent)
       .visit(const_cast<Expr *>(this), "");
 }
 
@@ -3444,12 +3480,6 @@ public:
     printFoot();
   }
 
-  void visitTransferringTypeRepr(TransferringTypeRepr *T, StringRef label) {
-    printCommon("transferring", label);
-    printRec(T->getBase());
-    printFoot();
-  }
-
   void visitSendingTypeRepr(SendingTypeRepr *T, StringRef label) {
     printCommon("sending", label);
     printRec(T->getBase());
@@ -3458,13 +3488,6 @@ public:
 
   void visitCompileTimeConstTypeRepr(CompileTimeConstTypeRepr *T, StringRef label) {
     printCommon("_const", label);
-    printRec(T->getBase());
-    printFoot();
-  }
-
-  void visitResultDependsOnTypeRepr(ResultDependsOnTypeRepr *T,
-                                    StringRef label) {
-    printCommon("_resultDependsOn", label);
     printRec(T->getBase());
     printFoot();
   }
@@ -3550,17 +3573,27 @@ public:
     printFoot();
   }
 
-  void visitLifetimeDependentReturnTypeRepr(LifetimeDependentReturnTypeRepr *T,
-                                            StringRef label) {
+  void visitLifetimeDependentTypeRepr(LifetimeDependentTypeRepr *T,
+                                      StringRef label) {
     printCommon("type_lifetime_dependent_return", label);
-    for (auto &dep : T->getLifetimeDependencies()) {
-      printFieldRaw(
-          [&](raw_ostream &out) {
-            out << " " << dep.getLifetimeDependenceSpecifierString() << " ";
-          },
-          "");
-    }
+
+    printFieldRaw(
+        [&](raw_ostream &out) {
+          out << " " << T->getLifetimeEntry()->getString() << " ";
+        },
+        "");
     printRec(T->getBase());
+    printFoot();
+  }
+
+  void visitIntegerTypeRepr(IntegerTypeRepr *T, StringRef label) {
+    printCommon("type_integer", label);
+
+    if (T->getMinusLoc()) {
+      printCommon("is_negative", label);
+    }
+
+    printFieldQuoted(T->getValue(), "value", IdentifierColor);
     printFoot();
   }
 };
@@ -3571,8 +3604,9 @@ void PrintBase::printRec(Decl *D, StringRef label) {
       printHead("<null decl>", DeclColor, label);
       printFoot();
     } else {
-      PrintDecl(OS, Indent, GetTypeOfExpr, GetTypeOfTypeRepr,
-                GetTypeOfKeyPathComponent).visit(D, label);
+      PrintDecl(OS, Indent, ParseIfNeeded, GetTypeOfExpr, GetTypeOfTypeRepr,
+                GetTypeOfKeyPathComponent)
+          .visit(D, label);
     }
   }, label);
 }
@@ -3582,8 +3616,9 @@ void PrintBase::printRec(Expr *E, StringRef label) {
       printHead("<null expr>", ExprColor, label);
       printFoot();
     } else {
-      PrintExpr(OS, Indent, GetTypeOfExpr, GetTypeOfTypeRepr,
-                GetTypeOfKeyPathComponent).visit(E, label);
+      PrintExpr(OS, Indent, ParseIfNeeded, GetTypeOfExpr, GetTypeOfTypeRepr,
+                GetTypeOfKeyPathComponent)
+          .visit(E, label);
     }
   }, label);
 }
@@ -3593,8 +3628,9 @@ void PrintBase::printRec(Stmt *S, const ASTContext *Ctx, StringRef label) {
       printHead("<null stmt>", ExprColor, label);
       printFoot();
     } else {
-      PrintStmt(OS, Ctx, Indent, GetTypeOfExpr, GetTypeOfTypeRepr,
-                GetTypeOfKeyPathComponent).visit(S, label);
+      PrintStmt(OS, Ctx, Indent, ParseIfNeeded, GetTypeOfExpr,
+                GetTypeOfTypeRepr, GetTypeOfKeyPathComponent)
+          .visit(S, label);
     }
   }, label);
 }
@@ -3604,8 +3640,9 @@ void PrintBase::printRec(TypeRepr *T, StringRef label) {
       printHead("<null typerepr>", TypeReprColor, label);
       printFoot();
     } else {
-      PrintTypeRepr(OS, Indent, GetTypeOfExpr, GetTypeOfTypeRepr,
-                    GetTypeOfKeyPathComponent).visit(T, label);
+      PrintTypeRepr(OS, Indent, ParseIfNeeded, GetTypeOfExpr, GetTypeOfTypeRepr,
+                    GetTypeOfKeyPathComponent)
+          .visit(T, label);
     }
   }, label);
 }
@@ -3615,9 +3652,9 @@ void PrintBase::printRec(const Pattern *P, StringRef label) {
       printHead("<null pattern>", PatternColor, label);
       printFoot();
     } else {
-      PrintPattern(OS, Indent, GetTypeOfExpr, GetTypeOfTypeRepr,
-                   GetTypeOfKeyPathComponent).visit(const_cast<Pattern *>(P),
-                                                    label);
+      PrintPattern(OS, Indent, ParseIfNeeded, GetTypeOfExpr, GetTypeOfTypeRepr,
+                   GetTypeOfKeyPathComponent)
+          .visit(const_cast<Pattern *>(P), label);
     }
   }, label);
 }
@@ -3821,16 +3858,13 @@ public:
 
     auto genericParams = genericSig.getGenericParams();
     auto replacementTypes =
-    static_cast<const SubstitutionMap &>(map).getReplacementTypesBuffer();
+    static_cast<const SubstitutionMap &>(map).getReplacementTypes();
     for (unsigned i : indices(genericParams)) {
       if (style == SubstitutionMap::DumpStyle::Minimal) {
         printFieldRaw([&](raw_ostream &out) {
           genericParams[i]->print(out);
           out << " -> ";
-          if (replacementTypes[i])
-            out << replacementTypes[i];
-          else
-            out << "<unresolved concrete type>";
+          out << replacementTypes[i];
         }, "");
       } else {
         printRecArbitrary([&](StringRef label) {
@@ -3839,8 +3873,7 @@ public:
             genericParams[i]->print(out);
             out << " -> ";
           }, "");
-          if (replacementTypes[i])
-            printRec(replacementTypes[i]);
+          printRec(replacementTypes[i]);
           printFoot();
         });
       }
@@ -3988,8 +4021,8 @@ namespace {
         printFlag("error_expr");
       } else if (auto *DMT = originator.dyn_cast<DependentMemberType *>()) {
         printRec(DMT, "dependent_member_type");
-      } else if (originator.is<PlaceholderTypeRepr *>()) {
-        printFlag("placeholder_type_repr");
+      } else if (originator.is<TypeRepr *>()) {
+        printFlag("type_repr");
       } else {
         assert(false && "unknown originator");
       }
@@ -4027,6 +4060,21 @@ namespace {
     void visitBuiltinVectorType(BuiltinVectorType *T, StringRef label) {
       printCommon("builtin_vector_type", label);
       printField(T->getNumElements(), "num_elements");
+      printRec(T->getElementType());
+      printFoot();
+    }
+    
+    void visitBuiltinUnboundGenericType(BuiltinUnboundGenericType *T,
+                                        StringRef label) {
+      printCommon("builtin_unbound_generic_type", label);
+      printField(T->getBuiltinTypeNameString(), "name");
+      printFoot();
+    }
+    
+    void visitBuiltinFixedArrayType(BuiltinFixedArrayType *T,
+                                    StringRef label) {
+      printCommon("builtin_fixed_array_type", label);
+      printRec(T->getSize());
       printRec(T->getElementType());
       printFoot();
     }
@@ -4088,14 +4136,6 @@ namespace {
       printField(T->getLevel(), "level");
 
       printRec(T->getPackType(), "pack");
-
-      printFoot();
-    }
-
-    void visitParenType(ParenType *T, StringRef label) {
-      printCommon("paren_type", label);
-
-      printRec(T->getUnderlyingType());
 
       printFoot();
     }
@@ -4220,10 +4260,13 @@ namespace {
     void visitOpenedArchetypeType(OpenedArchetypeType *T, StringRef label) {
       printArchetypeCommon(T, "opened_archetype_type", label);
 
-      printFieldQuoted(T->getOpenedExistentialID(), "opened_existential_id");
+      auto *env = T->getGenericEnvironment();
+      printFieldQuoted(env->getOpenedExistentialUUID(), "opened_existential_id");
 
       printArchetypeCommonRec(T);
-      printRec(T->getGenericEnvironment()->getOpenedExistentialType(), "opened_existential");
+      printRec(env->getOpenedExistentialType(), "opened_existential");
+      if (auto subMap = env->getOuterSubstitutions())
+        printRec(subMap, "substitutions");
 
       printFoot();
     }
@@ -4256,9 +4299,21 @@ namespace {
       printCommon("generic_type_param_type", label);
       printField(T->getDepth(), "depth");
       printField(T->getIndex(), "index");
-      if (auto decl = T->getDecl())
-        printFieldQuoted(decl->printRef(), "decl");
-      printFlag(T->isParameterPack(), "pack");
+      if (!T->isCanonical())
+        printFieldQuoted(T->getName(), "name");
+
+      switch (T->getParamKind()) {
+      case GenericTypeParamKind::Type:
+        printField((StringRef)"type", "param_kind");
+        break;
+      case GenericTypeParamKind::Pack:
+        printField((StringRef)"pack", "param_kind");
+        break;
+      case GenericTypeParamKind::Value:
+        printField((StringRef)"value", "param_kind");
+        printRec(T->getValueType(), "value_type");
+      }
+
       printFoot();
     }
 
@@ -4534,6 +4589,13 @@ namespace {
       printFoot();
     }
 
+    void visitIntegerType(IntegerType *T, StringRef label) {
+      printCommon("integer_type", label);
+      printFlag(T->isNegative(), "is_negative");
+      printFieldQuoted(T->getValue(), "value", LiteralValueColor);
+      printFoot();
+    }
+
 #undef TRIVIAL_TYPE_PRINTER
   };
 
@@ -4543,8 +4605,9 @@ namespace {
         printHead("<null type>", DeclColor, label);
         printFoot();
       } else {
-        PrintType(OS, Indent, GetTypeOfExpr, GetTypeOfTypeRepr,
-                  GetTypeOfKeyPathComponent).visit(type, label);
+        PrintType(OS, Indent, ParseIfNeeded, GetTypeOfExpr, GetTypeOfTypeRepr,
+                  GetTypeOfKeyPathComponent)
+            .visit(type, label);
       }
     }, label);
   }
@@ -4671,6 +4734,7 @@ void Requirement::dump(raw_ostream &out) const {
 }
 
 void SILParameterInfo::dump() const {
+  // TODO: Fix LifetimeDependenceInfo printing here.
   print(llvm::errs());
   llvm::errs() << '\n';
 }

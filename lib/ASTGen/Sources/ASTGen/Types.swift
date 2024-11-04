@@ -101,10 +101,6 @@ extension ASTGenVisitor {
       return self.generate(suppressedType: node).asTypeRepr
     case .tupleType(let node):
       return self.generate(tupleType: node).asTypeRepr
-#if RESILIENT_SWIFT_SYNTAX
-    @unknown default:
-      fatalError()
-#endif
     }
     preconditionFailure("isTypeMigrated() mismatch")
   }
@@ -350,7 +346,6 @@ extension BridgedAttributedTypeSpecifier {
     case .__owned: self = .legacyOwned
     case ._const: self = .const
     case .isolated: self = .isolated
-    case ._resultDependsOn: self = .resultDependsOn
     default: return nil
     }
   }
@@ -361,7 +356,8 @@ extension ASTGenVisitor {
     var type = generate(type: node.baseType)
 
     // Handle specifiers.
-    if let specifier = node.specifier {
+    if case .simpleTypeSpecifier(let simpleSpecifier) = node.specifiers.first {
+      let specifier = simpleSpecifier.specifier
       if let kind = BridgedAttributedTypeSpecifier(from: specifier.keywordKind) {
         type =
           BridgedSpecifierTypeRepr.createParsed(

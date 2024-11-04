@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/ApplySite.h"
 #include "swift/SIL/SILBuiltinVisitor.h"
 #include "swift/SIL/SILModule.h"
@@ -84,12 +85,12 @@ CONSTANT_OWNERSHIP_INST(Owned, CopyBlock)
 CONSTANT_OWNERSHIP_INST(Owned, CopyBlockWithoutEscaping)
 CONSTANT_OWNERSHIP_INST(Owned, CopyValue)
 CONSTANT_OWNERSHIP_INST(Owned, ExplicitCopyValue)
-CONSTANT_OWNERSHIP_INST(Owned, MoveValue)
 CONSTANT_OWNERSHIP_INST(Owned, EndCOWMutation)
 CONSTANT_OWNERSHIP_INST(Owned, EndInitLetRef)
 CONSTANT_OWNERSHIP_INST(Owned, BeginDeallocRef)
 CONSTANT_OWNERSHIP_INST(Owned, KeyPath)
 CONSTANT_OWNERSHIP_INST(Owned, InitExistentialValue)
+CONSTANT_OWNERSHIP_INST(Owned, Thunk)
 
 // One would think that these /should/ be unowned. In truth they are owned since
 // objc metatypes do not go through the retain/release fast path. In their
@@ -179,6 +180,7 @@ CONSTANT_OWNERSHIP_INST(None, PackElementGet)
 CONSTANT_OWNERSHIP_INST(None, TuplePackElementAddr)
 CONSTANT_OWNERSHIP_INST(None, Object)
 CONSTANT_OWNERSHIP_INST(None, Vector)
+CONSTANT_OWNERSHIP_INST(None, TypeValue)
 
 #undef CONSTANT_OWNERSHIP_INST
 
@@ -211,7 +213,9 @@ CONSTANT_OR_NONE_OWNERSHIP_INST(Guaranteed, OpenExistentialBoxValue)
 // value).
 CONSTANT_OR_NONE_OWNERSHIP_INST(Owned, MarkUninitialized)
 
-// unchecked_bitwise_cast is a bitwise copy. It produces a trivial or unowned
+// In raw SIL, a MoveValue delimits the scope of trivial variables.
+CONSTANT_OR_NONE_OWNERSHIP_INST(Owned, MoveValue)
+
 // result.
 //
 // If the operand is nontrivial and the result is trivial, then it is the
@@ -601,6 +605,8 @@ CONSTANT_OWNERSHIP_BUILTIN(None, TSanInoutAccess)
 CONSTANT_OWNERSHIP_BUILTIN(None, PoundAssert)
 CONSTANT_OWNERSHIP_BUILTIN(None, TypePtrAuthDiscriminator)
 CONSTANT_OWNERSHIP_BUILTIN(None, TargetOSVersionAtLeast)
+CONSTANT_OWNERSHIP_BUILTIN(None, TargetVariantOSVersionAtLeast)
+CONSTANT_OWNERSHIP_BUILTIN(None, TargetOSVersionOrVariantOSVersionAtLeast)
 CONSTANT_OWNERSHIP_BUILTIN(None, GlobalStringTablePointer)
 CONSTANT_OWNERSHIP_BUILTIN(None, GetCurrentAsyncTask)
 CONSTANT_OWNERSHIP_BUILTIN(None, CancelAsyncTask)
@@ -630,6 +636,8 @@ CONSTANT_OWNERSHIP_BUILTIN(None, CreateTaskGroup)
 CONSTANT_OWNERSHIP_BUILTIN(None, CreateTaskGroupWithFlags)
 CONSTANT_OWNERSHIP_BUILTIN(None, DestroyTaskGroup)
 CONSTANT_OWNERSHIP_BUILTIN(None, TaskRunInline)
+CONSTANT_OWNERSHIP_BUILTIN(Owned, FlowSensitiveSelfIsolation)
+CONSTANT_OWNERSHIP_BUILTIN(Owned, FlowSensitiveDistributedSelfIsolation)
 CONSTANT_OWNERSHIP_BUILTIN(None, GetEnumTag)
 CONSTANT_OWNERSHIP_BUILTIN(None, InjectEnumTag)
 CONSTANT_OWNERSHIP_BUILTIN(Owned, DistributedActorAsAnyActor)
@@ -720,7 +728,7 @@ namespace swift::test {
 // - SILValue: value
 // Dumps:
 // - message
-static FunctionTest GetOwnershipKind("get-ownership-kind", [](auto &function,
+static FunctionTest GetOwnershipKind("get_ownership_kind", [](auto &function,
                                                               auto &arguments,
                                                               auto &test) {
   SILValue value = arguments.takeValue();

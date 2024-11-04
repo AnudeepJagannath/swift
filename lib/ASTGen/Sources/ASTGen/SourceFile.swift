@@ -12,6 +12,7 @@
 
 import ASTBridging
 import SwiftDiagnostics
+import SwiftIfConfig
 @_spi(ExperimentalLanguageFeatures) import SwiftParser
 import SwiftParserDiagnostics
 import SwiftSyntax
@@ -24,10 +25,10 @@ public struct ExportedSourceFile {
   public let buffer: UnsafeBufferPointer<UInt8>
 
   /// The name of the enclosing module.
-  let moduleName: String
+  public let moduleName: String
 
   /// The name of the source file being parsed.
-  let fileName: String
+  public let fileName: String
 
   /// The syntax tree for the complete source file.
   public let syntax: SourceFileSyntax
@@ -35,7 +36,12 @@ public struct ExportedSourceFile {
   /// A source location converter to convert `AbsolutePosition`s in `syntax` to line/column locations.
   ///
   /// Cached so we don't need to re-build the line table every time we need to convert a position.
-  let sourceLocationConverter: SourceLocationConverter
+  public let sourceLocationConverter: SourceLocationConverter
+
+  /// Configured regions for this source file.
+  ///
+  /// This is a cached value; access via configuredRegions(astContext:).
+  var _configuredRegions: ConfiguredRegions? = nil
 
   public func position(of location: BridgedSourceLoc) -> AbsolutePosition? {
     let sourceFileBaseAddress = UnsafeRawPointer(buffer.baseAddress!)
@@ -43,6 +49,12 @@ public struct ExportedSourceFile {
       return nil
     }
     return AbsolutePosition(utf8Offset: opaqueValue - sourceFileBaseAddress)
+  }
+
+  /// Retrieve a bridged source location for the given absolute position in
+  /// this source file.
+  public func sourceLoc(at position: AbsolutePosition) -> BridgedSourceLoc {
+    BridgedSourceLoc(at: position, in: buffer)
   }
 }
 
@@ -57,11 +69,12 @@ extension Parser.ExperimentalFeatures {
       }
     }
 
+    mapFeature(.ReferenceBindings, to: .referenceBindings)
     mapFeature(.ThenStatements, to: .thenStatements)
     mapFeature(.DoExpressions, to: .doExpressions)
     mapFeature(.NonescapableTypes, to: .nonescapableTypes)
-    mapFeature(.TransferringArgsAndResults, to: .transferringArgsAndResults)
-    mapFeature(.SendingArgsAndResults, to: .sendingArgsAndResults)
+    mapFeature(.TrailingComma, to: .trailingComma)
+    mapFeature(.CoroutineAccessors, to: .coroutineAccessors)
   }
 }
 
@@ -136,20 +149,10 @@ public func roundTripCheck(
   }
 }
 
-extension Syntax {
-  /// Whether this syntax node is or is enclosed within a #if.
-  fileprivate var isInIfConfig: Bool {
-    if self.is(IfConfigDeclSyntax.self) {
-      return true
-    }
-
-    return parent?.isInIfConfig ?? false
-  }
-}
-
 /// Emit diagnostics within the given source file.
 @_cdecl("swift_ASTGen_emitParserDiagnostics")
 public func emitParserDiagnostics(
+  ctx: BridgedASTContext,
   diagEnginePtr: UnsafeMutableRawPointer,
   sourceFilePtr: UnsafeMutablePointer<UInt8>,
   emitOnlyErrors: CInt,
@@ -161,16 +164,14 @@ public func emitParserDiagnostics(
   ) { sourceFile in
     var anyDiags = false
 
-    let diags = ParseDiagnosticsGenerator.diagnostics(
-      for: sourceFile.pointee.syntax
-    )
+    let sourceFileSyntax = sourceFile.pointee.syntax
+    let diags = ParseDiagnosticsGenerator.diagnostics(for: sourceFileSyntax)
 
     let diagnosticEngine = BridgedDiagnosticEngine(raw: diagEnginePtr)
+    let configuredRegions = sourceFile.pointee.configuredRegions(astContext: ctx)
     for diag in diags {
-      // Skip over diagnostics within #if, because we don't know whether
-      // we are in an active region or not.
-      // FIXME: This heuristic could be improved.
-      if diag.node.isInIfConfig {
+      // If the diagnostic is in an unparsed #if region, don't emit it.
+      if configuredRegions.isActive(diag.node) == .unparsed {
         continue
       }
 
@@ -198,4 +199,65 @@ public func emitParserDiagnostics(
 
     return anyDiags ? 1 : 0
   }
+}
+
+/// Retrieve a syntax node in the given source file, with the given type.
+public func findSyntaxNodeInSourceFile<Node: SyntaxProtocol>(
+  sourceFilePtr: UnsafeRawPointer,
+  sourceLocationPtr: UnsafePointer<UInt8>?,
+  type: Node.Type,
+  wantOutermost: Bool = false
+) -> Node? {
+  guard let sourceLocationPtr = sourceLocationPtr else {
+    return nil
+  }
+
+  let sourceFilePtr = sourceFilePtr.assumingMemoryBound(to: ExportedSourceFile.self)
+
+  // Find the offset.
+  let buffer = sourceFilePtr.pointee.buffer
+  let offset = sourceLocationPtr - buffer.baseAddress!
+  if offset < 0 || offset >= buffer.count {
+    print("source location isn't inside this buffer")
+    return nil
+  }
+
+  // Find the token at that offset.
+  let sf = sourceFilePtr.pointee.syntax
+  guard let token = sf.token(at: AbsolutePosition(utf8Offset: offset)) else {
+    print("couldn't find token at offset \(offset)")
+    return nil
+  }
+
+  var currentSyntax = Syntax(token)
+  var resultSyntax: Node? = nil
+  while let parentSyntax = currentSyntax.parent {
+    currentSyntax = parentSyntax
+    if let typedParent = currentSyntax.as(type) {
+      resultSyntax = typedParent
+      break
+    }
+  }
+
+  // If we didn't find anything, complain and fail.
+  guard var resultSyntax else {
+    print("unable to find node: \(token.debugDescription)")
+    return nil
+  }
+
+  // If we want the outermost node, keep looking.
+  // E.g. for 'foo.bar' we want the member ref expression instead of the
+  // identifier expression.
+  if wantOutermost {
+    while let parentSyntax = currentSyntax.parent,
+      parentSyntax.position == resultSyntax.position
+    {
+      currentSyntax = parentSyntax
+      if let typedParent = currentSyntax.as(type) {
+        resultSyntax = typedParent
+      }
+    }
+  }
+
+  return resultSyntax
 }

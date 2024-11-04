@@ -51,8 +51,12 @@ private:
   scanFilesystemForSwiftModuleDependency(Identifier moduleName,
                                          const ModuleDependenciesCache &cache);
 
+  // Worker-specific instance of CompilerInvocation
+  std::unique_ptr<CompilerInvocation> workerCompilerInvocation;
+  // Worker-specific instance of ASTContext
+  std::unique_ptr<ASTContext> workerASTContext;
   // An AST delegate for interface scanning.
-  std::unique_ptr<InterfaceSubContextDelegateImpl> ScanningASTDelegate;
+  std::unique_ptr<InterfaceSubContextDelegateImpl> scanningASTDelegate;
   // The Clang scanner tool used by this worker.
   clang::tooling::dependencies::DependencyScanningTool clangScanningTool;
   // Swift and Clang module loaders acting as scanners.
@@ -145,7 +149,7 @@ private:
   /// The available pool of workers for filesystem module search
   unsigned NumThreads;
   std::list<std::unique_ptr<ModuleDependencyScanningWorker>> Workers;
-  llvm::ThreadPool ScanningThreadPool;
+  llvm::StdThreadPool ScanningThreadPool;
   /// Protect worker access.
   std::mutex WorkersLock;
 };

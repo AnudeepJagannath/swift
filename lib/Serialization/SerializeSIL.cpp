@@ -19,6 +19,7 @@
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/Module.h"
 #include "swift/AST/ProtocolConformance.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/CFG.h"
 #include "swift/SIL/PrettyStackTrace.h"
 #include "swift/SIL/SILArgument.h"
@@ -147,12 +148,12 @@ namespace {
 
     void EmitKey(raw_ostream &out, key_type_ref key, unsigned len) {
       uint32_t keyID = S.addUniquedStringRef(key);
-      endian::write<uint32_t>(out, keyID, little);
+      endian::write<uint32_t>(out, keyID, llvm::endianness::little);
     }
 
     void EmitData(raw_ostream &out, key_type_ref key, data_type_ref data,
                   unsigned len) {
-      endian::write<uint32_t>(out, data, little);
+      endian::write<uint32_t>(out, data, llvm::endianness::little);
     }
   };
 
@@ -278,7 +279,7 @@ namespace {
     void writeSILGlobalVar(const SILGlobalVariable &g);
     void writeSILWitnessTable(const SILWitnessTable &wt);
     void writeSILWitnessTableEntry(const SILWitnessTable::Entry &entry,
-                                   std::optional<SerializedKind_t> serializedKind = std::nullopt);
+                                   SerializedKind_t serializedKind);
     void writeSILDefaultWitnessTable(const SILDefaultWitnessTable &wt);
     void
     writeSILDifferentiabilityWitness(const SILDifferentiabilityWitness &dw);
@@ -376,8 +377,7 @@ void SILSerializer::addReferencedSILFunction(const SILFunction *F,
   }
 
   if (F->getLinkage() == SILLinkage::Shared) {
-    assert(!F->isNotSerialized() ||
-           F->hasForeignBody());
+    assert(F->isAnySerialized() || F->hasForeignBody());
 
     FuncsToEmit[F] = false;
     functionWorklist.push_back(F);
@@ -495,7 +495,6 @@ void SILSerializer::writeSILFunction(const SILFunction &F, bool DeclOnly) {
   }
 
   unsigned numAttrs = NoBody ? 0 : F.getSpecializeAttrs().size();
-  // pcmo TODO: check if package-cmo is enabled
   auto resilience = F.getModule().getSwiftModule()->getResilienceStrategy();
   bool serializeDerivedEffects = (resilience != ResilienceStrategy::Resilient) &&
                                  !F.hasSemanticsAttr("optimize.no.crossmodule");
@@ -510,7 +509,7 @@ void SILSerializer::writeSILFunction(const SILFunction &F, bool DeclOnly) {
   std::optional<llvm::VersionTuple> available;
   auto availability = F.getAvailabilityForLinkage();
   if (!availability.isAlwaysAvailable()) {
-    available = availability.getOSVersion().getLowerEndpoint();
+    available = availability.getRawMinimumVersion();
   }
   ENCODE_VER_TUPLE(available, available)
 
@@ -568,7 +567,7 @@ void SILSerializer::writeSILFunction(const SILFunction &F, bool DeclOnly) {
     }
     auto availability = SA->getAvailability();
     if (!availability.isAlwaysAvailable()) {
-      available = availability.getOSVersion().getLowerEndpoint();
+      available = availability.getRawMinimumVersion();
     }
     ENCODE_VER_TUPLE(available, available)
 
@@ -1037,9 +1036,9 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   }
   case SILInstructionKind::DeallocBoxInst: {
     auto DBI = cast<DeallocBoxInst>(&SI);
-    writeOneTypeOneOperandLayout(DBI->getKind(), 0,
-                                 DBI->getOperand()->getType(),
-                                 DBI->getOperand());
+    unsigned Attr = unsigned(DBI->isDeadEnd());
+    writeOneTypeOneOperandLayout(
+        DBI->getKind(), Attr, DBI->getOperand()->getType(), DBI->getOperand());
     break;
   }
   case SILInstructionKind::DeallocExistentialBoxInst: {
@@ -1544,6 +1543,7 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
   case SILInstructionKind::ValueToBridgeObjectInst:
   case SILInstructionKind::FixLifetimeInst:
   case SILInstructionKind::EndLifetimeInst:
+  case SILInstructionKind::ExtendLifetimeInst:
   case SILInstructionKind::CopyBlockInst:
   case SILInstructionKind::StrongReleaseInst:
   case SILInstructionKind::StrongRetainInst:
@@ -1575,7 +1575,7 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
     } else if (auto *HTE = dyn_cast<HopToExecutorInst>(&SI)) {
       Attr = HTE->isMandatory();
     } else if (auto *DVI = dyn_cast<DestroyValueInst>(&SI)) {
-      Attr = DVI->poisonRefs();
+      Attr = unsigned(DVI->poisonRefs()) | (unsigned(DVI->isDeadEnd()) << 1);
     } else if (auto *BCMI = dyn_cast<BeginCOWMutationInst>(&SI)) {
       Attr = BCMI->isNative();
     } else if (auto *ECMI = dyn_cast<EndCOWMutationInst>(&SI)) {
@@ -1602,6 +1602,8 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
     } else if (auto *I = dyn_cast<CopyableToMoveOnlyWrapperValueInst>(&SI)) {
       Attr = I->getForwardingOwnershipKind() == OwnershipKind::Owned ? true
                                                                      : false;
+    } else if (auto *LB = dyn_cast<LoadBorrowInst>(&SI)) {
+      Attr = LB->isUnchecked();
     }
     writeOneOperandLayout(SI.getKind(), Attr, SI.getOperand(0));
     break;
@@ -1971,6 +1973,20 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
                        gaca.getFormalResumeType());
     break;
   }
+  case SILInstructionKind::ThunkInst: {
+    auto &ti = cast<ThunkInst>(SI);
+    auto operandType = ti.getOperand()->getType();
+    auto operandTypeRef = S.addTypeRef(operandType.getRawASTType());
+    auto operandRef = addValueRef(ti.getOperand());
+
+    SILThunkLayout::emitRecord(
+        Out, ScratchRecord, SILAbbrCodes[SILThunkLayout::Code],
+        unsigned(ti.getThunkKind()), operandTypeRef,
+        unsigned(operandType.getCategory()), operandRef,
+        S.addSubstitutionMapRef(ti.getSubstitutionMap()));
+    break;
+  }
+
   // Conversion instructions (and others of similar form).
 #define LOADABLE_REF_STORAGE(Name, ...) \
   case SILInstructionKind::RefTo##Name##Inst: \
@@ -2410,6 +2426,27 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
         (unsigned)TI->getType().getCategory(), ListOfValues);
     break;
   }
+  case SILInstructionKind::MergeIsolationRegionInst: {
+    const auto *mir = cast<MergeIsolationRegionInst>(&SI);
+    SmallVector<uint64_t, 4> ListOfValues;
+    auto getValue = [&](SILValue value) -> uint64_t {
+      uint32_t result = addValueRef(value);
+      // Set the top bit if we are an address. We only transfer raw ast types,
+      // so we lose this bit otherwise. This is safe since all of our IDs are
+      // guaranteed to be 31 bits meaning we can always take the top bit.
+      result |= value->getType().isObject() ? 0 : 0x80000000;
+      return result;
+    };
+
+    for (auto value : mir->getArguments()) {
+      ListOfValues.push_back(getValue(value));
+      ListOfValues.push_back(S.addTypeRef(value->getType().getRawASTType()));
+    }
+    unsigned abbrCode = SILAbbrCodes[SILValuesLayout::Code];
+    SILValuesLayout::emitRecord(Out, ScratchRecord, abbrCode,
+                                (unsigned)SI.getKind(), ListOfValues);
+    break;
+  }
   case SILInstructionKind::TupleAddrConstructorInst: {
     // Format: a type followed by a list of values. A value is expressed by
     // 2 IDs: ValueID, ValueResultNumber.
@@ -2764,6 +2801,18 @@ void SILSerializer::writeSILInstruction(const SILInstruction &SI) {
         S.addDeclRef(decl), functionRefs);
     break;
   }
+
+  case SILInstructionKind::TypeValueInst: {
+    auto *tvi = cast<TypeValueInst>(&SI);
+    auto valueTy = tvi->getType();
+
+    SILTypeValueLayout::emitRecord(Out, ScratchRecord,
+                                   SILAbbrCodes[SILTypeValueLayout::Code],
+                                   S.addTypeRef(valueTy.getRawASTType()),
+                                   (unsigned)valueTy.getCategory(),
+                                   S.addTypeRef(tvi->getParamType()));
+    break;
+  }
   }
   // Non-void values get registered in the value table.
   for (auto result : SI.getResults()) {
@@ -2797,7 +2846,7 @@ static void writeIndexTable(Serializer &S,
 
     llvm::raw_svector_ostream blobStream(hashTableBlob);
     // Make sure that no bucket is at offset 0.
-    endian::write<uint32_t>(blobStream, 0, little);
+    endian::write<uint32_t>(blobStream, 0, llvm::endianness::little);
     tableOffset = generator.Emit(blobStream, tableInfo);
   }
   SmallVector<uint64_t, 8> scratch;
@@ -2879,7 +2928,7 @@ void SILSerializer::writeSILGlobalVar(const SILGlobalVariable &g) {
                                  TyID, dID);
 
   // Don't emit the initializer instructions if not marked as "serialized".
-  if (g.isNotSerialized())
+  if (!g.isAnySerialized())
     return;
 
   ValueIDs.clear();
@@ -2926,8 +2975,8 @@ void SILSerializer::writeSILVTable(const SILVTable &vt) {
     SILFunction *impl = entry.getImplementation();
 
     if (ShouldSerializeAll ||
-        impl->hasValidLinkageForFragileRef(vt.getSerializedKind(),
-                                           /*assumeFragileCaller*/ false)) {
+        (vt.isAnySerialized() &&
+         impl->hasValidLinkageForFragileRef(vt.getSerializedKind()))) {
       handleSILDeclRef(S, entry.getMethod(), ListOfValues);
       addReferencedSILFunction(impl, true);
       // Each entry is a pair of SILDeclRef and SILFunction.
@@ -2950,7 +2999,11 @@ void SILSerializer::writeSILMoveOnlyDeinit(const SILMoveOnlyDeinit &deinit) {
     return;
 
   SILFunction *impl = deinit.getImplementation();
-  if (!ShouldSerializeAll && !impl->hasValidLinkageForFragileRef())
+  if (!ShouldSerializeAll &&
+      // Package CMO for MoveOnlyDeinit is not supported so
+      // pass the IsSerialized argument to keep the behavior
+      // consistent with or without the optimization.
+      !impl->hasValidLinkageForFragileRef(IsSerialized))
     return;
 
   // Use the mangled name of the class as a key to distinguish between classes
@@ -3026,7 +3079,7 @@ void SILSerializer::writeSILWitnessTable(const SILWitnessTable &wt) {
 
 void SILSerializer::writeSILWitnessTableEntry(
                                         const SILWitnessTable::Entry &entry,
-                                        std::optional<SerializedKind_t> serializedKind) {
+                                        SerializedKind_t serializedKind) {
   if (entry.getKind() == SILWitnessTable::BaseProtocol) {
     auto &baseWitness = entry.getBaseProtocolWitness();
 
@@ -3039,8 +3092,8 @@ void SILSerializer::writeSILWitnessTableEntry(
     return;
   }
 
-  if (entry.getKind() == SILWitnessTable::AssociatedTypeProtocol) {
-    auto &assoc = entry.getAssociatedTypeProtocolWitness();
+  if (entry.getKind() == SILWitnessTable::AssociatedConformance) {
+    auto &assoc = entry.getAssociatedConformanceWitness();
 
     auto requirementID = S.addTypeRef(assoc.Requirement);
     auto protocolID = S.addDeclRef(assoc.Protocol);
@@ -3068,8 +3121,8 @@ void SILSerializer::writeSILWitnessTableEntry(
   IdentifierID witnessID = 0;
   SILFunction *witness = methodWitness.Witness;
   if (witness &&
-      witness->hasValidLinkageForFragileRef(serializedKind,
-                                            /*assumeFragileCaller*/ false)) {
+      serializedKind != IsNotSerialized &&
+      witness->hasValidLinkageForFragileRef(serializedKind)) {
     addReferencedSILFunction(witness, true);
     witnessID = S.addUniquedStringRef(witness->getName());
   }
@@ -3102,7 +3155,11 @@ writeSILDefaultWitnessTable(const SILDefaultWitnessTable &wt) {
           SILAbbrCodes[DefaultWitnessTableNoEntryLayout::Code]);
       continue;
     }
-    writeSILWitnessTableEntry(entry);
+
+    // Default witness table is not serialized. The IsSerialized
+    // argument is passed here to call hasValidLinkageForFragileRef
+    // to keep the behavior consistent with or without any optimizations.
+    writeSILWitnessTableEntry(entry, IsSerialized);
   }
 }
 
@@ -3174,8 +3231,7 @@ bool SILSerializer::shouldEmitFunctionBody(const SILFunction *F,
   // If F is serialized, we should always emit its body.
   // Shared functions are only serialized if they are referenced from another
   // serialized function. This is handled in `addReferencedSILFunction`.
-  if (!F->isNotSerialized() &&
-      !hasSharedVisibility(F->getLinkage()))
+  if (F->isAnySerialized() && !hasSharedVisibility(F->getLinkage()))
     return true;
 
   return false;
@@ -3196,6 +3252,7 @@ void SILSerializer::writeSILBlock(const SILModule *SILMod) {
   registerSILAbbr<SILOneTypeValuesLayout>();
   registerSILAbbr<SILOneTypeOwnershipValuesLayout>();
   registerSILAbbr<SILOneTypeValuesCategoriesLayout>();
+  registerSILAbbr<SILValuesLayout>();
   registerSILAbbr<SILTwoOperandsLayout>();
   registerSILAbbr<SILTwoOperandsExtraAttributeLayout>();
   registerSILAbbr<SILTailAddrLayout>();
@@ -3215,6 +3272,8 @@ void SILSerializer::writeSILBlock(const SILModule *SILMod) {
   registerSILAbbr<SILOpenPackElementLayout>();
   registerSILAbbr<SILPackElementGetLayout>();
   registerSILAbbr<SILPackElementSetLayout>();
+  registerSILAbbr<SILTypeValueLayout>();
+  registerSILAbbr<SILThunkLayout>();
 
   registerSILAbbr<VTableLayout>();
   registerSILAbbr<VTableEntryLayout>();
@@ -3237,13 +3296,13 @@ void SILSerializer::writeSILBlock(const SILModule *SILMod) {
   // serialize everything.
   // FIXME: Resilience: could write out vtable for fragile classes.
   for (const auto &vt : SILMod->getVTables()) {
-    if ((ShouldSerializeAll || !vt->isNotSerialized()) &&
+    if ((ShouldSerializeAll || vt->isAnySerialized()) &&
         SILMod->shouldSerializeEntitiesAssociatedWithDeclContext(vt->getClass()))
       writeSILVTable(*vt);
   }
 
   for (const auto &deinit : SILMod->getMoveOnlyDeinits()) {
-    if ((ShouldSerializeAll || !deinit->isNotSerialized()) &&
+    if ((ShouldSerializeAll || deinit->isAnySerialized()) &&
         SILMod->shouldSerializeEntitiesAssociatedWithDeclContext(
             deinit->getNominalDecl()))
       writeSILMoveOnlyDeinit(*deinit);
@@ -3251,7 +3310,7 @@ void SILSerializer::writeSILBlock(const SILModule *SILMod) {
 
   // Write out property descriptors.
   for (const SILProperty &prop : SILMod->getPropertyList()) {
-    if ((ShouldSerializeAll || !prop.isNotSerialized()) &&
+    if ((ShouldSerializeAll || prop.isAnySerialized()) &&
         SILMod->shouldSerializeEntitiesAssociatedWithDeclContext(
                                      prop.getDecl()->getInnermostDeclContext()))
       writeSILProperty(prop);
@@ -3259,7 +3318,7 @@ void SILSerializer::writeSILBlock(const SILModule *SILMod) {
 
   // Write out fragile WitnessTables.
   for (const SILWitnessTable &wt : SILMod->getWitnessTables()) {
-    if ((ShouldSerializeAll || !wt.isNotSerialized()) &&
+    if ((ShouldSerializeAll || wt.isAnySerialized()) &&
         SILMod->shouldSerializeEntitiesAssociatedWithDeclContext(
                                          wt.getConformance()->getDeclContext()))
       writeSILWitnessTable(wt);
@@ -3276,7 +3335,7 @@ void SILSerializer::writeSILBlock(const SILModule *SILMod) {
 
   // Add global variables that must be emitted to the list.
   for (const SILGlobalVariable &g : SILMod->getSILGlobals()) {
-    if (!g.isNotSerialized() || ShouldSerializeAll)
+    if (g.isAnySerialized() || ShouldSerializeAll)
       addReferencedGlobalVariable(&g);
   }
 
@@ -3322,7 +3381,6 @@ void SILSerializer::writeSILBlock(const SILModule *SILMod) {
 
   // Now write function declarations for every function we've
   // emitted a reference to without emitting a function body for.
-  // pcmo TODO: check if package-cmo is enabled
   auto resilience = SILMod->getSwiftModule()->getResilienceStrategy();
   for (const SILFunction &F : *SILMod) {
     auto iter = FuncsToEmit.find(&F);

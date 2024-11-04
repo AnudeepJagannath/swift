@@ -5,6 +5,8 @@
 
 // REQUIRES: swift_in_compiler
 // REQUIRES: OS=macosx || OS=linux-gnu
+// REQUIRES: volatile
+// REQUIRES: swift_feature_Embedded
 
 import _Volatile
 

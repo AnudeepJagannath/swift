@@ -183,7 +183,7 @@ public:
   SILBuilder(SILBasicBlock *BB, SILBuilderContext &C,
              const SILDebugScope *DS = nullptr)
       : TempContext(C.getModule()), C(C), F(BB->getParent()) {
-    assert(DS && "block has no debug scope");
+    ASSERT(DS && "block has no debug scope");
     setInsertionPoint(BB);
     if (DS)
       setCurrentDebugScope(DS);
@@ -197,7 +197,7 @@ public:
   void setSILConventions(SILModuleConventions silConv) { C.silConv = silConv; }
 
   SILFunction &getFunction() const {
-    assert(F && "cannot create this instruction without a function context");
+    ASSERT(F && "cannot create this instruction without a function context");
     return *F;
   }
 
@@ -215,6 +215,11 @@ public:
 
   SILBuilderContext &getBuilderContext() const { return C; }
   SILModule &getModule() const { return C.Module; }
+  SILInstructionContext getInstructionContext() const {
+    if (!F)
+      return SILInstructionContext::forModule(getModule());
+    return SILInstructionContext::forFunction(*F);
+  }
   ASTContext &getASTContext() const { return getModule().getASTContext(); }
   const Lowering::TypeLowering &getTypeLowering(SILType T) const {
 
@@ -286,7 +291,7 @@ public:
   SILBasicBlock *getInsertionBB() const { return BB; }
   SILBasicBlock::iterator getInsertionPoint() const { return InsertPt; }
   SILLocation getInsertionPointLoc() const {
-    assert(!insertingAtEndOfBlock());
+    ASSERT(!insertingAtEndOfBlock());
     return InsertPt->getLoc();
   }
 
@@ -294,7 +299,7 @@ public:
   /// of the current basic block.  False if we're inserting before an existing
   /// instruction.
   bool insertingAtEndOfBlock() const {
-    assert(hasValidInsertionPoint() &&
+    ASSERT(hasValidInsertionPoint() &&
            "Must have insertion point to ask about it");
     return InsertPt == BB->end();
   }
@@ -307,13 +312,13 @@ public:
   void setInsertionPoint(SILBasicBlock *BB, SILBasicBlock::iterator insertPt) {
     this->BB = BB;
     this->InsertPt = insertPt;
-    assert(insertPt == BB->end() || insertPt->getParent() == BB);
+    ASSERT(insertPt == BB->end() || insertPt->getParent() == BB);
   }
 
   /// setInsertionPoint - Set the insertion point to insert before the specified
   /// instruction.
   void setInsertionPoint(SILInstruction *I) {
-    assert(I && "can't set insertion point to a null instruction");
+    ASSERT(I && "can't set insertion point to a null instruction");
     setInsertionPoint(I->getParent(), I->getIterator());
   }
 
@@ -326,7 +331,7 @@ public:
   /// setInsertionPoint - Set the insertion point to insert at the end of the
   /// specified block.
   void setInsertionPoint(SILBasicBlock *BB) {
-    assert(BB && "can't set insertion point to a null basic block");
+    ASSERT(BB && "can't set insertion point to a null basic block");
     setInsertionPoint(BB, BB->end());
   }
 
@@ -369,7 +374,7 @@ public:
   ///
   /// Assumes that no insertion point is currently active.
   void emitBlock(SILBasicBlock *BB) {
-    assert(!hasValidInsertionPoint());
+    ASSERT(!hasValidInsertionPoint());
     setInsertionPoint(BB);
   }
 
@@ -418,7 +423,7 @@ public:
     Loc.markAsPrologue();
 #ifndef NDEBUG
     if (dyn_cast_or_null<VarDecl>(Loc.getAsASTNode<Decl>()))
-      assert((skipVarDeclAssert || Loc.isSynthesizedAST() || Var) &&
+      ASSERT((skipVarDeclAssert || Loc.isSynthesizedAST() || Var) &&
              "location is a VarDecl, but SILDebugVariable is empty");
 #else
     (void)skipVarDeclAssert;
@@ -462,7 +467,7 @@ public:
                                ArrayRef<SILValue> ElementCountOperands) {
     // AllocRefInsts expand to function calls and can therefore not be
     // counted towards the function prologue.
-    assert(!Loc.isInPrologue());
+    ASSERT(!Loc.isInPrologue());
     return insert(AllocRefInst::create(getSILDebugLocation(Loc), getFunction(),
                                        ObjectType, objc, canAllocOnStack, isBare,
                                        ElementTypes, ElementCountOperands));
@@ -475,7 +480,7 @@ public:
                                     ArrayRef<SILValue> ElementCountOperands) {
     // AllocRefDynamicInsts expand to function calls and can therefore
     // not be counted towards the function prologue.
-    assert(!Loc.isInPrologue());
+    ASSERT(!Loc.isInPrologue());
     return insert(AllocRefDynamicInst::create(
         getSILDebugLocation(Loc), *F, operand, type, objc, canAllocOnStack,
         ElementTypes, ElementCountOperands));
@@ -515,7 +520,7 @@ public:
 #if defined(NDEBUG)
     (void) skipVarDeclAssert;
 #endif
-    assert((skipVarDeclAssert ||
+    ASSERT((skipVarDeclAssert ||
             !dyn_cast_or_null<VarDecl>(Loc.getAsASTNode<Decl>()) || Var) &&
            "location is a VarDecl, but SILDebugVariable is empty");
     return insert(AllocBoxInst::create(
@@ -555,10 +560,13 @@ public:
       ArrayRef<SILValue> args, SILBasicBlock *normalBB, SILBasicBlock *errorBB,
       ApplyOptions options = ApplyOptions(),
       const GenericSpecializationInformation *specializationInfo = nullptr,
-      std::optional<ApplyIsolationCrossing> isolationCrossing = std::nullopt) {
+      std::optional<ApplyIsolationCrossing> isolationCrossing = std::nullopt,
+      ProfileCounter normalCount = ProfileCounter(),
+      ProfileCounter errorCount = ProfileCounter()) {
     return insertTerminator(TryApplyInst::create(
         getSILDebugLocation(loc), callee, subs, args, normalBB, errorBB,
-        options, *F, specializationInfo, isolationCrossing));
+        options, *F, specializationInfo, isolationCrossing,
+        normalCount, errorCount));
   }
 
   PartialApplyInst *createPartialApply(
@@ -569,7 +577,7 @@ public:
       PartialApplyInst::OnStackKind OnStack =
           PartialApplyInst::OnStackKind::NotOnStack,
       const GenericSpecializationInformation *SpecializationInfo = nullptr) {
-    assert(OnStack == PartialApplyInst::OnStackKind::OnStack ||
+    ASSERT(OnStack == PartialApplyInst::OnStackKind::OnStack ||
            llvm::all_of(Args,
                         [](SILValue value) {
                           return value->getOwnershipKind().isCompatibleWith(
@@ -604,8 +612,8 @@ public:
   BuiltinInst *createBuiltin(SILLocation Loc, Identifier Name, SILType ResultTy,
                              SubstitutionMap Subs,
                              ArrayRef<SILValue> Args) {
-    return insert(BuiltinInst::create(getSILDebugLocation(Loc), Name,
-                                      ResultTy, Subs, Args, getModule()));
+    return insert(BuiltinInst::create(getSILDebugLocation(Loc), Name, ResultTy,
+                                      Subs, Args, getInstructionContext()));
   }
 
   /// Create a binary function with the signature: OpdTy, OpdTy -> ResultTy.
@@ -618,7 +626,7 @@ public:
     appendOperandTypeName(OpdTy, NameStr);
     auto Ident = C.getIdentifier(NameStr);
     return insert(BuiltinInst::create(getSILDebugLocation(Loc), Ident, ResultTy,
-                                      {}, Args, getModule()));
+                                      {}, Args, getInstructionContext()));
   }
 
   // Create a binary function with the signature: OpdTy1, OpdTy2 -> ResultTy.
@@ -631,8 +639,8 @@ public:
     appendOperandTypeName(OpdTy1, NameStr);
     appendOperandTypeName(OpdTy2, NameStr);
     auto Ident = C.getIdentifier(NameStr);
-    return insert(BuiltinInst::create(getSILDebugLocation(Loc), Ident,
-                                      ResultTy, {}, Args, getModule()));
+    return insert(BuiltinInst::create(getSILDebugLocation(Loc), Ident, ResultTy,
+                                      {}, Args, getInstructionContext()));
   }
 
   /// Create a binary function with the signature:
@@ -640,10 +648,10 @@ public:
   BuiltinInst *
   createBuiltinBinaryFunctionWithOverflow(SILLocation Loc, StringRef Name,
                                           ArrayRef<SILValue> Args) {
-    assert(Args.size() == 3 && "Need three arguments");
-    assert(Args[0]->getType() == Args[1]->getType() &&
+    ASSERT(Args.size() == 3 && "Need three arguments");
+    ASSERT(Args[0]->getType() == Args[1]->getType() &&
            "Binary operands must match");
-    assert(Args[2]->getType().is<BuiltinIntegerType>() &&
+    ASSERT(Args[2]->getType().is<BuiltinIntegerType>() &&
            Args[2]->getType().getASTType()->isBuiltinIntegerType(1) &&
            "Must have a third Int1 operand");
 
@@ -675,7 +683,7 @@ public:
       return createDynamicFunctionRef(Loc, f);
     else if (kind == SILInstructionKind::PreviousDynamicFunctionRefInst)
       return createPreviousDynamicFunctionRef(Loc, f);
-    assert(false && "Should not get here");
+    ASSERT(false && "Should not get here");
     return nullptr;
   }
 
@@ -762,7 +770,7 @@ public:
                                 LoadOwnershipQualifier Qualifier,
                                 bool SupportUnqualifiedSIL = false) {
     if (SupportUnqualifiedSIL && !hasOwnership()) {
-      assert(
+      ASSERT(
           Qualifier != LoadOwnershipQualifier::Copy &&
           "In unqualified SIL, a copy must be done separately form the load");
       return createLoad(Loc, LV, LoadOwnershipQualifier::Unqualified);
@@ -776,11 +784,11 @@ public:
 
   LoadInst *createLoad(SILLocation Loc, SILValue LV,
                        LoadOwnershipQualifier Qualifier) {
-    assert((Qualifier != LoadOwnershipQualifier::Unqualified) ||
+    ASSERT((Qualifier != LoadOwnershipQualifier::Unqualified) ||
            !hasOwnership() && "Unqualified inst in qualified function");
-    assert((Qualifier == LoadOwnershipQualifier::Unqualified) ||
+    ASSERT((Qualifier == LoadOwnershipQualifier::Unqualified) ||
            hasOwnership() && "Qualified inst in unqualified function");
-    assert(isLoadableOrOpaque(LV->getType()));
+    ASSERT(isLoadableOrOpaque(LV->getType()));
     return insert(new (getModule())
                       LoadInst(getSILDebugLocation(Loc), LV, Qualifier));
   }
@@ -799,7 +807,7 @@ public:
   /// non-address values.
   SILValue emitLoadValueOperation(SILLocation Loc, SILValue LV,
                                   LoadOwnershipQualifier Qualifier) {
-    assert(isLoadableOrOpaque(LV->getType()));
+    ASSERT(isLoadableOrOpaque(LV->getType()));
     const auto &lowering = getTypeLowering(LV->getType());
     return lowering.emitLoad(*this, Loc, LV, Qualifier);
   }
@@ -809,7 +817,7 @@ public:
   SILValue emitLoweredLoadValueOperation(
       SILLocation Loc, SILValue LV, LoadOwnershipQualifier Qualifier,
       Lowering::TypeLowering::TypeExpansionKind ExpansionKind) {
-    assert(isLoadableOrOpaque(LV->getType()));
+    ASSERT(isLoadableOrOpaque(LV->getType()));
     const auto &lowering = getTypeLowering(LV->getType());
     return lowering.emitLoweredLoad(*this, Loc, LV, Qualifier, ExpansionKind);
   }
@@ -820,13 +828,13 @@ public:
       SILLocation Loc, SILValue Value, SILValue Addr,
       StoreOwnershipQualifier Qual,
       Lowering::TypeLowering::TypeExpansionKind ExpansionKind) {
-    assert(isLoadableOrOpaque(Value->getType()));
+    ASSERT(isLoadableOrOpaque(Value->getType()));
     const auto &lowering = getTypeLowering(Value->getType());
     lowering.emitLoweredStore(*this, Loc, Value, Addr, Qual, ExpansionKind);
   }
 
   LoadBorrowInst *createLoadBorrow(SILLocation Loc, SILValue LV) {
-    assert(isLoadableOrOpaque(LV->getType()) &&
+    ASSERT(isLoadableOrOpaque(LV->getType()) &&
            !LV->getType().isTrivial(getFunction()));
     return insert(new (getModule())
                       LoadBorrowInst(getSILDebugLocation(Loc), LV));
@@ -837,8 +845,8 @@ public:
       HasPointerEscape_t hasPointerEscape = DoesNotHavePointerEscape,
       IsFromVarDecl_t fromVarDecl = IsNotFromVarDecl,
       BeginBorrowInst::IsFixed_t fixed = BeginBorrowInst::IsNotFixed) {
-    assert(getFunction().hasOwnership());
-    assert(!LV->getType().isAddress());
+    ASSERT(getFunction().hasOwnership());
+    ASSERT(!LV->getType().isAddress());
     return insert(new (getModule())
                       BeginBorrowInst(getSILDebugLocation(Loc), LV, isLexical,
                                       hasPointerEscape, fromVarDecl, fixed));
@@ -902,7 +910,7 @@ public:
                                   StoreOwnershipQualifier Qualifier,
                                   bool SupportUnqualifiedSIL = false) {
     if (SupportUnqualifiedSIL && !hasOwnership()) {
-      assert(
+      ASSERT(
           Qualifier != StoreOwnershipQualifier::Assign &&
           "In unqualified SIL, assigns must be represented via 2 instructions");
       return createStore(Loc, Src, DestAddr,
@@ -916,9 +924,9 @@ public:
 
   StoreInst *createStore(SILLocation Loc, SILValue Src, SILValue DestAddr,
                          StoreOwnershipQualifier Qualifier) {
-    assert((Qualifier != StoreOwnershipQualifier::Unqualified) ||
+    ASSERT((Qualifier != StoreOwnershipQualifier::Unqualified) ||
            !hasOwnership() && "Unqualified inst in qualified function");
-    assert((Qualifier == StoreOwnershipQualifier::Unqualified) ||
+    ASSERT((Qualifier == StoreOwnershipQualifier::Unqualified) ||
            hasOwnership() && "Qualified inst in unqualified function");
     return insert(new (getModule()) StoreInst(getSILDebugLocation(Loc), Src,
                                                 DestAddr, Qualifier));
@@ -928,15 +936,15 @@ public:
   /// non-address values.
   void emitStoreValueOperation(SILLocation Loc, SILValue Src, SILValue DestAddr,
                                StoreOwnershipQualifier Qualifier) {
-    assert(!Src->getType().isAddress());
+    ASSERT(!Src->getType().isAddress());
     const auto &lowering = getTypeLowering(Src->getType());
     return lowering.emitStore(*this, Loc, Src, DestAddr, Qualifier);
   }
 
   EndBorrowInst *createEndBorrow(SILLocation loc, SILValue borrowedValue) {
-    assert(!SILArgument::isTerminatorResult(borrowedValue) &&
+    ASSERT(!SILArgument::isTerminatorResult(borrowedValue) &&
                "terminator results do not have end_borrow");
-    assert(!isa<SILFunctionArgument>(borrowedValue) &&
+    ASSERT(!isa<SILFunctionArgument>(borrowedValue) &&
            "Function arguments should never have an end_borrow");
     return insert(new (getModule())
                       EndBorrowInst(getSILDebugLocation(loc), borrowedValue));
@@ -1072,7 +1080,7 @@ public:
 
   DebugValueInst *createDebugValue(
       SILLocation Loc, SILValue src, SILDebugVariable Var,
-      bool poisonRefs = false,
+      PoisonRefs_t poisonRefs = DontPoisonRefs,
       UsesMoveableValueDebugInfo_t wasMoved = DoesNotUseMoveableValueDebugInfo,
       bool trace = false);
   DebugValueInst *createDebugValueAddr(
@@ -1100,7 +1108,7 @@ public:
 
   UnownedCopyValueInst *createUnownedCopyValue(SILLocation Loc,
                                                SILValue operand) {
-    assert(!getFunction().getModule().useLoweredAddresses());
+    ASSERT(!getFunction().getModule().useLoweredAddresses());
     auto type = operand->getType()
                     .getReferenceStorageType(getFunction().getASTContext(),
                                              ReferenceOwnership::Unowned)
@@ -1110,7 +1118,7 @@ public:
   }
 
   WeakCopyValueInst *createWeakCopyValue(SILLocation Loc, SILValue operand) {
-    assert(!getFunction().getModule().useLoweredAddresses());
+    ASSERT(!getFunction().getModule().useLoweredAddresses());
     auto type = operand->getType()
                     .getReferenceStorageType(getFunction().getASTContext(),
                                              ReferenceOwnership::Weak)
@@ -1194,6 +1202,7 @@ public:
   CopyAddrInst *createCopyAddr(SILLocation Loc, SILValue srcAddr,
                                SILValue destAddr, IsTake_t isTake,
                                IsInitialization_t isInitialize) {
+    // See rdar://135156833 for why this is not an ASSERT
     assert(srcAddr->getType() == destAddr->getType());
     return insert(new (getModule()) CopyAddrInst(
         getSILDebugLocation(Loc), srcAddr, destAddr, isTake, isInitialize));
@@ -1202,7 +1211,7 @@ public:
   ExplicitCopyAddrInst *
   createExplicitCopyAddr(SILLocation Loc, SILValue srcAddr, SILValue destAddr,
                          IsTake_t isTake, IsInitialization_t isInitialize) {
-    assert(srcAddr->getType() == destAddr->getType());
+    ASSERT(srcAddr->getType() == destAddr->getType());
     return insert(new (getModule()) ExplicitCopyAddrInst(
         getSILDebugLocation(Loc), srcAddr, destAddr, isTake, isInitialize));
   }
@@ -1236,6 +1245,24 @@ public:
         WithoutActuallyEscaping, forwardingOwnershipKind));
   }
 
+  ThunkInst *createThunk(SILLocation Loc, SILValue Op, ThunkInst::Kind kind,
+                         SubstitutionMap substitutionMap = {}) {
+    return insert(ThunkInst::create(getSILDebugLocation(Loc), Op, getModule(),
+                                    F, kind, substitutionMap));
+  }
+
+  ThunkInst *createIdentityThunk(SILLocation Loc, SILValue Op,
+                                 SubstitutionMap substitutionMap = {}) {
+    return createThunk(Loc, Op, ThunkInst::Kind::Identity, substitutionMap);
+  }
+
+  ThunkInst *
+  createHopToMainActorIfNeededThunk(SILLocation Loc, SILValue Op,
+                                    SubstitutionMap substitutionMap = {}) {
+    return createThunk(Loc, Op, ThunkInst::Kind::HopToMainActorIfNeeded,
+                       substitutionMap);
+  }
+
   ConvertEscapeToNoEscapeInst *
   createConvertEscapeToNoEscape(SILLocation Loc, SILValue Op, SILType Ty,
                                 bool lifetimeGuaranteed) {
@@ -1250,7 +1277,7 @@ public:
 
   UpcastInst *createUpcast(SILLocation Loc, SILValue Op, SILType Ty,
                            ValueOwnershipKind forwardingOwnershipKind) {
-    assert(Ty.isObject());
+    ASSERT(Ty.isObject());
     if (isInsertingIntoGlobal()) {
       return insert(UpcastInst::create(getSILDebugLocation(Loc), Op, Ty,
                                        getModule(), forwardingOwnershipKind));
@@ -1328,7 +1355,7 @@ public:
   UncheckedValueCastInst *
   createUncheckedValueCast(SILLocation Loc, SILValue Op, SILType Ty,
                            ValueOwnershipKind forwardingOwnershipKind) {
-    assert(hasOwnership());
+    ASSERT(hasOwnership());
     return insert(UncheckedValueCastInst::create(
         getSILDebugLocation(Loc), Op, Ty, getFunction(),
         forwardingOwnershipKind));
@@ -1422,11 +1449,11 @@ public:
   }
 
   CopyValueInst *createCopyValue(SILLocation Loc, SILValue operand) {
-    assert(getFunction().hasOwnership());
-    assert(!operand->getType().isTrivial(getFunction()) &&
+    ASSERT(getFunction().hasOwnership());
+    ASSERT(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
            "emitCopyValueOperation");
-    assert((getModule().getStage() == SILStage::Raw
+    ASSERT((getModule().getStage() == SILStage::Raw
             || !operand->getType().isMoveOnly())
            && "should not be copying move-only values in canonical SIL");
     return insert(new (getModule())
@@ -1435,7 +1462,7 @@ public:
 
   ExplicitCopyValueInst *createExplicitCopyValue(SILLocation Loc,
                                                  SILValue operand) {
-    assert(!operand->getType().isTrivial(getFunction()) &&
+    ASSERT(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
            "emitCopyValueOperation");
     return insert(new (getModule())
@@ -1443,22 +1470,23 @@ public:
   }
 
   DestroyValueInst *createDestroyValue(SILLocation Loc, SILValue operand,
-                                       bool poisonRefs = false) {
-    assert(getFunction().hasOwnership());
-    assert(isLoadableOrOpaque(operand->getType()));
-    assert(!operand->getType().isTrivial(getFunction()) &&
+                                       PoisonRefs_t poisonRefs = DontPoisonRefs,
+                                       IsDeadEnd_t isDeadEnd = IsntDeadEnd) {
+    ASSERT(getFunction().hasOwnership());
+    ASSERT(isLoadableOrOpaque(operand->getType()));
+    ASSERT(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
            "emitDestroyValueOperation");
-    return insert(new (getModule()) DestroyValueInst(getSILDebugLocation(Loc),
-                                                     operand, poisonRefs));
+    return insert(new (getModule()) DestroyValueInst(
+        getSILDebugLocation(Loc), operand, poisonRefs, isDeadEnd));
   }
 
   MoveValueInst *createMoveValue(
       SILLocation loc, SILValue operand, IsLexical_t isLexical = IsNotLexical,
       HasPointerEscape_t hasPointerEscape = DoesNotHavePointerEscape,
       IsFromVarDecl_t fromVarDecl = IsNotFromVarDecl) {
-    assert(getFunction().hasOwnership());
-    assert(!operand->getType().isTrivial(getFunction()) &&
+    ASSERT(getFunction().hasOwnership());
+    ASSERT(fromVarDecl || !operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api. Use instead "
            "emitMoveValueOperation");
     return insert(new (getModule())
@@ -1467,8 +1495,8 @@ public:
   }
 
   DropDeinitInst *createDropDeinit(SILLocation loc, SILValue operand) {
-    assert(getFunction().hasOwnership());
-    assert(!operand->getType().isTrivial(getFunction()) &&
+    ASSERT(getFunction().hasOwnership());
+    ASSERT(!operand->getType().isTrivial(getFunction()) &&
            "Should not be passing trivial values to this api.");
     return insert(new (getModule()) DropDeinitInst(getSILDebugLocation(loc),
                                                    operand));
@@ -1507,7 +1535,7 @@ public:
   CopyableToMoveOnlyWrapperValueInst *
   createGuaranteedCopyableToMoveOnlyWrapperValue(SILLocation loc,
                                                  SILValue src) {
-    assert(!src->getType().isTrivial(*F) &&
+    ASSERT(!src->getType().isTrivial(*F) &&
            "trivial types can only use the owned version of this API");
     return insert(new (getModule()) CopyableToMoveOnlyWrapperValueInst(
         getSILDebugLocation(loc), src,
@@ -1575,23 +1603,23 @@ public:
 
   RetainValueInst *createRetainValue(SILLocation Loc, SILValue operand,
                                      Atomicity atomicity) {
-    assert(!hasOwnership());
-    assert(isLoadableOrOpaque(operand->getType()));
+    ASSERT(!hasOwnership());
+    ASSERT(isLoadableOrOpaque(operand->getType()));
     return insert(new (getModule()) RetainValueInst(getSILDebugLocation(Loc),
                                                       operand, atomicity));
   }
 
   RetainValueAddrInst *createRetainValueAddr(SILLocation Loc, SILValue operand,
                                              Atomicity atomicity) {
-    assert(!hasOwnership());
+    ASSERT(!hasOwnership());
     return insert(new (getModule()) RetainValueAddrInst(
         getSILDebugLocation(Loc), operand, atomicity));
   }
 
   ReleaseValueInst *createReleaseValue(SILLocation Loc, SILValue operand,
                                        Atomicity atomicity) {
-    assert(!hasOwnership());
-    assert(isLoadableOrOpaque(operand->getType()));
+    ASSERT(!hasOwnership());
+    ASSERT(isLoadableOrOpaque(operand->getType()));
     return insert(new (getModule()) ReleaseValueInst(getSILDebugLocation(Loc),
                                                        operand, atomicity));
   }
@@ -1599,7 +1627,7 @@ public:
   ReleaseValueAddrInst *createReleaseValueAddr(SILLocation Loc,
                                                SILValue operand,
                                                Atomicity atomicity) {
-    assert(!hasOwnership());
+    ASSERT(!hasOwnership());
     return insert(new (getModule()) ReleaseValueAddrInst(
         getSILDebugLocation(Loc), operand, atomicity));
   }
@@ -1607,8 +1635,8 @@ public:
   UnmanagedRetainValueInst *createUnmanagedRetainValue(SILLocation Loc,
                                                        SILValue operand,
                                                        Atomicity atomicity) {
-    assert(hasOwnership());
-    assert(isLoadableOrOpaque(operand->getType()));
+    ASSERT(hasOwnership());
+    ASSERT(isLoadableOrOpaque(operand->getType()));
     return insert(new (getModule()) UnmanagedRetainValueInst(
         getSILDebugLocation(Loc), operand, atomicity));
   }
@@ -1616,8 +1644,8 @@ public:
   UnmanagedReleaseValueInst *createUnmanagedReleaseValue(SILLocation Loc,
                                                          SILValue operand,
                                                          Atomicity atomicity) {
-    assert(hasOwnership());
-    assert(isLoadableOrOpaque(operand->getType()));
+    ASSERT(hasOwnership());
+    ASSERT(isLoadableOrOpaque(operand->getType()));
     return insert(new (getModule()) UnmanagedReleaseValueInst(
         getSILDebugLocation(Loc), operand, atomicity));
   }
@@ -1672,7 +1700,7 @@ public:
   StructInst *createStruct(SILLocation Loc, SILType Ty,
                            ArrayRef<SILValue> Elements,
                            ValueOwnershipKind forwardingOwnershipKind) {
-    assert(isLoadableOrOpaque(Ty));
+    ASSERT(isLoadableOrOpaque(Ty));
     return insert(StructInst::create(getSILDebugLocation(Loc), Ty, Elements,
                                      getModule(), forwardingOwnershipKind));
   }
@@ -1688,7 +1716,7 @@ public:
   TupleInst *createTuple(SILLocation Loc, SILType Ty,
                          ArrayRef<SILValue> Elements,
                          ValueOwnershipKind forwardingOwnershipKind) {
-    assert(isLoadableOrOpaque(Ty));
+    ASSERT(isLoadableOrOpaque(Ty));
     return insert(TupleInst::create(getSILDebugLocation(Loc), Ty, Elements,
                                     getModule(), forwardingOwnershipKind));
   }
@@ -1699,7 +1727,7 @@ public:
   createTupleAddrConstructor(SILLocation Loc, SILValue DestAddr,
                              ArrayRef<SILValue> Elements,
                              IsInitialization_t IsInitOfDest) {
-    assert(getFunction().getModule().useLoweredAddresses());
+    ASSERT(getFunction().getModule().useLoweredAddresses());
     return insert(TupleAddrConstructorInst::create(getSILDebugLocation(Loc),
                                                    DestAddr, Elements,
                                                    IsInitOfDest, getModule()));
@@ -1707,15 +1735,17 @@ public:
 
   EnumInst *createEnum(SILLocation Loc, SILValue Operand,
                        EnumElementDecl *Element, SILType Ty) {
-    return createEnum(Loc, Operand, Element, Ty,
-                      Operand ? Operand->getOwnershipKind()
-                              : ValueOwnershipKind(OwnershipKind::None));
+    return createEnum(
+        Loc, Operand, Element, Ty,
+        Operand ? getSILValueOwnership({Operand}, Ty)
+                : (Ty.isMoveOnly() ? ValueOwnershipKind(OwnershipKind::Owned)
+                                   : ValueOwnershipKind(OwnershipKind::None)));
   }
 
   EnumInst *createEnum(SILLocation Loc, SILValue Operand,
                        EnumElementDecl *Element, SILType Ty,
                        ValueOwnershipKind forwardingOwnershipKind) {
-    assert(isLoadableOrOpaque(Ty));
+    ASSERT(isLoadableOrOpaque(Ty));
     return insert(new (getModule())
                       EnumInst(getSILDebugLocation(Loc), Operand, Element, Ty,
                                forwardingOwnershipKind));
@@ -1723,14 +1753,14 @@ public:
 
   /// Inject a loadable value into the corresponding optional type.
   EnumInst *createOptionalSome(SILLocation Loc, SILValue operand, SILType ty) {
-    assert(isLoadableOrOpaque(ty));
+    ASSERT(isLoadableOrOpaque(ty));
     auto someDecl = getModule().getASTContext().getOptionalSomeDecl();
     return createEnum(Loc, operand, someDecl, ty);
   }
 
   /// Create the nil value of a loadable optional type.
   EnumInst *createOptionalNone(SILLocation Loc, SILType ty) {
-    assert(isLoadableOrOpaque(ty));
+    ASSERT(isLoadableOrOpaque(ty));
     auto noneDecl = getModule().getASTContext().getOptionalNoneDecl();
     return createEnum(Loc, nullptr, noneDecl, ty);
   }
@@ -1763,7 +1793,7 @@ public:
   createUncheckedEnumData(SILLocation Loc, SILValue Operand,
                           EnumElementDecl *Element, SILType Ty,
                           ValueOwnershipKind forwardingOwnershipKind) {
-    assert(isLoadableOrOpaque(Ty));
+    ASSERT(isLoadableOrOpaque(Ty));
     return insert(new (getModule()) UncheckedEnumDataInst(
         getSILDebugLocation(Loc), Operand, Element, Ty,
         forwardingOwnershipKind));
@@ -1802,7 +1832,7 @@ public:
       ArrayRef<std::pair<EnumElementDecl *, SILValue>> CaseValues,
       std::optional<ArrayRef<ProfileCounter>> CaseCounts = std::nullopt,
       ProfileCounter DefaultCount = ProfileCounter()) {
-    assert(isLoadableOrOpaque(Ty));
+    ASSERT(isLoadableOrOpaque(Ty));
     return insert(SelectEnumInst::create(
         getSILDebugLocation(Loc), Operand, Ty, DefaultValue, CaseValues,
         getModule(), CaseCounts, DefaultCount));
@@ -1844,7 +1874,7 @@ public:
                                                SILValue Operand,
                                                unsigned FieldNo,
                                                SILType ResultTy) {
-    assert(!Operand->getType().castTo<TupleType>().containsPackExpansionType()
+    ASSERT(!Operand->getType().castTo<TupleType>().containsPackExpansionType()
            && "tuples with pack expansions must be indexed with "
               "tuple_pack_element_addr");
     return insert(new (getModule()) TupleElementAddrInst(
@@ -1950,7 +1980,7 @@ public:
     //
     // emitDestructureValueOperation(SILLocation, SILValue,
     //                               SmallVectorImpl<SILValue> &);
-    assert(hasOwnership() && "Expected to be called in ownership code only.");
+    ASSERT(hasOwnership() && "Expected to be called in ownership code only.");
     SILType opTy = operand->getType();
     if (opTy.is<TupleType>())
       return createDestructureTuple(loc, operand);
@@ -2207,7 +2237,7 @@ public:
                                                SILValue packIndex,
                                                SILValue tuple,
                                                SILType elementType) {
-    assert(!getFunction().getModule().useLoweredAddresses());
+    ASSERT(!getFunction().getModule().useLoweredAddresses());
     return insert(TuplePackExtractInst::create(
         getFunction(), getSILDebugLocation(loc), packIndex, tuple, elementType,
         tuple->getOwnershipKind()));
@@ -2276,13 +2306,13 @@ public:
 
   StrongRetainInst *createStrongRetain(SILLocation Loc, SILValue Operand,
                                        Atomicity atomicity) {
-    assert(!hasOwnership());
+    ASSERT(!hasOwnership());
     return insert(new (getModule()) StrongRetainInst(getSILDebugLocation(Loc),
                                                        Operand, atomicity));
   }
   StrongReleaseInst *createStrongRelease(SILLocation Loc, SILValue Operand,
                                          Atomicity atomicity) {
-    assert(!hasOwnership());
+    ASSERT(!hasOwnership());
     return insert(new (getModule()) StrongReleaseInst(
         getSILDebugLocation(Loc), Operand, atomicity));
   }
@@ -2290,6 +2320,11 @@ public:
   EndLifetimeInst *createEndLifetime(SILLocation Loc, SILValue Operand) {
     return insert(new (getModule())
                       EndLifetimeInst(getSILDebugLocation(Loc), Operand));
+  }
+
+  ExtendLifetimeInst *createExtendLifetime(SILLocation Loc, SILValue Operand) {
+    return insert(new (getModule())
+                      ExtendLifetimeInst(getSILDebugLocation(Loc), Operand));
   }
 
   UncheckedOwnershipConversionInst *
@@ -2379,10 +2414,10 @@ public:
     return insert(new (getModule()) DeallocPartialRefInst(
         getSILDebugLocation(Loc), operand, metatype));
   }
-  DeallocBoxInst *createDeallocBox(SILLocation Loc,
-                                   SILValue operand) {
-    return insert(new (getModule()) DeallocBoxInst(
-        getSILDebugLocation(Loc), operand));
+  DeallocBoxInst *createDeallocBox(SILLocation Loc, SILValue operand,
+                                   IsDeadEnd_t isDeadEnd = IsntDeadEnd) {
+    return insert(new (getModule()) DeallocBoxInst(getSILDebugLocation(Loc),
+                                                   operand, isDeadEnd));
   }
   DeallocExistentialBoxInst *createDeallocExistentialBox(SILLocation Loc,
                                                          CanType concreteType,
@@ -2402,6 +2437,13 @@ public:
                                                          SILValue boxOperand) {
     return insert(new (getModule()) ProjectExistentialBoxInst(
         getSILDebugLocation(Loc), valueTy, boxOperand));
+  }
+
+  TypeValueInst *createTypeValue(SILLocation loc, SILType valueType,
+                                 CanType paramType) {
+    return insert(TypeValueInst::create(getFunction(),
+                              getSILDebugLocation(loc),
+                              valueType, paramType));
   }
 
   //===--------------------------------------------------------------------===//
@@ -2537,6 +2579,12 @@ public:
                     getSILDebugLocation(loc), fnValue, resultType));
   }
 
+  MergeIsolationRegionInst *
+  createMergeIsolationRegion(SILLocation loc, ArrayRef<SILValue> args) {
+    return insert(MergeIsolationRegionInst::create(getSILDebugLocation(loc),
+                                                   args, getModule()));
+  }
+
   //===--------------------------------------------------------------------===//
   // Terminator SILInstruction Creation Methods
   //===--------------------------------------------------------------------===//
@@ -2668,6 +2716,17 @@ public:
         getSILDebugLocation(Loc), Operand, DefaultBB, CaseBBs, getFunction(),
         CaseCounts, DefaultCount, forwardingOwnershipKind));
   }
+
+  /// A convenience function to decompose a scalar optional value with a
+  /// switch_enum.  Returns the object value, which will only be valid
+  /// in `someBB`.  Don't forget to switch insertion blocks after
+  /// calling this.
+  SILPhiArgument *createSwitchOptional(
+      SILLocation loc, SILValue operand,
+      SILBasicBlock *someBB, SILBasicBlock *noneBB,
+      ValueOwnershipKind forwardingOwnershipKind,
+      ProfileCounter someCount = ProfileCounter(),
+      ProfileCounter noneCount = ProfileCounter());
 
   SwitchEnumAddrInst *createSwitchEnumAddr(
       SILLocation Loc, SILValue Operand, SILBasicBlock *DefaultBB,
@@ -2827,7 +2886,7 @@ public:
   /// Convenience function for calling emitCopy on the type lowering
   /// for the non-address value.
   SILValue emitCopyValueOperation(SILLocation Loc, SILValue v) {
-    assert(!v->getType().isAddress());
+    ASSERT(!v->getType().isAddress());
     auto &lowering = getTypeLowering(v->getType());
     return lowering.emitCopyValue(*this, Loc, v);
   }
@@ -2837,7 +2896,7 @@ public:
   SILValue emitLoweredCopyValueOperation(
       SILLocation Loc, SILValue v,
       Lowering::TypeLowering::TypeExpansionKind expansionKind) {
-    assert(!v->getType().isAddress());
+    ASSERT(!v->getType().isAddress());
     auto &lowering = getTypeLowering(v->getType());
     return lowering.emitLoweredCopyValue(*this, Loc, v, expansionKind);
   }
@@ -2845,7 +2904,7 @@ public:
   /// Convenience function for calling TypeLowering.emitDestroy on the type
   /// lowering for the non-address value.
   void emitDestroyValueOperation(SILLocation Loc, SILValue v) {
-    assert(!v->getType().isAddress());
+    ASSERT(!v->getType().isAddress());
     if (F->hasOwnership() && v->getOwnershipKind() == OwnershipKind::None)
       return;
     auto &lowering = getTypeLowering(v->getType());
@@ -2857,7 +2916,7 @@ public:
   void emitLoweredDestroyValueOperation(
       SILLocation Loc, SILValue v,
       Lowering::TypeLowering::TypeExpansionKind expansionKind) {
-    assert(!v->getType().isAddress());
+    ASSERT(!v->getType().isAddress());
     if (F->hasOwnership() && v->getOwnershipKind() == OwnershipKind::None)
       return;
     auto &lowering = getTypeLowering(v->getType());
@@ -2880,10 +2939,10 @@ public:
       SILLocation Loc, SILValue v, IsLexical_t isLexical = IsNotLexical,
       HasPointerEscape_t hasPointerEscape = DoesNotHavePointerEscape,
       IsFromVarDecl_t fromVarDecl = IsNotFromVarDecl) {
-    assert(!v->getType().isAddress());
+    ASSERT(!v->getType().isAddress());
     if (v->getType().isTrivial(*getInsertionBB()->getParent()))
       return v;
-    assert(v->getOwnershipKind() == OwnershipKind::Owned &&
+    ASSERT(v->getOwnershipKind() == OwnershipKind::Owned &&
            "move_value consumes its argument");
     return createMoveValue(Loc, v, isLexical, hasPointerEscape, fromVarDecl);
   }
@@ -3058,7 +3117,7 @@ private:
   }
 
   void insertImpl(SILInstruction *TheInst) {
-    assert(hasValidInsertionPoint());
+    ASSERT(hasValidInsertionPoint());
     BB->insert(InsertPt, TheInst);
     getModule().notifyAddedInstruction(TheInst);
     C.notifyInserted(TheInst);
@@ -3103,7 +3162,7 @@ private:
       case BuiltinFloatType::PPC128: Name += "PPC128"; break;
       }
     } else {
-      assert(OpdTy.getASTType() == getASTContext().TheRawPointerType);
+      ASSERT(OpdTy.getASTType() == getASTContext().TheRawPointerType);
       Name += "_RawPointer";
     }
   }
@@ -3115,11 +3174,11 @@ private:
 /// SIL instructions.
 class SILBuilderWithScope : public SILBuilder {
   void inheritScopeFrom(SILInstruction *I) {
-    assert(I->getDebugScope() && "instruction has no debug scope");
+    ASSERT(I->getDebugScope() && "instruction has no debug scope");
     SILBasicBlock::iterator II(*I);
     auto End = I->getParent()->end();
     const SILDebugScope *DS = II->getDebugScope();
-    assert(DS);
+    ASSERT(DS);
     // Skip over meta instructions, since debug_values may originate from outer
     // scopes. Don't do any of this after inlining.
     while (!DS->InlinedCallSite && II != End && II->isMetaInstruction())
@@ -3129,7 +3188,7 @@ class SILBuilderWithScope : public SILBuilder {
       if (!nextScope->InlinedCallSite)
         DS = nextScope;
     }
-    assert(DS);
+    ASSERT(DS);
     setCurrentDebugScope(DS);
   }
 
@@ -3200,7 +3259,7 @@ public:
   /// non-metainstruction in the BB.
   explicit SILBuilderWithScope(SILBasicBlock *BB) : SILBuilder(BB->begin()) {
     const SILDebugScope *DS = BB->getScopeOfFirstNonMetaInstruction();
-    assert(DS && "Instruction without debug scope associated!");
+    ASSERT(DS && "Instruction without debug scope associated!");
     setCurrentDebugScope(DS);
   }
 
@@ -3229,7 +3288,7 @@ public:
       return insertAfter(mvir->getParent(), func);
     if (auto *arg = dyn_cast<SILArgument>(value))
       return insertAfter(&*arg->getParent()->begin(), func);
-    assert(!isa<SILUndef>(value) && "This API can not use undef");
+    ASSERT(!isa<SILUndef>(value) && "This API can not use undef");
     llvm_unreachable("Unhandled case?!");
   }
 };

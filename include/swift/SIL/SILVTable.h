@@ -158,11 +158,10 @@ public:
   bool isSerialized() const {
     return SerializedKind_t(SerializedKind) == IsSerialized;
   }
-  bool isSerializedForPackage() const {
-    return SerializedKind_t(SerializedKind) == IsSerializedForPackage;
-  }
-  bool isNotSerialized() const {
-    return SerializedKind_t(SerializedKind) == IsNotSerialized;
+
+  bool isAnySerialized() const {
+    return SerializedKind_t(SerializedKind) == IsSerialized ||
+           SerializedKind_t(SerializedKind) == IsSerializedForPackage;
   }
 
   SerializedKind_t getSerializedKind() const {
@@ -205,6 +204,8 @@ public:
         });
     NumEntries = std::distance(Entries.begin(), end);
   }
+
+  void replaceEntries(ArrayRef<Entry> newEntries);
 
   /// Verify that the vtable is well-formed for the given class.
   void verify(const SILModule &M) const;

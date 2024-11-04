@@ -32,6 +32,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/Type.h"
 #include "swift/AST/TypeVisitor.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/LLVM.h"
 
 #include "clang/AST/ASTContext.h"
@@ -74,10 +75,14 @@ getClangBuiltinTypeFromKind(const clang::ASTContext &context,
   case clang::BuiltinType::Id:                                                 \
     return context.Id##Ty;
 #include "clang/Basic/RISCVVTypes.def"
-#define WASM_REF_TYPE(Name, MangedNameBase, Id, SingletonId, AS)               \
+#define WASM_REF_TYPE(Name, MangledNameBase, Id, SingletonId, AS)              \
   case clang::BuiltinType::Id:                                                 \
     return context.SingletonId;
 #include "clang/Basic/WebAssemblyReferenceTypes.def"
+#define AMDGPU_TYPE(Name, Id, SingletonId)                                     \
+  case clang::BuiltinType::Id:                                                 \
+    return context.SingletonId;
+#include "clang/Basic/AMDGPUTypes.def"
   }
 
   // Not a valid BuiltinType.
@@ -178,7 +183,7 @@ ClangTypeConverter::getFunctionType(ArrayRef<SILParameterInfo> params,
     if (pc.isNull())
       return nullptr;
     clang::FunctionProtoType::ExtParameterInfo extParamInfo;
-    if (p.isConsumed()) {
+    if (p.isConsumedInCallee()) {
       someParamIsConsumed = true;
       extParamInfo = extParamInfo.withIsConsumed(true);
     }
@@ -227,7 +232,7 @@ clang::QualType ClangTypeConverter::convertMemberType(NominalTypeDecl *DC,
 // we could recover in some other way.
 static clang::QualType getClangVectorType(const clang::ASTContext &ctx,
                                           clang::BuiltinType::Kind eltKind,
-                                          clang::VectorType::VectorKind vecKind,
+                                          clang::VectorKind vecKind,
                                           StringRef numEltsString) {
   unsigned numElts;
   bool failedParse = numEltsString.getAsInteger<unsigned>(10, numElts);
@@ -268,11 +273,11 @@ clang::QualType ClangTypeConverter::visitStructType(StructType *type) {
 #undef CHECK_NAMED_TYPE
 
   // Map vector types to the corresponding C vectors.
-#define MAP_SIMD_TYPE(TYPE_NAME, _, BUILTIN_KIND)                      \
-  if (name.starts_with(#TYPE_NAME)) {                                   \
-    return getClangVectorType(ctx, clang::BuiltinType::BUILTIN_KIND,   \
-                              clang::VectorType::GenericVector,        \
-                              name.drop_front(sizeof(#TYPE_NAME)-1));  \
+#define MAP_SIMD_TYPE(TYPE_NAME, _, BUILTIN_KIND)                              \
+  if (name.starts_with(#TYPE_NAME)) {                                          \
+    return getClangVectorType(ctx, clang::BuiltinType::BUILTIN_KIND,           \
+                              clang::VectorKind::Generic,                      \
+                              name.drop_front(sizeof(#TYPE_NAME) - 1));        \
   }
 #include "swift/ClangImporter/SIMDMappedTypes.def"
 
@@ -427,8 +432,8 @@ clang::QualType ClangTypeConverter::visitTupleType(TupleType *type) {
     return clang::QualType();
 
   APInt size(32, tupleNumElements);
-  return ClangASTContext.getConstantArrayType(clangEltTy, size, nullptr,
-           clang::ArrayType::Normal, 0);
+  return ClangASTContext.getConstantArrayType(
+      clangEltTy, size, nullptr, clang::ArraySizeModifier::Normal, 0);
 }
 
 clang::QualType ClangTypeConverter::visitProtocolType(ProtocolType *type) {
@@ -617,7 +622,7 @@ ClangTypeConverter::visitBoundGenericType(BoundGenericType *type) {
       return clang::QualType();
     (void) failedParse;
     auto vectorTy = ClangASTContext.getVectorType(scalarTy, numElts,
-      clang::VectorType::VectorKind::GenericVector);
+                                                  clang::VectorKind::Generic);
     return vectorTy;
   }
   }
@@ -838,7 +843,11 @@ clang::QualType ClangTypeConverter::convert(Type type) {
     if (auto clangDecl = decl->getClangDecl()) {
       auto &ctx = ClangASTContext;
       if (auto clangTypeDecl = dyn_cast<clang::TypeDecl>(clangDecl)) {
-        return ctx.getTypeDeclType(clangTypeDecl).getUnqualifiedType();
+        auto qualType = ctx.getTypeDeclType(clangTypeDecl);
+        if (type->isForeignReferenceType()) {
+          qualType = ctx.getPointerType(qualType);
+        }
+        return qualType.getUnqualifiedType();
       } else if (auto ifaceDecl = dyn_cast<clang::ObjCInterfaceDecl>(clangDecl)) {
         auto clangType  = ctx.getObjCInterfaceType(ifaceDecl);
         return ctx.getObjCObjectPointerType(clangType);
@@ -890,12 +899,25 @@ ClangTypeConverter::getClangTemplateArguments(
     auto templateParam = cast<clang::TemplateTypeParmDecl>(param);
     // We must have found a defaulted parameter at the end of the list.
     if (templateParam->getIndex() >= genericArgs.size()) {
-      templateArgs.push_back(
-          clang::TemplateArgument(templateParam->getDefaultArgument()));
+      templateArgs.push_back(clang::TemplateArgument(
+          templateParam->getDefaultArgument().getArgument()));
       continue;
     }
 
     auto replacement = genericArgs[templateParam->getIndex()];
+
+    // Ban ObjCBool type from being substituted into C++ templates.
+    if (auto nominal = replacement->getAs<NominalType>()) {
+      if (auto nominalDecl = nominal->getDecl()) {
+        if (nominalDecl->getName().is("ObjCBool") &&
+            nominalDecl->getModuleContext()->getName() ==
+                nominalDecl->getASTContext().Id_ObjectiveC) {
+          failedTypes.push_back(replacement);
+          continue;
+        }
+      }
+    }
+
     auto qualType = convert(replacement);
     if (qualType.isNull()) {
       failedTypes.push_back(replacement);

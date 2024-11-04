@@ -19,6 +19,7 @@
 #include "swift/AST/GenericParamList.h"
 #include "swift/AST/SourceFile.h" // only for isMacroSignatureFile
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Nullability.h"
 #include "swift/Parse/IDEInspectionCallbacks.h"
 #include "swift/Parse/Lexer.h"
@@ -53,21 +54,12 @@ Parser::ParsedTypeAttributeList::applyAttributesToType(Parser &p,
     ty = new (p.Context) CompileTimeConstTypeRepr(ty, ConstLoc);
   }
 
-  if (ResultDependsOnLoc.isValid()) {
-    ty = new (p.Context) ResultDependsOnTypeRepr(ty, ResultDependsOnLoc);
-  }
-
-  if (TransferringLoc.isValid()) {
-    ty = new (p.Context) TransferringTypeRepr(ty, TransferringLoc);
-  }
-
   if (SendingLoc.isValid()) {
     ty = new (p.Context) SendingTypeRepr(ty, SendingLoc);
   }
 
-  if (!lifetimeDependenceSpecifiers.empty()) {
-    ty = LifetimeDependentReturnTypeRepr::create(p.Context, ty,
-                                                 lifetimeDependenceSpecifiers);
+  if (lifetimeEntry) {
+    ty = LifetimeDependentTypeRepr::create(p.Context, ty, lifetimeEntry);
   }
   return ty;
 }
@@ -163,6 +155,8 @@ LayoutConstraint Parser::parseLayoutConstraint(Identifier LayoutConstraintID) {
 ///     type-collection
 ///     type-array
 ///     '_'
+///     integer-literal
+///     '-' integer-literal
 ///     'Pack' '{' (type (',' type)*)? '}'    (only in SIL files)a
 ParserResult<TypeRepr> Parser::parseTypeSimple(
     Diag<> MessageID, ParseTypeReason reason) {
@@ -179,6 +173,12 @@ ParserResult<TypeRepr> Parser::parseTypeSimple(
   SourceLoc tildeLoc;
   if (Tok.isTilde()) {
     tildeLoc = consumeToken();
+  }
+
+  // Eat any '-' preceding integer literals.
+  SourceLoc minusLoc;
+  if (Tok.isMinus() && peekToken().is(tok::integer_literal)) {
+    minusLoc = consumeToken();
   }
 
   switch (Tok.getKind()) {
@@ -237,6 +237,12 @@ ParserResult<TypeRepr> Parser::parseTypeSimple(
     }
     return makeParserCodeCompletionResult<TypeRepr>(
         ErrorTypeRepr::create(Context, consumeToken(tok::code_complete)));
+  case tok::integer_literal: {
+    auto text = copyAndStripUnderscores(Tok.getText());
+    auto loc = consumeToken(tok::integer_literal);
+    ty = makeParserResult(new (Context) IntegerTypeRepr(text, loc, minusLoc));
+    break;
+  }
   case tok::l_square: {
     ty = parseTypeCollection();
     break;
@@ -403,8 +409,14 @@ ParserResult<TypeRepr> Parser::parseTypeScalar(
   ParserStatus status;
 
   // Parse attributes.
-  ParsedTypeAttributeList parsedAttributeList;
+  ParsedTypeAttributeList parsedAttributeList(reason);
   status |= parsedAttributeList.parse(*this);
+
+  // If we have a completion, create an ErrorType.
+  if (status.hasCodeCompletion()) {
+    auto *ET = ErrorTypeRepr::create(Context, PreviousLoc);
+    return makeParserCodeCompletionResult<TypeRepr>(ET);
+  }
 
   // Parse generic parameters in SIL mode.
   GenericParamList *generics = nullptr;
@@ -1007,7 +1019,7 @@ Parser::parseTypeSimpleOrComposition(Diag<> MessageID, ParseTypeReason reason) {
             .fixItInsert(FirstTypeLoc, keyword.str() + " ");
       }
 
-      const bool isAnyKeyword = keyword.equals("any");
+      const bool isAnyKeyword = keyword == "any";
 
       if (isAnyKeyword) {
         if (anyLoc.isInvalid()) {
@@ -1205,6 +1217,11 @@ ParserResult<TypeRepr> Parser::parseTypeTupleBody() {
       ObsoletedInOutLoc = SourceLoc();
     }
     Backtracking.reset();
+
+    // Try complete the start of a parameter type since the user may be writing
+    // this as a function type.
+    if (tryCompleteFunctionParamTypeBeginning())
+      return makeParserCodeCompletionStatus();
 
     // Parse the type annotation.
     auto type = parseType(diag::expected_type);
@@ -1472,7 +1489,9 @@ static bool isGenericTypeDisambiguatingToken(Parser &P) {
   auto &tok = P.Tok;
   switch (tok.getKind()) {
   default:
-    return false;
+    // If this is the end of the expr (wouldn't match parseExprSequenceElement),
+    // prefer generic type list over an illegal unary postfix '>' operator.
+    return P.isStartOfSwiftDecl() || P.isStartOfStmt(/*prefer expr=*/true);
   case tok::r_paren:
   case tok::r_square:
   case tok::l_brace:
@@ -1506,7 +1525,7 @@ static bool isGenericTypeDisambiguatingToken(Parser &P) {
 }
 
 bool Parser::canParseAsGenericArgumentList() {
-  if (!Tok.isAnyOperator() || !Tok.getText().equals("<"))
+  if (!Tok.isAnyOperator() || Tok.getText() != "<")
     return false;
 
   BacktrackingScope backtrack(*this);
@@ -1555,6 +1574,8 @@ bool Parser::canParseType() {
     consumeToken();
   } else if (Tok.isContextualKeyword("each")) {
     consumeToken();
+  } else if (Tok.isContextualKeyword("sending")) {
+    consumeToken();
   }
 
   switch (Tok.getKind()) {
@@ -1566,13 +1587,26 @@ bool Parser::canParseType() {
       return false;
     break;
   case tok::oper_prefix:
-    if (Tok.getText() != "~") {
+    if (!Tok.isTilde() && !Tok.isMinus()) {
       return false;
     }
 
-    consumeToken();
-    if (!canParseTypeIdentifier())
-      return false;
+    // '~' can only appear before type identifiers like '~Copyable'.
+    if (Tok.isTilde()) {
+      consumeToken();
+
+      if (!canParseTypeIdentifier())
+        return false;
+    }
+
+    // '-' can only appear before integers being used as types like '-123'.
+    if (Tok.isMinus()) {
+      consumeToken();
+
+      if (!Tok.is(tok::integer_literal))
+        return false;
+    }
+
     break;
   case tok::kw_protocol:
     return canParseOldStyleProtocolComposition();
@@ -1602,7 +1636,9 @@ bool Parser::canParseType() {
   case tok::kw__:
     consumeToken();
     break;
-
+  case tok::integer_literal:
+    consumeToken();
+    break;
 
   default:
     return false;

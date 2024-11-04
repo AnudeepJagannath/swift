@@ -23,6 +23,7 @@
 #include "swift/AST/Module.h"
 #include "swift/AST/Pattern.h"
 #include "swift/AST/SourceFile.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/PlaygroundOption.h"
 
 #include <random>
@@ -460,7 +461,14 @@ public:
           }
         } else if (auto *AE = dyn_cast<ApplyExpr>(E)) {
           bool Handled = false;
-          if (auto *DRE = dyn_cast<DeclRefExpr>(AE->getFn())) {
+          DeclRefExpr *DRE = nullptr;
+          // With Swift 6 the print() function decl is a sub expression
+          // of a function conversion expression.
+          if (auto *FCE = dyn_cast<FunctionConversionExpr>(AE->getFn()))
+            DRE = dyn_cast<DeclRefExpr>(FCE->getSubExpr());
+          else
+            DRE = dyn_cast<DeclRefExpr>(AE->getFn());
+          if (DRE) {
             auto *FnD = dyn_cast<AbstractFunctionDecl>(DRE->getDecl());
             if (FnD && FnD->getModuleContext() == Context.TheStdlibModule) {
               DeclBaseName FnName = FnD->getBaseName();
@@ -661,7 +669,7 @@ public:
       return nullptr;
     }
 
-    if (isa<ConstructorDecl>(TypeCheckDC) && VD->getNameStr().equals("self")) {
+    if (isa<ConstructorDecl>(TypeCheckDC) && VD->getNameStr() == "self") {
       // Don't log "self" in a constructor
       return nullptr;
     }
@@ -949,7 +957,9 @@ void swift::performPlaygroundTransform(SourceFile &SF, PlaygroundOptionSet Opts)
 
     PreWalkAction walkToDeclPre(Decl *D) override {
       if (auto *FD = dyn_cast<AbstractFunctionDecl>(D)) {
-        if (!FD->isImplicit() && !FD->isBodySkipped()) {
+        // Skip any functions that do not have user-written source code.
+        if (!FD->isImplicit() && !FD->isBodySkipped() &&
+            !FD->isInMacroExpansionInContext()) {
           if (BraceStmt *Body = FD->getBody()) {
             const ParameterList *PL = FD->getParameters();
             Instrumenter I(ctx, FD, RNG, Options, TmpNameIndex);

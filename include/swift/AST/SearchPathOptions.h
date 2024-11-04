@@ -20,6 +20,7 @@
 #include "llvm/ADT/IntrusiveRefCntPtr.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/Error.h"
+#include "llvm/Support/VersionTuple.h"
 #include "llvm/Support/VirtualFileSystem.h"
 #include <optional>
 
@@ -377,6 +378,10 @@ private:
   std::optional<std::string> VCToolsRoot = std::nullopt;
   std::optional<std::string> VCToolsVersion = std::nullopt;
 
+  std::optional<StringRef> SysRoot = std::nullopt;
+
+  mutable std::optional<std::string> SDKPlatformPath = std::nullopt;
+
 public:
   StringRef getSDKPath() const { return SDKPath; }
 
@@ -394,6 +399,12 @@ public:
 
     Lookup.searchPathsDidChange();
   }
+
+  /// Retrieves the corresponding parent platform path for the SDK, or
+  /// \c nullopt if there isn't one.
+  /// NOTE: This computes and caches the result, and as such will not respect
+  /// a different FileSystem being passed later.
+  std::optional<StringRef> getSDKPlatformPath(llvm::vfs::FileSystem *FS) const;
 
   std::optional<StringRef> getWinSDKRoot() const { return WinSDKRoot; }
   void setWinSDKRoot(StringRef root) {
@@ -413,6 +424,11 @@ public:
   std::optional<StringRef> getVCToolsVersion() const { return VCToolsVersion; }
   void setVCToolsVersion(StringRef version) {
     VCToolsVersion = version;
+  }
+
+  std::optional<StringRef> getSysRoot() const { return SysRoot; }
+  void setSysRoot(StringRef sysroot) {
+    SysRoot = sysroot;
   }
 
   ArrayRef<std::string> getImportSearchPaths() const {
@@ -468,6 +484,9 @@ public:
   /// Plugin search path options.
   std::vector<PluginSearchOption> PluginSearchOpts;
 
+  /// Path to in-process plugin server shared library.
+  std::string InProcessPluginServerPath;
+
   /// Don't look in for compiler-provided modules.
   bool SkipRuntimeLibraryImportPaths = false;
 
@@ -509,6 +528,14 @@ public:
   using CrossImportMap = llvm::StringMap<std::vector<std::string>>;
   CrossImportMap CrossImportInfo;
 
+  /// CanImport information passed from scanning.
+  struct CanImportInfo {
+    std::string ModuleName;
+    llvm::VersionTuple Version;
+    llvm::VersionTuple UnderlyingVersion;
+  };
+  std::vector<CanImportInfo> CanImportModuleInfo;
+
   /// Whether to search for cross import overlay on file system.
   bool DisableCrossImportOverlaySearch = false;
 
@@ -523,8 +550,9 @@ public:
   /// Specify the module loading behavior of the compilation.
   ModuleLoadingMode ModuleLoadMode = ModuleLoadingMode::PreferSerialized;
 
-  /// Legacy scanner search behavior.
-  bool NoScannerModuleValidation = false;
+  /// New scanner search behavior. Validate up-to-date existing Swift module
+  /// dependencies in the scanner itself.
+  bool ScannerModuleValidation = false;
 
   /// Return all module search paths that (non-recursively) contain a file whose
   /// name is in \p Filenames.
@@ -574,7 +602,7 @@ public:
                         hash_combine_range(RuntimeLibraryImportPaths.begin(),
                                            RuntimeLibraryImportPaths.end()),
                         DisableModulesValidateSystemDependencies,
-                        NoScannerModuleValidation,
+                        ScannerModuleValidation,
                         ModuleLoadMode);
   }
 

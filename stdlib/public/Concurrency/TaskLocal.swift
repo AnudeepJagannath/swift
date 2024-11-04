@@ -11,7 +11,6 @@
 //===----------------------------------------------------------------------===//
 
 import Swift
-@_implementationOnly import _SwiftConcurrencyShims
 
 
 // Macros are disabled when Swift is built without swift-syntax.
@@ -215,14 +214,21 @@ public final class TaskLocal<Value: Sendable>: Sendable, CustomStringConvertible
       file: file, line: line)
   }
 
-  @usableFromInline
+  // Note: hack to stage out @_unsafeInheritExecutor forms of various functions
+  // in favor of #isolation. The _unsafeInheritExecutor_ prefix is meaningful
+  // to the type checker.
+  //
+  // This function also doubles as an ABI-compatibility shim predating the
+  // introduction of #isolation.
   @discardableResult
   @_unsafeInheritExecutor // ABI compatibility with Swift 5.1
   @available(SwiftStdlib 5.1, *)
   @_silgen_name("$ss9TaskLocalC9withValue_9operation4file4lineqd__x_qd__yYaKXESSSutYaKlF")
-  internal func __abi_withValue<R>(_ valueDuringOperation: Value,
-                                   operation: () async throws -> R,
-                                   file: String = #fileID, line: UInt = #line) async rethrows -> R {
+  public func _unsafeInheritExecutor_withValue<R>(
+    _ valueDuringOperation: Value,
+    operation: () async throws -> R,
+    file: String = #fileID, line: UInt = #line
+  ) async rethrows -> R {
     return try await withValueImpl(valueDuringOperation, operation: operation, file: file, line: line)
   }
 
@@ -252,26 +258,22 @@ public final class TaskLocal<Value: Sendable>: Sendable, CustomStringConvertible
                                  operation: () async throws -> R,
                                  isolation: isolated (any Actor)?,
                                  file: String = #fileID, line: UInt = #line) async rethrows -> R {
-    // check if we're not trying to bind a value from an illegal context; this may crash
-    _checkIllegalTaskLocalBindingWithinWithTaskGroup(file: file, line: line)
-
     _taskLocalValuePush(key: key, value: consume valueDuringOperation)
     defer { _taskLocalValuePop() }
 
     return try await operation()
   }
 
+  @_silgen_name("$ss9TaskLocalC13withValueImpl_9operation4file4lineqd__xn_qd__yYaKXESSSutYaKlF")
   @inlinable
   @discardableResult
-  @_unsafeInheritExecutor
+  @_unsafeInheritExecutor // internal for backwards compatibility; though may be able to be removed safely?
   @available(SwiftStdlib 5.1, *)
-  @backDeployed(before: SwiftStdlib 5.9)
-  internal func withValueImpl<R>(_ valueDuringOperation: __owned Value,
-                                 operation: () async throws -> R,
-                                 file: String = #fileID, line: UInt = #line) async rethrows -> R {
-    // check if we're not trying to bind a value from an illegal context; this may crash
-    _checkIllegalTaskLocalBindingWithinWithTaskGroup(file: file, line: line)
-
+  internal func _unsafeInheritExecutor_withValueImpl<R>(
+    _ valueDuringOperation: __owned Value,
+    operation: () async throws -> R,
+    file: String = #fileID, line: UInt = #line
+  ) async rethrows -> R {
     _taskLocalValuePush(key: key, value: consume valueDuringOperation)
     defer { _taskLocalValuePop() }
 
@@ -296,9 +298,6 @@ public final class TaskLocal<Value: Sendable>: Sendable, CustomStringConvertible
   @discardableResult
   public func withValue<R>(_ valueDuringOperation: Value, operation: () throws -> R,
                            file: String = #fileID, line: UInt = #line) rethrows -> R {
-    // check if we're not trying to bind a value from an illegal context; this may crash
-    _checkIllegalTaskLocalBindingWithinWithTaskGroup(file: file, line: line)
-
     _taskLocalValuePush(key: key, value: valueDuringOperation)
     defer { _taskLocalValuePop() }
 
@@ -312,7 +311,7 @@ public final class TaskLocal<Value: Sendable>: Sendable, CustomStringConvertible
 
     @available(*, unavailable, message: "use '$myTaskLocal.withValue(_:do:)' instead")
     set {
-      fatalError("Illegal attempt to set a \(Self.self) value, use `withValue(...) { ... }` instead.")
+      fatalError("Illegal attempt to set a TaskLocal value, use `withValue(...) { ... }` instead.")
     }
   }
 
@@ -371,8 +370,9 @@ func _taskLocalsCopy(
 
 // ==== Checks -----------------------------------------------------------------
 
-@available(SwiftStdlib 5.1, *)
 @usableFromInline
+@available(SwiftStdlib 5.1, *)
+@available(*, deprecated, message: "The situation diagnosed by this is not handled gracefully rather than by crashing")
 func _checkIllegalTaskLocalBindingWithinWithTaskGroup(file: String, line: UInt) {
   if _taskHasTaskGroupStatusRecord() {
     file.withCString { _fileStart in
@@ -382,8 +382,9 @@ func _checkIllegalTaskLocalBindingWithinWithTaskGroup(file: String, line: UInt) 
   }
 }
 
-@available(SwiftStdlib 5.1, *)
 @usableFromInline
+@available(SwiftStdlib 5.1, *)
+@available(*, deprecated, message: "The situation diagnosed by this is not handled gracefully rather than by crashing")
 @_silgen_name("swift_task_reportIllegalTaskLocalBindingWithinWithTaskGroup")
 func _reportIllegalTaskLocalBindingWithinWithTaskGroup(
   _ _filenameStart: UnsafePointer<Int8>,

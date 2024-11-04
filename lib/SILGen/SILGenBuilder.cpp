@@ -19,6 +19,7 @@
 #include "SwitchEnumBuilder.h"
 #include "swift/AST/GenericSignature.h"
 #include "swift/AST/SubstitutionMap.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/SIL/DynamicCasts.h"
 #include "swift/SIL/SILInstruction.h"
 
@@ -536,9 +537,6 @@ static ManagedValue createInputFunctionArgument(
       isNoImplicitCopy |= pd->getSpecifier() == ParamSpecifier::Borrowing;
       isNoImplicitCopy |= pd->getSpecifier() == ParamSpecifier::Consuming;
     }
-    if (pd->hasResultDependsOn()) {
-      arg->setHasResultDependsOn();
-    }
   }
   if (isNoImplicitCopy)
     arg->setNoImplicitCopy(isNoImplicitCopy);
@@ -566,6 +564,7 @@ static ManagedValue createInputFunctionArgument(
   case SILArgumentConvention::Pack_Owned:
     return SGF.emitManagedPackWithCleanup(arg);
 
+  case SILArgumentConvention::Indirect_In_CXX:
   case SILArgumentConvention::Indirect_In:
     if (SGF.silConv.useLoweredAddresses())
       return SGF.emitManagedBufferWithCleanup(arg);
@@ -1204,4 +1203,18 @@ ManagedValue SILGenBuilder::borrowObjectRValue(SILGenFunction &SGF,
     return SGF.emitManagedBeginBorrow(loc, value);
   }
   return SGF.emitFormalEvaluationManagedBeginBorrow(loc, value);
+}
+
+ManagedValue SILGenBuilder::createHopToMainActorIfNeededThunk(
+    SILLocation loc, ManagedValue op, SubstitutionMap substitutionMap) {
+  if (op.getOwnershipKind() == OwnershipKind::None) {
+    auto *thunkedFunc = createHopToMainActorIfNeededThunk(
+        loc, op.forward(getSILGenFunction()), substitutionMap);
+    return SGF.emitManagedRValueWithCleanup(thunkedFunc);
+  }
+
+  CleanupCloner cloner(*this, op);
+  auto *thunkedFunc = createHopToMainActorIfNeededThunk(
+      loc, op.forward(getSILGenFunction()), substitutionMap);
+  return cloner.clone(thunkedFunc);
 }

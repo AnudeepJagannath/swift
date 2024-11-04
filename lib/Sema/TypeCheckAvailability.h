@@ -14,7 +14,7 @@
 #define SWIFT_SEMA_TYPE_CHECK_AVAILABILITY_H
 
 #include "swift/AST/AttrKind.h"
-#include "swift/AST/Availability.h"
+#include "swift/AST/AvailabilityContext.h"
 #include "swift/AST/DeclContext.h"
 #include "swift/AST/Identifier.h"
 #include "swift/Basic/LLVM.h"
@@ -73,10 +73,7 @@ enum class ExportabilityReason : unsigned {
   ResultBuilder,
   ExtensionWithPublicMembers,
   ExtensionWithConditionalConformances,
-  // Exported members of extension can be `package`.
-  ExtensionWithPackageMembers,
-  // Exported inheritance type can be `package`.
-  ExtensionWithPackageConditionalConformances
+  Inheritance
 };
 
 /// A description of the restrictions on what declarations can be referenced
@@ -84,12 +81,9 @@ enum class ExportabilityReason : unsigned {
 ///
 /// We say a declaration is "exported" if all of the following holds:
 ///
-/// - the declaration is `public`  or `@usableFromInline`
+/// - the declaration is `public` or `@usableFromInline`
 /// - the declaration is not `@_spi`
 /// - the declaration was not imported from an `@_implementationOnly` import
-/// - the declaration is `package`; while treated as exported, the
-///   scope is limited compared to `public`  or `@usableFromInline`;
-///   the `IsPackage` bit is set to track the scope.
 ///
 /// The "signature" of a declaration is the set of all types written in the
 /// declaration (such as function parameter and return types), but not
@@ -109,21 +103,16 @@ enum class ExportabilityReason : unsigned {
 /// without producing a warning or error, respectively.
 class ExportContext {
   DeclContext *DC;
-  AvailabilityContext RunningOSVersion;
+  AvailabilityContext Availability;
   FragileFunctionKind FragileKind;
   unsigned SPI : 1;
-  unsigned IsPackage : 1;
   unsigned Exported : 1;
-  unsigned Deprecated : 1;
   unsigned Implicit : 1;
-  unsigned Unavailable : 1;
-  unsigned Platform : 8;
   unsigned Reason : 3;
 
-  ExportContext(DeclContext *DC, AvailabilityContext runningOSVersion,
-                FragileFunctionKind kind, bool spi, bool isPackage, bool exported,
-                bool implicit, bool deprecated,
-                std::optional<PlatformKind> unavailablePlatformKind);
+  ExportContext(DeclContext *DC, AvailabilityContext availability,
+                FragileFunctionKind kind, bool spi, bool exported,
+                bool implicit);
 
 public:
 
@@ -160,10 +149,17 @@ public:
   /// That is, this will perform a 'bitwise and' on the 'exported' bit.
   ExportContext withExported(bool exported) const;
 
+  /// Produce a new context with the same properties as this one, except the
+  /// availability context is constrained by \p availability if necessary.
+  ExportContext
+  withRefinedAvailability(const AvailabilityRange &availability) const;
+
   DeclContext *getDeclContext() const { return DC; }
 
-  AvailabilityContext getAvailabilityContext() const {
-    return RunningOSVersion;
+  AvailabilityContext getAvailability() const { return Availability; }
+
+  AvailabilityRange getAvailabilityRange() const {
+    return Availability.getPlatformRange();
   }
 
   /// If not 'None', the context has the inlinable function body restriction.
@@ -176,18 +172,17 @@ public:
   /// If true, the context is SPI and can reference SPI declarations.
   bool isSPI() const { return SPI; }
 
-  /// If true, the context has a package access scope.
-  bool isPackage() const { return IsPackage; }
-
   /// If true, the context is exported and cannot reference SPI declarations
   /// or declarations from `@_implementationOnly` imports.
   bool isExported() const { return Exported; }
 
   /// If true, the context is part of a deprecated declaration and can
   /// reference other deprecated declarations without warning.
-  bool isDeprecated() const { return Deprecated; }
+  bool isDeprecated() const { return Availability.isDeprecated(); }
 
-  std::optional<PlatformKind> getUnavailablePlatformKind() const;
+  std::optional<PlatformKind> getUnavailablePlatformKind() const {
+    return Availability.getUnavailablePlatformKind();
+  }
 
   /// If true, the context can only reference exported declarations, either
   /// because it is the signature context of an exported declaration, or
@@ -197,6 +192,12 @@ public:
   /// Get the ExportabilityReason for diagnostics. If this is 'None', there
   /// are no restrictions on referencing unexported declarations.
   std::optional<ExportabilityReason> getExportabilityReason() const;
+
+  /// If \p decl is unconditionally unavailable in this context, and the context
+  /// is not also unavailable in the same way, then this returns the specific
+  /// `@available` attribute that makes the decl unavailable. Otherwise, returns
+  /// nullptr.
+  const AvailableAttr *shouldDiagnoseDeclAsUnavailable(const Decl *decl) const;
 };
 
 /// Check if a declaration is exported as part of a module's external interface.
@@ -216,16 +217,6 @@ void diagnoseExprAvailability(const Expr *E, DeclContext *DC);
 void diagnoseStmtAvailability(const Stmt *S, DeclContext *DC,
                               bool walkRecursively=false);
 
-/// Diagnose uses of unavailable declarations in types.
-bool diagnoseTypeReprAvailability(const TypeRepr *T,
-                                  const ExportContext &context,
-                                  DeclAvailabilityFlags flags = std::nullopt);
-
-/// Diagnose uses of unavailable conformances in types.
-void diagnoseTypeAvailability(Type T, SourceLoc loc,
-                              const ExportContext &context,
-                              DeclAvailabilityFlags flags = std::nullopt);
-
 /// Checks both a TypeRepr and a Type, but avoids emitting duplicate
 /// diagnostics by only checking the Type if the TypeRepr succeeded.
 void diagnoseTypeAvailability(const TypeRepr *TR, Type T, SourceLoc loc,
@@ -240,15 +231,6 @@ diagnoseConformanceAvailability(SourceLoc loc,
                                 Type replacementTy=Type(),
                                 bool warnIfConformanceUnavailablePreSwift6 = false);
 
-bool diagnoseSubstitutionMapAvailability(
-    SourceLoc loc,
-    SubstitutionMap subs, 
-    const ExportContext &context,
-    Type depTy = Type(),
-    Type replacementTy = Type(),
-    bool warnIfConformanceUnavailablePreSwift6 = false,
-    bool suppressParameterizationCheckForOptional = false);
-
 /// Diagnose uses of unavailable declarations. Returns true if a diagnostic
 /// was emitted.
 bool diagnoseDeclAvailability(const ValueDecl *D, SourceRange R,
@@ -261,30 +243,21 @@ void diagnoseOverrideOfUnavailableDecl(ValueDecl *override,
                                        const ValueDecl *base,
                                        const AvailableAttr *attr);
 
-/// Emit a diagnostic for references to declarations that have been
-/// marked as unavailable, either through "unavailable" or "obsoleted:".
-bool diagnoseExplicitUnavailability(const ValueDecl *D, SourceRange R,
-                                    const ExportContext &Where,
-                                    const Expr *call,
-                                    DeclAvailabilityFlags Flags = std::nullopt);
+/// Checks whether a declaration should be considered unavailable when referred
+/// to in the given declaration context and availability context and, if so,
+/// returns a result that describes the unmet availability requirements.
+/// Returns `std::nullopt` if the declaration is available.
+std::optional<UnmetAvailabilityRequirement>
+getUnmetDeclAvailabilityRequirement(const Decl *decl,
+                                    const DeclContext *declContext,
+                                    AvailabilityContext availabilityContext);
 
-/// Emit a diagnostic for references to declarations that have been
-/// marked as unavailable, either through "unavailable" or "obsoleted:".
-bool diagnoseExplicitUnavailability(
-    const ValueDecl *D,
-    SourceRange R,
-    const ExportContext &Where,
-    DeclAvailabilityFlags Flags,
-    llvm::function_ref<void(InFlightDiagnostic &)> attachRenameFixIts);
-
-/// Emit a diagnostic for references to declarations that have been
-/// marked as unavailable, either through "unavailable" or "obsoleted:".
-bool diagnoseExplicitUnavailability(
-    SourceLoc loc,
-    const RootProtocolConformance *rootConf,
-    const ExtensionDecl *ext,
-    const ExportContext &where,
-    bool warnIfConformanceUnavailablePreSwift6 = false);
+/// Checks whether a declaration should be considered unavailable when referred
+/// to at the given source location in the given decl context and, if so,
+/// returns a result that describes the unmet availability requirements.
+/// Returns `std::nullopt` if the declaration is available.
+std::optional<UnmetAvailabilityRequirement> getUnmetDeclAvailabilityRequirement(
+    const Decl *decl, const DeclContext *referenceDC, SourceLoc referenceLoc);
 
 /// Diagnose uses of the runtime support of the given type, such as
 /// type metadata and dynamic casting.

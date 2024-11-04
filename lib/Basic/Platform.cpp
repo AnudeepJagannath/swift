@@ -10,6 +10,7 @@
 //
 //===----------------------------------------------------------------------===//
 
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Platform.h"
 #include "llvm/ADT/StringExtras.h"
 #include "llvm/ADT/StringSwitch.h"
@@ -196,32 +197,31 @@ static StringRef getPlatformNameForDarwin(const DarwinPlatformKind platform) {
 
 StringRef swift::getPlatformNameForTriple(const llvm::Triple &triple) {
   switch (triple.getOS()) {
-  case llvm::Triple::ZOS:
-  case llvm::Triple::Ananas:
-  case llvm::Triple::CloudABI:
+  case llvm::Triple::AIX:
+  case llvm::Triple::AMDHSA:
+  case llvm::Triple::AMDPAL:
+  case llvm::Triple::BridgeOS:
+  case llvm::Triple::CUDA:
   case llvm::Triple::DragonFly:
   case llvm::Triple::DriverKit:
+  case llvm::Triple::ELFIAMCU:
   case llvm::Triple::Emscripten:
   case llvm::Triple::Fuchsia:
-  case llvm::Triple::KFreeBSD:
-  case llvm::Triple::Lv2:
-  case llvm::Triple::NetBSD:
-  case llvm::Triple::PS5:
-  case llvm::Triple::ShaderModel:
-  case llvm::Triple::Solaris:
-  case llvm::Triple::Minix:
-  case llvm::Triple::RTEMS:
-  case llvm::Triple::NaCl:
-  case llvm::Triple::AIX:
-  case llvm::Triple::CUDA:
-  case llvm::Triple::NVCL:
-  case llvm::Triple::AMDHSA:
-  case llvm::Triple::ELFIAMCU:
-  case llvm::Triple::Mesa3D:
-  case llvm::Triple::Contiki:
-  case llvm::Triple::AMDPAL:
   case llvm::Triple::HermitCore:
   case llvm::Triple::Hurd:
+  case llvm::Triple::KFreeBSD:
+  case llvm::Triple::Lv2:
+  case llvm::Triple::Mesa3D:
+  case llvm::Triple::NaCl:
+  case llvm::Triple::NetBSD:
+  case llvm::Triple::NVCL:
+  case llvm::Triple::PS5:
+  case llvm::Triple::RTEMS:
+  case llvm::Triple::Serenity:
+  case llvm::Triple::ShaderModel:
+  case llvm::Triple::Solaris:
+  case llvm::Triple::Vulkan:
+  case llvm::Triple::ZOS:
     return "";
   case llvm::Triple::Darwin:
   case llvm::Triple::MacOSX:
@@ -470,7 +470,13 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
         return floorFor64(llvm::VersionTuple(5, 5));
       return floorFor64(llvm::VersionTuple(5, 6));
     } else if (Major == 13) {
-      return floorFor64(llvm::VersionTuple(5, 7));
+      if (Minor <= 2)
+        return floorFor64(llvm::VersionTuple(5, 7));
+      return floorFor64(llvm::VersionTuple(5, 8));
+    } else if (Major == 14) {
+      if (Minor <= 3)
+        return floorFor64(llvm::VersionTuple(5, 9));
+      return floorFor64(llvm::VersionTuple(5, 10));
     }
   } else if (Triple.isiOS()) { // includes tvOS
     llvm::VersionTuple OSVersion = Triple.getiOSVersion();
@@ -510,7 +516,13 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
         return floorForArchitecture(llvm::VersionTuple(5, 5));
       return floorForArchitecture(llvm::VersionTuple(5, 6));
     } else if (Major <= 16) {
-      return floorForArchitecture(llvm::VersionTuple(5, 7));
+      if (Minor <= 3)
+        return floorForArchitecture(llvm::VersionTuple(5, 7));
+      return floorForArchitecture(llvm::VersionTuple(5, 8));
+    } else if (Major <= 17) {
+      if (Minor <= 3)
+        return floorForArchitecture(llvm::VersionTuple(5, 9));
+      return floorForArchitecture(llvm::VersionTuple(5, 10));
     }
   } else if (Triple.isWatchOS()) {
     llvm::VersionTuple OSVersion = Triple.getWatchOSVersion();
@@ -541,11 +553,25 @@ swift::getSwiftRuntimeCompatibilityVersionForTarget(
         return floorFor64bits(llvm::VersionTuple(5, 5));
       return floorFor64bits(llvm::VersionTuple(5, 6));
     } else if (Major <= 9) {
-      return floorFor64bits(llvm::VersionTuple(5, 7));
+      if (Minor <= 3)
+        return floorFor64bits(llvm::VersionTuple(5, 7));
+      return floorFor64bits(llvm::VersionTuple(5, 8));
+    } else if (Major <= 10) {
+      if (Minor <= 3)
+        return floorFor64bits(llvm::VersionTuple(5, 9));
+      return floorFor64bits(llvm::VersionTuple(5, 10));
     }
   }
   else if (Triple.isXROS()) {
-    return std::nullopt;
+    llvm::VersionTuple OSVersion = Triple.getOSVersion();
+    unsigned Major = OSVersion.getMajor();
+    unsigned Minor = OSVersion.getMinor().value_or(0);
+
+    if (Major <= 1) {
+      if (Minor <= 0)
+        return llvm::VersionTuple(5, 9);
+      return llvm::VersionTuple(5, 10);
+    }
   }
 
   return std::nullopt;

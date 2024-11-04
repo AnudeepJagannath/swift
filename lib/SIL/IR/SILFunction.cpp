@@ -32,6 +32,7 @@
 #include "swift/SIL/SILModule.h"
 #include "swift/SIL/SILProfiler.h"
 #include "clang/AST/Decl.h"
+#include "swift/Basic/Assertions.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/GraphWriter.h"
@@ -101,7 +102,7 @@ SILSpecializeAttr::SILSpecializeAttr(bool exported, SpecializationKind kind,
                                      ArrayRef<Type> typeErasedParams,
                                      SILFunction *target, Identifier spiGroup,
                                      const ModuleDecl *spiModule,
-                                     AvailabilityContext availability)
+                                     AvailabilityRange availability)
     : kind(kind), exported(exported), specializedSignature(specializedSig),
       unerasedSpecializedSignature(unerasedSpecializedSig),
       typeErasedParams(typeErasedParams.begin(), typeErasedParams.end()),
@@ -117,7 +118,7 @@ SILSpecializeAttr::create(SILModule &M, GenericSignature specializedSig,
                           bool exported, SpecializationKind kind,
                           SILFunction *target, Identifier spiGroup,
                           const ModuleDecl *spiModule,
-                          AvailabilityContext availability) {
+                          AvailabilityRange availability) {
   auto erasedSpecializedSig =
       SILSpecializeAttr::buildTypeErasedSignature(specializedSig,
                                                   typeErasedParams);
@@ -217,7 +218,7 @@ SILFunction::SILFunction(
     IsRuntimeAccessible_t isRuntimeAccessible)
     : SwiftObjectHeader(functionMetatype), Module(Module),
       index(Module.getNewFunctionIndex()),
-      Availability(AvailabilityContext::alwaysAvailable()) {
+      Availability(AvailabilityRange::alwaysAvailable()) {
   init(Linkage, Name, LoweredType, genericEnv, isBareSILFunction, isTrans,
        serializedKind, entryCount, isThunk, classSubclassScope, inlineStrategy, E,
        DebugScope, isDynamic, isExactSelfClass, isDistributed,
@@ -247,7 +248,7 @@ void SILFunction::init(
   this->LoweredType = LoweredType;
   this->SpecializationInfo = nullptr;
   this->EntryCount = entryCount;
-  this->Availability = AvailabilityContext::alwaysAvailable();
+  this->Availability = AvailabilityRange::alwaysAvailable();
   this->Bare = isBareSILFunction;
   this->Transparent = isTrans;
   this->SerializedKind = serializedKind;
@@ -266,7 +267,6 @@ void SILFunction::init(
   this->ForceEnableLexicalLifetimes = DoNotForceEnableLexicalLifetimes;
   this->UseStackForPackMetadata = DoUseStackForPackMetadata;
   this->HasUnsafeNonEscapableResult = false;
-  this->HasResultDependsOnSelf = false;
   this->IsPerformanceConstraint = false;
   this->stackProtection = false;
   this->Inlined = false;
@@ -503,8 +503,7 @@ Type SILFunction::mapTypeIntoContext(Type type) const {
     // Otherwise, assume we have an interface type for the "combined" captured
     // environment.
     return type.subst(MapIntoLocalArchetypeContext(GenericEnv, CapturedEnvs),
-                      LookUpConformanceInModule(Module.getSwiftModule()),
-                      SubstFlags::AllowLoweredTypes |
+                      LookUpConformanceInModule(),
                       SubstFlags::PreservePackExpansionLevel);
   }
 
@@ -519,7 +518,7 @@ SILType SILFunction::mapTypeIntoContext(SILType type) const {
     auto genericSig = GenericEnv->getGenericSignature().getCanonicalSignature();
     return type.subst(Module,
                       MapIntoLocalArchetypeContext(GenericEnv, CapturedEnvs),
-                      LookUpConformanceInModule(Module.getSwiftModule()),
+                      LookUpConformanceInModule(),
                       genericSig,
                       SubstFlags::PreservePackExpansionLevel);
   }
@@ -535,7 +534,7 @@ SILType GenericEnvironment::mapTypeIntoContext(SILModule &M,
   auto genericSig = getGenericSignature().getCanonicalSignature();
   return type.subst(M,
                     QueryInterfaceTypeSubstitutions(this),
-                    LookUpConformanceInModule(M.getSwiftModule()),
+                    LookUpConformanceInModule(),
                     genericSig,
                     SubstFlags::PreservePackExpansionLevel);
 }
@@ -625,7 +624,7 @@ bool SILFunction::isWeakImported(ModuleDecl *module) const {
     return false;
 
   auto deploymentTarget =
-      AvailabilityContext::forDeploymentTarget(getASTContext());
+      AvailabilityRange::forDeploymentTarget(getASTContext());
 
   if (getASTContext().LangOpts.WeakLinkAtTarget)
     return !Availability.isSupersetOf(deploymentTarget);
@@ -920,8 +919,6 @@ bool SILFunction::hasName(const char *Name) const {
  Checks if this (callee) function body can be inlined into the caller
  by comparing their SerializedKind_t values. 
  
- If the \p assumeFragileCaller is true, the caller must be serialized,
- in which case the callee needs to be serialized also to be inlined.
  If both callee and caller are not_serialized, the callee can be inlined
  into the caller during SIL inlining passes even if it (and the caller)
  might contain private symbols. If this callee is serialized_for_pkg, it
@@ -934,22 +931,13 @@ Callee  serialized_for_pkg  |      ok        |       ok           |    no
         serialized          |      ok        |       ok           |    ok
 
 */
-bool SILFunction::canBeInlinedIntoCaller(
-      std::optional<SerializedKind_t> callerSerializedKind,
-      bool assumeFragileCaller) const {
-  // If the \p assumeFragileCaller is true, the caller must
-  // be serialized, so return true only if the callee is also
-  // serialized.
-  if (assumeFragileCaller)
-    return isSerialized();
-                                           
+bool SILFunction::canBeInlinedIntoCaller(SerializedKind_t callerSerializedKind) const {
   switch (getSerializedKind()) {
     // If both callee and caller are not_serialized, the callee
     // can be inlined into the caller during SIL inlining passes
     // even if it (and the caller) might contain private symbols.
     case IsNotSerialized:
-      return callerSerializedKind.has_value() &&
-             callerSerializedKind.value() == IsNotSerialized;
+      return callerSerializedKind == IsNotSerialized;
 
     // If Package-CMO is enabled, we serialize package, public,
     // and @usableFromInline decls as [serialized_for_package].
@@ -962,8 +950,7 @@ bool SILFunction::canBeInlinedIntoCaller(
     // for this callee's body to be inlined into the caller.
     // It can however be referenced by [serialized] caller.
     case IsSerializedForPackage:
-      return callerSerializedKind.has_value() &&
-             callerSerializedKind.value() != IsSerialized;
+      return callerSerializedKind != IsSerialized;
     case IsSerialized:
       return true;
   }
@@ -972,16 +959,18 @@ bool SILFunction::canBeInlinedIntoCaller(
 
 /// Returns true if this function can be referenced from a fragile function
 /// body.
-bool SILFunction::hasValidLinkageForFragileRef(
-       std::optional<SerializedKind_t> callerSerializedKind,
-       bool assumeFragileCaller) const {
+bool SILFunction::hasValidLinkageForFragileRef(SerializedKind_t callerSerializedKind) const {
   // Fragile functions can reference 'static inline' functions imported
   // from C.
   if (hasForeignBody())
     return true;
 
+  // The call site of this function must have checked that
+  // caller.isAnySerialized() is true, as indicated by the
+  // function name itself (contains 'ForFragileRef').
+  assert(callerSerializedKind != IsNotSerialized);
   // If we can inline it, we can reference it.
-  if (canBeInlinedIntoCaller(callerSerializedKind, assumeFragileCaller))
+  if (canBeInlinedIntoCaller(callerSerializedKind))
     return true;
 
   // If the containing module has been serialized already, we no longer

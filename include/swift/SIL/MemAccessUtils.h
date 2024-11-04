@@ -887,10 +887,10 @@ namespace swift {
 /// For convenience, encapsulate and AccessStorage value along with its
 /// accessed base address.
 struct AccessStorageWithBase {
-  /// Identical to AccessStorage::compute but preserves the access base.
+  /// Identical to AccessStorage::computeInScope but walks through begin_access.
   static AccessStorageWithBase compute(SILValue sourceAddress);
 
-  /// Identical to AccessStorage::computeInScope but preserves the base.
+  /// Identical to AccessStorage::compute but stops at begin_access
   static AccessStorageWithBase computeInScope(SILValue sourceAddress);
 
   AccessStorage storage;
@@ -1648,6 +1648,21 @@ inline bool isAccessStorageIdentityCast(SingleValueInstruction *svi) {
   case SILInstructionKind::MoveOnlyWrapperToCopyableBoxInst:
     return true;
   }
+}
+
+// Strip access markers and casts that preserve the address type.
+//
+// Consider using RelativeAccessStorageWithBase::compute().
+inline SILValue stripAccessAndIdentityCasts(SILValue v) {
+  if (auto *bai = dyn_cast<BeginAccessInst>(v)) {
+    return stripAccessAndIdentityCasts(bai->getOperand());
+  }
+  if (auto *svi = dyn_cast<SingleValueInstruction>(v)) {
+    if (isAccessStorageIdentityCast(svi)) {
+      return stripAccessAndIdentityCasts(svi->getAllOperands()[0].get());
+    }
+  }
+  return v;
 }
 
 /// An address, pointer, or box cast that occurs outside of the formal

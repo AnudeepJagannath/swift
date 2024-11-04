@@ -1,6 +1,8 @@
-// RUN: %target-swift-frontend -parse-as-library -disable-availability-checking -import-objc-header %S/Inputs/perf-annotations.h -emit-sil %s -o /dev/null -verify
-// REQUIRES: swift_stdlib_no_asserts,optimized_stdlib
+// RUN: %target-swift-frontend -parse-as-library -disable-availability-checking -enable-experimental-feature RawLayout -import-objc-header %S/Inputs/perf-annotations.h -emit-sil %s -o /dev/null -verify
+
 // REQUIRES: swift_in_compiler
+// REQUIRES: optimized_stdlib
+// REQUIRES: swift_feature_RawLayout
 
 protocol P {
   func protoMethod(_ a: Int) -> Int
@@ -231,11 +233,6 @@ func closueWhichModifiesLocalVar() -> Int {
   }
   localNonEscapingClosure()
   return x
-}
-
-@_noAllocation
-func createEmptyArray() {
-  _ = [Int]() // expected-error {{ending the lifetime of a value of type}}
 }
 
 struct Buffer {
@@ -505,6 +502,15 @@ func testLargeTuple() {
     _ = GenericStruct<SixInt8s>()
 }
 
+struct Ptr<T> {
+  public var p: UnsafeMutablePointer<T>
+
+  @_noAllocation
+  init(p: UnsafeMutablePointer<T>) {
+    self.p = p
+  }
+}
+
 struct NonCopyableStruct: ~Copyable {
   func foo() {}
 }
@@ -513,4 +519,49 @@ struct NonCopyableStruct: ~Copyable {
 func testNonCopyable() {
   let t = NonCopyableStruct()
   t.foo()
+}
+
+public struct RawLayoutWrapper: ~Copyable {
+  private let x = RawLayout<Int>()
+
+  @_noLocks func testit() {
+    x.test()
+  }
+}
+
+@_rawLayout(like: T)
+public struct RawLayout<T>: ~Copyable {
+  public func test() {}
+}
+
+func takesClosure(_: () -> ()) {}
+
+@_noLocks
+func testClosureExpression<T>(_ t: T) {
+  takesClosure {
+  // expected-error@-1 {{generic closures or local functions can cause metadata allocation or locks}}
+    _ = T.self
+  }
+}
+
+@_noLocks
+func testLocalFunction<T>(_ t: T) {
+  func localFunc() {
+    _ = T.self
+  }
+
+  takesClosure(localFunc)
+  // expected-error@-1 {{generic closures or local functions can cause metadata allocation or locks}}
+}
+
+func takesGInt(_ x: G<Int>) {}
+
+struct G<T> {}
+
+extension G where T == Int {
+  @_noAllocation func method() {
+    takesClosure {
+      takesGInt(self) // OK
+    }
+  }
 }

@@ -1,5 +1,7 @@
 // RUN: %target-swift-frontend -parse-as-library -emit-sil -enforce-exclusivity=checked -primary-file %s -o /dev/null -verify
 
+// REQUIRES: swift_feature_KeyPathWithStaticMembers
+
 // AccessEnforcementWMO assumes that the only way to address a global or static
 // property is via a formal begin_access. If we ever allow keypaths for static
 // properties, which I think is conceivable, then this test will fail to produce
@@ -10,5 +12,5 @@ public class C {
 }
 
 public func testGlobalProp() {
-  let a: AnyKeyPath = \C.globalProp // expected-error{{key path cannot refer to static member 'globalProp'}}
+  let a: AnyKeyPath = \C.globalProp // expected-error{{static member 'globalProp' cannot be used on instance of type 'C'}}
 }

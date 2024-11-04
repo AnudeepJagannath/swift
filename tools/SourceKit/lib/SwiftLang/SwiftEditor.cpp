@@ -745,10 +745,9 @@ public:
 
     BufferID = SM.addNewSourceBuffer(std::move(BufCopy));
 
-    Parser.reset(new ParserUnit(
-        SM, SourceFileKind::Main, BufferID, CompInv.getLangOptions(),
-        CompInv.getTypeCheckerOptions(), CompInv.getSILOptions(),
-        CompInv.getModuleName()));
+    Parser.reset(new ParserUnit(SM, SourceFileKind::Main, BufferID,
+                                CompInv.getLangOptions(),
+                                CompInv.getModuleName()));
 
     registerTypeCheckerRequestFunctions(
         Parser->getParser().Context.evaluator);
@@ -1102,11 +1101,7 @@ public:
       return;
     }
 
-    if (!AstUnit->getPrimarySourceFile().getBufferID().has_value()) {
-      LOG_WARN_FUNC("Primary SourceFile is expected to have a BufferID");
-      return;
-    }
-    unsigned BufferID = AstUnit->getPrimarySourceFile().getBufferID().value();
+    unsigned BufferID = AstUnit->getPrimarySourceFile().getBufferID();
 
     SemanticAnnotator Annotator(CompIns.getSourceMgr(), BufferID);
     Annotator.walk(AstUnit->getPrimarySourceFile());
@@ -1603,22 +1598,6 @@ private:
       }
       return Action::Continue(E);
     }
-
-    PreWalkAction walkToDeclPre(Decl *D) override {
-      if (auto *ICD = dyn_cast<IfConfigDecl>(D)) {
-        // The base walker assumes the content of active IfConfigDecl clauses
-        // has been injected into the parent context and will be walked there.
-        // This doesn't hold for pre-typechecked ASTs and we need to find
-        // placeholders in inactive clauses anyway, so walk them here.
-        for (auto Clause: ICD->getClauses()) {
-          for (auto Elem: Clause.Elements) {
-            Elem.walk(*this);
-          }
-        }
-        return Action::SkipNode();
-      }
-      return Action::Continue();
-    }
   };
 
   class ClosureTypeWalker: public ASTWalker {
@@ -1796,20 +1775,6 @@ private:
           }
         }
         return Action::Continue(S);
-      }
-
-      PreWalkAction walkToDeclPre(Decl *D) override {
-        if (auto *ICD = dyn_cast<IfConfigDecl>(D)) {
-          for (auto Clause : ICD->getClauses()) {
-            // Active clase elements are visited normally.
-            if (Clause.isActive)
-              continue;
-            for (auto Member : Clause.Elements)
-              Member.walk(*this);
-          }
-          return Action::SkipNode();
-        }
-        return Action::Continue();
       }
 
       ArgumentList *findEnclosingCallArg(SourceFile &SF, SourceLoc SL) {
@@ -2400,7 +2365,7 @@ void SwiftEditorDocument::reportDocumentStructure(SourceFile &SrcFile,
                                                   EditorConsumer &Consumer) {
   ide::SyntaxModelContext ModelContext(SrcFile);
   SwiftDocumentStructureWalker Walker(SrcFile.getASTContext().SourceMgr,
-                                      *SrcFile.getBufferID(),
+                                      SrcFile.getBufferID(),
                                       Consumer);
   ModelContext.walk(Walker);
 }
@@ -2624,7 +2589,7 @@ void SwiftLangSupport::getSemanticTokens(
             "Unable to find input file"));
         return;
       }
-      SemanticAnnotator Annotator(CompIns.getSourceMgr(), *SF->getBufferID());
+      SemanticAnnotator Annotator(CompIns.getSourceMgr(), SF->getBufferID());
       Annotator.walk(SF);
       Receiver(
           RequestResult<SemanticTokensResult>::fromResult(Annotator.SemaToks));
@@ -2632,6 +2597,11 @@ void SwiftLangSupport::getSemanticTokens(
 
     void cancelled() override {
       Receiver(RequestResult<SemanticTokensResult>::cancelled());
+    }
+
+    void failed(StringRef Error) override {
+      LOG_WARN_FUNC("semantic tokens failed: " << Error);
+      Receiver(RequestResult<SemanticTokensResult>::fromError(Error));
     }
   };
 

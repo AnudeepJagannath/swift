@@ -1,6 +1,7 @@
 // RUN: %target-typecheck-verify-swift -disable-availability-checking -enable-experimental-feature SendingArgsAndResults -strict-concurrency=complete -enable-upcoming-feature RegionBasedIsolation
 
-// REQUIRES: asserts
+// REQUIRES: swift_feature_RegionBasedIsolation
+// REQUIRES: swift_feature_SendingArgsAndResults
 
 func testArg(_ x: sending String) {
 }
@@ -28,3 +29,6 @@ func testArgWithConsumingWrongOrder(_ x: sending consuming String, _ y: sending 
 func testArgWithConsumingWrongOrderType(_ x: (sending consuming String, sending inout String) -> ()) {}
 // expected-error @-1 {{'sending' must be placed after specifier 'consuming'}}
 // expected-error @-2 {{'sending' must be placed after specifier 'inout'}}
+
+func testBorrowSending(_ x: borrowing sending String) {}
+// expected-error @-1 {{'sending' cannot be used together with 'borrowing'}}

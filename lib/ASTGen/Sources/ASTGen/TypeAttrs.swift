@@ -22,19 +22,16 @@ extension ASTGenVisitor {
     }
 
     let attrs = BridgedTypeAttributes.new()
-    for node in node.attributes {
-      switch node {
-      case .attribute(let node):
-        guard let attr = self.generateTypeAttribute(attribute: node) else {
-          continue
-        }
-        attrs.add(attr);
-      case .ifConfigDecl:
-        fatalError("unimplemented")
-#if RESILIENT_SWIFT_SYNTAX
-      @unknown default:
-        fatalError()
-#endif
+    visitIfConfigElements(node.attributes, of: AttributeSyntax.self) { element in
+      switch element {
+      case .ifConfigDecl(let ifConfigDecl):
+        return .ifConfigDecl(ifConfigDecl)
+      case .attribute(let attribute):
+        return .underlying(attribute)
+      }
+    } body: { attribute in
+      if let attr = self.generateTypeAttribute(attribute: attribute) {
+        attrs.add(attr)
       }
     }
 
@@ -72,6 +69,7 @@ extension ASTGenVisitor {
         .yields,
         .yieldMany,
         .yieldOnce,
+        .yieldOnce2,
         .thin,
         .thick,
         .unimplementable:
@@ -107,6 +105,7 @@ extension ASTGenVisitor {
         .in,
         .inConstant,
         .inGuaranteed,
+        .inCXX,
         .inout,
         .inoutAliasable,
         .moveOnly,

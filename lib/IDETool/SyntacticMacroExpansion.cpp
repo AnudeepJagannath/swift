@@ -15,6 +15,7 @@
 #include "swift/AST/MacroDefinition.h"
 #include "swift/AST/PluginLoader.h"
 #include "swift/AST/TypeRepr.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Driver/FrontendUtil.h"
 #include "swift/Frontend/Frontend.h"
 #include "swift/IDE/Utils.h"
@@ -62,7 +63,8 @@ bool SyntacticMacroExpansionInstance::setup(
       invocation.getLangOptions(), invocation.getTypeCheckerOptions(),
       invocation.getSILOptions(), invocation.getSearchPathOptions(),
       invocation.getClangImporterOptions(), invocation.getSymbolGraphOptions(),
-      invocation.getCASOptions(), SourceMgr, Diags));
+      invocation.getCASOptions(), invocation.getSerializationOptions(),
+      SourceMgr, Diags));
   registerParseRequestFunctions(Ctx->evaluator);
   registerTypeCheckerRequestFunctions(Ctx->evaluator);
 
@@ -230,7 +232,7 @@ expandFreestandingMacro(MacroDecl *macro,
   SourceFile *expandedSource =
       swift::evaluateFreestandingMacro(expansion, discriminator);
   if (expandedSource)
-    bufferIDs.push_back(*expandedSource->getBufferID());
+    bufferIDs.push_back(expandedSource->getBufferID());
 
   return bufferIDs;
 }
@@ -253,7 +255,7 @@ expandAttachedMacro(MacroDecl *macro, CustomAttr *attr, Decl *attachedDecl) {
     SourceFile *expandedSource = swift::evaluateAttachedMacro(
         macro, target, attr, passParent, role, discriminator);
     if (expandedSource)
-      bufferIDs.push_back(*expandedSource->getBufferID());
+      bufferIDs.push_back(expandedSource->getBufferID());
   };
 
   MacroRoles roles = macro->getMacroRoles();
@@ -429,7 +431,7 @@ void SyntacticMacroExpansionInstance::expand(
   // Find the expansion at 'expansion.offset'.
   MacroExpansionFinder expansionFinder(
       SourceMgr,
-      SourceMgr.getLocForOffset(*SF->getBufferID(), expansion.offset));
+      SourceMgr.getLocForOffset(SF->getBufferID(), expansion.offset));
   SF->walk(expansionFinder);
   auto expansionNode = expansionFinder.getResult();
   if (!expansionNode)

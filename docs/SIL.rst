@@ -789,13 +789,16 @@ coroutine, where a normal function return would need to transfer ownership of
 its return value, since a normal function's context ceases to exist and be able
 to maintain ownership of the value after it returns.
 
-To support these concepts, SIL supports two kinds of coroutine:
-``@yield_many`` and ``@yield_once``. Either of these attributes may be
+To support these concepts, SIL supports two flavors: single-yield and
+multi-yield.  These two flavors correspond to three kinds.  A multi-yield
+coroutine is of kind ``@yield_many``. A single-yield coroutine is of kind
+either ``@yield_once`` or ``@yield_once_2``. Any of these attributes may be
 written before a function type to indicate that it is a coroutine type.
-``@yield_many`` and ``@yield_once`` coroutines are allowed to also be
-``@async``. (Note that ``@async`` functions are not themselves modeled
-explicitly as coroutines in SIL, although the implementation may use a coroutine
-lowering strategy.)
+
+Both single-yield and multi-yield coroutines are allowed to also be ``@async``.
+(Note that ``@async`` functions are not themselves modeled explicitly as
+coroutines in SIL, although the implementation may use a coroutine lowering
+strategy.)
 
 A coroutine type may declare any number of *yielded values*, which is to
 say, values which are provided to the caller at a yield point.  Yielded
@@ -804,7 +807,7 @@ the ``@yields`` attribute.  A yielded value may have a convention attribute,
 taken from the set of parameter attributes and interpreted as if the yield
 site were calling back to the calling function.
 
-Currently, a coroutine may not have normal results.
+In addition to yielded values a coroutine could also have normal results.
 
 Coroutine functions may be used in many of the same ways as normal
 function values.  However, they cannot be called with the standard
@@ -816,9 +819,10 @@ calling a yield-many coroutine of any kind.
 Coroutines may contain the special ``yield`` and ``unwind``
 instructions.
 
-A ``@yield_many`` coroutine may yield as many times as it desires.
-A ``@yield_once`` coroutine may yield exactly once before returning,
-although it may also ``throw`` before reaching that point.
+A multi-yield (``@yield_many``) coroutine may yield as many times as it desires.
+A single-yield (``@yield_once`` or ``@yield_once_2``) coroutine may yield
+exactly once before returning, although it may also ``throw`` before reaching
+that point.
 
 Variadic Generics
 `````````````````
@@ -1177,6 +1181,7 @@ information when inlined.
   sil-function-thunk ::= 'thunk'
   sil-function-thunk ::= 'signature_optimized_thunk'
   sil-function-thunk ::= 'reabstraction_thunk'
+  sil-function-thunk ::= 'back_deployed_thunk'
 
 The function is a compiler generated thunk.
 ::
@@ -1737,7 +1742,7 @@ the underlying normal conformance.
   sil-witness-entry ::= 'base_protocol' identifier ':' protocol-conformance
   sil-witness-entry ::= 'method' sil-decl-ref ':' sil-function-name
   sil-witness-entry ::= 'associated_type' identifier
-  sil-witness-entry ::= 'associated_type_protocol'
+  sil-witness-entry ::= 'associated_conformance'
                         '(' identifier ':' identifier ')' ':' protocol-conformance
 
 Witness tables consist of the following entries:
@@ -2748,12 +2753,12 @@ That's the case if the destroy point is jointly dominated by:
 
 or
 
-* an ``inject_enum_addr`` to the enum memory location with a non-trivial or
+* an ``inject_enum_addr`` to the enum memory location with a trivial or
   non-payload case.
 
 or
 
-* a successor of a ``switch_enum`` or ``switch_enum_addr`` for a non-trivial
+* a successor of a ``switch_enum`` or ``switch_enum_addr`` for a trivial
   or non-payload case.
 
 Dead End Blocks
@@ -3747,7 +3752,7 @@ of ``scalar_pack_index``, ``pack_pack_index``, or ``dynamic_pack_index``),
 and it must index into a pack type with the same shape as the indexed
 pack type.
 
-Third, additional restrictions must be satisifed depending on which
+Third, additional restrictions must be satisfied depending on which
 pack indexing instruction the pack index is:
 
 - For ``scalar_pack_index``, the projected element type must be the
@@ -4121,6 +4126,91 @@ pipeline.
 
 The operand is a guaranteed operand, i.e. not consumed.
 
+merge_isolation_region
+``````````````````````
+
+::
+
+  sil-instruction :: 'merge_isolation_region' (sil-operand ',')+ sil-operand
+
+  %2 = merge_isolation_region %first : $*T, %second : $U
+  %2 = merge_isolation_region %first : $*T, %second : $U, %third : $H
+
+Instruction that is only valid in Ownership SSA.
+
+This instruction informs region isolation that all of the operands should be
+considered to be artificially apart of the same region. It is intended to be
+used to express region dependency when due to unsafe codegen we have to traffic
+a non-Sendable value through computations with Sendable values (causing us to
+not track the non-Sendable value) but have to later express that a non-Sendable
+result of using the Sendable value needs to be in the same region as the
+original non-Sendable value. As an example of where this comes up, consider the
+following code::
+
+  // objc code
+  @interface CallbackData : NSObject
+  @end
+  
+  @interface Klass : NSObject
+  
+  - (void)loadDataWithCompletionHandler:(void (^)(CallbackData * _Nullable, NSError * _Nullable))completionHandler;
+  
+  @end
+
+  // swift code
+  extension Klass {
+    func loadCallbackData() async throws -> sending CallbackData {
+      try await loadData()
+    }
+  }
+
+This lowers to::
+
+  %5 = alloc_stack $CallbackData                  // users: %26, %25, %31, %16, %7
+  %6 = objc_method %0 : $Klass, #Klass.loadData!foreign : (Klass) -> () async throws -> CallbackData, $@convention(objc_method) (Optional<@convention(block) (Optional<CallbackData>, Optional<NSError>) -> ()>, Klass) -> () // user: %20
+  %7 = get_async_continuation_addr [throws] CallbackData, %5 : $*CallbackData // users: %23, %8
+  %8 = struct $UnsafeContinuation<CallbackData, any Error> (%7 : $Builtin.RawUnsafeContinuation) // user: %14
+  %9 = alloc_stack $@block_storage Any            // users: %22, %16, %10
+  %10 = project_block_storage %9 : $*@block_storage Any // user: %11
+  %11 = init_existential_addr %10 : $*Any, $CheckedContinuation<CallbackData, any Error> // user: %15
+  // function_ref _createCheckedThrowingContinuation<A>(_:)
+  %12 = function_ref @$ss34_createCheckedThrowingContinuationyScCyxs5Error_pGSccyxsAB_pGnlF : $@convention(thin) <τ_0_0> (UnsafeContinuation<τ_0_0, any Error>) -> @out CheckedContinuation<τ_0_0, any Error> // user: %14
+  %13 = alloc_stack $CheckedContinuation<CallbackData, any Error> // users: %21, %15, %14
+  %14 = apply %12<CallbackData>(%13, %8) : $@convention(thin) <τ_0_0> (UnsafeContinuation<τ_0_0, any Error>) -> @out CheckedContinuation<τ_0_0, any Error>
+  copy_addr [take] %13 to [init] %11 : $*CheckedContinuation<CallbackData, any Error> // id: %15
+  merge_isolation_region %9 : $*@block_storage Any, %5 : $*CallbackData // id: %16
+  // function_ref @objc completion handler block implementation for @escaping @callee_unowned @convention(block) (@unowned CallbackData?, @unowned NSError?) -> () with result type CallbackData
+  %17 = function_ref @$sSo12CallbackDataCSgSo7NSErrorCSgIeyByy_ABTz_ : $@convention(c) (@inout_aliasable @block_storage Any, Optional<CallbackData>, Optional<NSError>) -> () // user: %18
+  %18 = init_block_storage_header %9 : $*@block_storage Any, invoke %17 : $@convention(c) (@inout_aliasable @block_storage Any, Optional<CallbackData>, Optional<NSError>) -> (), type $@convention(block) (Optional<CallbackData>, Optional<NSError>) -> () // user: %19
+  %19 = enum $Optional<@convention(block) (Optional<CallbackData>, Optional<NSError>) -> ()>, #Optional.some!enumelt, %18 : $@convention(block) (Optional<CallbackData>, Optional<NSError>) -> () // user: %20
+  %20 = apply %6(%19, %0) : $@convention(objc_method) (Optional<@convention(block) (Optional<CallbackData>, Optional<NSError>) -> ()>, Klass) -> ()
+
+Notice how without the `merge_isolation_region`_ instruction (%16) there is no
+non-Sendable def-use chain from %5, the indirect return value of the block, to
+the actual non-Sendable block storage %9. This can result in region isolation
+not propagating restrictions on usage from %9 onto %5 risking the creation of
+races.
+
+Applying the previous discussion to this specific example, self (%0) is
+non-Sendable and is bound to the current task. If we did not have the
+`merge_isolation_region`_ instruction here, we would not tie the return value %5
+to %0 via %9. This would cause %5 to be treated as a disconnected value and thus
+be a valid sending return value potentially allowing for %5 in the caller of the
+function to be sent to another isolation domain and introduce a race.
+
+.. note::
+   This is effectively the same purpose that `mark_dependence`_ plays for memory
+   dependence (expressing memory dependence that the compiler cannot infer)
+   except in the world of region isolation. We purposely use a different
+   instruction since `mark_dependence`_ is often times used to create a
+   temporary dependence in between two values via the return value of
+   `mark_dependence`_. If `mark_dependence`_ had the semantics of acting like a
+   region merge we would in contrast have from that point on a region dependence
+   in between the base and value of the `mark_dependence`_ causing the
+   `mark_dependence`_ to have a less "local" effect since all paths through that
+   program point would have to maintain that region dependence until the end of
+   the function.
+
 dealloc_stack
 `````````````
 ::
@@ -4179,7 +4269,7 @@ dealloc_box
 ```````````
 ::
 
-  sil-instruction ::= 'dealloc_box' sil-operand
+  sil-instruction ::= 'dealloc_box' '[dead_end]'? sil-operand
 
   dealloc_box %0 : $@box T
 
@@ -4191,6 +4281,9 @@ undefined behavior results.
 This does not destroy the boxed value. The contents of the
 value must have been fully uninitialized or destroyed before
 ``dealloc_box`` is applied.
+
+The optional ``dead_end`` attribute specifies that this instruction was created
+during lifetime completion and is eligible for deletion during OSSA lowering.
 
 project_box
 ```````````
@@ -4681,6 +4774,22 @@ The instruction accepts an object or address type.
 `@owned T`. If its argument is an address type, it's an identity projection.
 This instruction is valid only in OSSA and is lowered to a no-op when lowering
 to non-OSSA.
+
+extend_lifetime
+```````````````
+
+::
+
+   sil-instruction ::= 'extend_lifetime' sil-operand
+
+   // Indicate that %0's linear lifetime extends to this point
+   extend_lifetime %0 : $X
+
+Indicates that a value's linear lifetime extends to this point.  Inserted by
+OSSALifetimeCompletion(AvailabilityBoundary) in order to provide the invariant
+that a value is either consumed OR has an `extend_lifetime` user on all paths
+and furthermore that all uses are within the boundary defined by that set of
+instructions (the consumes and the `extend_lifetime`s).
 
 assign
 ``````
@@ -5633,7 +5742,7 @@ strong reference count is greater than 1.
 A discussion of the semantics can be found here:
 `is_unique instruction <arcopts_is_unique_>`_
 
-.. _arcopts_is_unique: https://github.com/apple/swift/blob/main/docs/ARCOptimization.md#is_unique-instruction
+.. _arcopts_is_unique: https://github.com/swiftlang/swift/blob/main/docs/ARCOptimization.md#is_unique-instruction
 
 begin_cow_mutation
 ``````````````````
@@ -6108,11 +6217,18 @@ begin_apply
   // %float : $Float
   // %token is a token
 
+  (%anyAddr, %float, %token, %allocation) = begin_apply %0() : $@yield_once_2 () -> (@yields @inout %Any, @yields Float)
+  // %anyAddr : $*Any
+  // %float : $Float
+  // %token is a token
+  // %allocation is a pointer to a token
+
 Transfers control to coroutine ``%0``, passing it the given arguments.
 The rules for the application generally follow the rules for ``apply``,
 except:
 
-- the callee value must have a ``yield_once`` coroutine type,
+- the callee value must have be of single-yield coroutine type (``yield_once``
+  or ``yield_once_2``)
 
 - control returns to this function not when the coroutine performs a
   ``return``, but when it performs a ``yield``, and
@@ -6120,11 +6236,17 @@ except:
 - the instruction results are derived from the yields of the coroutine
   instead of its normal results.
 
-The final result of a ``begin_apply`` is a "token", a special value which
-can only be used as the operand of an ``end_apply`` or ``abort_apply``
-instruction.  Before this second instruction is executed, the coroutine
-is said to be "suspended", and the token represents a reference to its
-suspended activation record.
+The final (in the case of ``@yield_once``) or penultimate (in the case of
+``@yield_once_2``) result of a ``begin_apply`` is a "token", a special value
+which can only be used as the operand of an ``end_apply`` or ``abort_apply``
+instruction.  Before this second instruction is executed, the coroutine is said
+to be "suspended", and the token represents a reference to its suspended
+activation record.
+
+If the coroutine's kind ``yield_once_2``, its final result is an address of a
+"token", representing the allocation done by the callee coroutine.  It can only
+be used as the operand of a ``dealloc_stack`` which must appear after the
+coroutine is resumed.
 
 The other results of the instruction correspond to the yields in the
 coroutine type.  In general, the rules of a yield are similar to the rules
@@ -6310,6 +6432,16 @@ callee function (and thus said signature). Instead:
    obtained from ``partial_apply`` will not own its underlying value.  The
    ``@inout_aliasable`` parameter convention is used when a ``@noescape``
    closure captures an ``inout`` argument.
+
+**Coroutines** ``partial_apply`` could be used to create closures over
+coroutines. Overall, the ``partial_apply`` of a coroutine is straightforward: it
+is another coroutine that captures arguments passed to the ``partial_apply``
+instruction. This closure applies the original coroutine (similar to the
+``begin_apply`` instruction) for yields (suspend) and yields the resulting
+values. Then it calls the original coroutine continuation for return or unwind,
+and forwards the results (if any) to the caller as well. Currently only the
+autodiff transformation produces ``partial_apply`` for coroutines while
+differentiating modify accessors.
 
 **NOTE:** If the callee is generic, all of its generic parameters must be bound
 by the given substitution list. The arguments are given with these generic
@@ -6648,7 +6780,7 @@ destroy_value
 
 ::
 
-  sil-instruction ::= 'destroy_value' '[poison]'? sil-operand
+  sil-instruction ::= 'destroy_value' '[dead_end]'? '[poison]'? sil-operand
 
   destroy_value %0 : $A
 
@@ -6665,6 +6797,9 @@ are the preferred forms.
 For aggregate types, especially enums, it is typically both easier
 and more efficient to reason about aggregate destroys than it is to
 reason about destroys of the subobjects.
+
+The optional ``dead_end`` attribute specifies that this instruction was created
+during lifetime completion and is eligible for deletion during OSSA lowering.
 
 autorelease_value
 `````````````````
@@ -7001,7 +7136,7 @@ presence or value of the ``enum_extensibility`` Clang attribute.
 
 (See `SE-0192`__ for more information about non-frozen enums.)
 
-__ https://github.com/apple/swift-evolution/blob/main/proposals/0192-non-exhaustive-enums.md
+__ https://github.com/swiftlang/swift-evolution/blob/main/proposals/0192-non-exhaustive-enums.md
 
 enum
 ````
@@ -7729,6 +7864,20 @@ element value operand is the projected element type of the pack element
 and must be structurally well-typed for the given index and pack type;
 see the structural type matching rules for pack indices.
 
+Value Generics
+~~~~~~~~~~~~~~~~~
+
+type_value
+```````````
+
+::
+
+  sil-instruction ::= 'type_value' sil-type 'for' sil-identifier
+
+Produce the dynamic value of the given value generic, which must be a formal
+value generic type. The value of the instruction has the type of whatever the
+underlying value generic's type is. For right now that is limited to ``Int``.
+
 Unchecked Conversions
 ~~~~~~~~~~~~~~~~~~~~~
 
@@ -8060,6 +8209,40 @@ passed to a function (materializeForSet) which escapes the closure in a way not
 expressed by the convert's users. The mandatory pass must ensure the lifetime
 in a conservative way.
 
+
+thunk
+`````
+::
+
+  sil-instruction ::= 'thunk' sil-thunk-attr* sil-value sil-apply-substitution-list? () sil-type
+  sil-thunk-attr ::= '[' thunk-kind ']'
+  sil-thunk-kind ::= identity
+
+  %1 = thunk [identity] %0() : $@convention(thin) (T) -> U
+  // %0 must be of a function type $T -> U
+  // %1 will be of type @callee_guaranteed (T) -> U since we are creating an
+  // "identity" thunk.
+  
+  %1 = thunk [identity] %0<T>() : $@convention(thin) (τ_0_0) -> ()
+  // %0 must be of a function type $T -> ()
+  // %1 will be of type @callee_guaranteed <τ_0_0> (τ_0_0) -> () since we are creating a
+  // "identity" thunk.
+
+Takes in a function and depending on the kind produces a new function result
+that is ``@callee_guaranteed``. The specific way that the function type of the
+input is modified by this instruction depends on the specific sil-thunk-kind of
+the instruction. So for instance, the hop_to_mainactor_if_needed thunk just
+returns a callee_guaranteed version of the input function... but one could
+imagine a "reabstracted" thunk kind that would produce the appropriate
+reabstracted thunk kind.
+
+This instructions is lowered to a true think in Lowered SIL by the ThunkLowering
+pass.
+
+It is assumed that like `partial_apply`_, if we need a substitution map, it will be
+attached to `thunk`_. This ensures that we have the substitution
+map already created if we need to create a `partial_apply`_.
+
 classify_bridge_object
 ``````````````````````
 ::
@@ -8295,9 +8478,10 @@ the current function was invoked with a ``try_apply`` instruction, control
 resumes at the normal destination, and the value of the basic block argument
 will be the operand of this ``return`` instruction.
 
-If the current function is a ``yield_once`` coroutine, there must not be
-a path from the entry block to a ``return`` which does not pass through
-a ``yield`` instruction. This rule does not apply in the ``raw`` SIL stage.
+If the current function is a single-yield coroutine (``yield_once`` or
+``yield_once_2``), there must not be a path from the entry block to a
+``return`` which does not pass through a ``yield`` instruction. This rule does
+not apply in the ``raw`` SIL stage.
 
 ``return`` does not retain or release its operand or any other values.
 
@@ -8365,9 +8549,10 @@ The ``resume`` and ``unwind`` destination blocks must be uniquely
 referenced by the ``yield`` instruction.  This prevents them from becoming
 critical edges.
 
-In a ``yield_once`` coroutine, there must not be a control flow path leading
-from the ``resume`` edge to another ``yield`` instruction in this function.
-This rule does not apply in the ``raw`` SIL stage.
+In a single-yield coroutine (``yield_once`` or ``yield_once_2``), there must
+not be a control flow path leading from the ``resume`` edge to another
+``yield`` instruction in this function. This rule does not apply in the ``raw``
+SIL stage.
 
 There must not be a control flow path leading from the ``unwind`` edge to
 a ``return`` instruction, to a ``throw`` instruction, or to any block
@@ -8948,7 +9133,6 @@ underlying T from an @moveOnly T.
 NOTE: From the perspective of the address checker, a trivial `load`_ with a
 `moveonlywrapper_to_copyable_addr`_ operand is considered to be a use of a
 noncopyable type.
-
 
 Assertion configuration
 ~~~~~~~~~~~~~~~~~~~~~~~

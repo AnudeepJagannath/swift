@@ -77,6 +77,7 @@ namespace clang {
   class ASTContext;
   template <class> class CanQual;
   class CodeGenerator;
+  class CXXDestructorDecl;
   class Decl;
   class GlobalDecl;
   class Type;
@@ -553,6 +554,9 @@ public:
   /// Return the effective triple used by clang.
   llvm::Triple getEffectiveClangTriple();
 
+  /// Return the effective variant triple used by clang.
+  llvm::Triple getEffectiveClangVariantTriple();
+
   const llvm::StringRef getClangDataLayoutString();
 };
 
@@ -657,9 +661,10 @@ public:
   llvm::Module &Module;
   const llvm::DataLayout DataLayout;
   const llvm::Triple Triple;
+  const llvm::Triple VariantTriple;
   std::unique_ptr<llvm::TargetMachine> TargetMachine;
   ModuleDecl *getSwiftModule() const;
-  AvailabilityContext getAvailabilityContext() const;
+  AvailabilityRange getAvailabilityRange() const;
   Lowering::TypeConverter &getSILTypes() const;
   SILModule &getSILModule() const { return IRGen.SIL; }
   const IRGenOptions &getOptions() const { return IRGen.Opts; }
@@ -695,7 +700,7 @@ public:
   bool ShouldUseSwiftError;
 
   llvm::Type *VoidTy;                  /// void (usually {})
-  llvm::Type *PtrTy;                   /// ptr
+  llvm::PointerType *PtrTy;            /// ptr
   llvm::IntegerType *Int1Ty;           /// i1
   llvm::IntegerType *Int8Ty;           /// i8
   llvm::IntegerType *Int16Ty;          /// i16
@@ -821,7 +826,8 @@ public:
   llvm::StructType  *SwiftTaskOptionRecordTy;
   llvm::StructType  *SwiftInitialSerialExecutorTaskOptionRecordTy;
   llvm::StructType  *SwiftTaskGroupTaskOptionRecordTy;
-  llvm::StructType  *SwiftInitialTaskExecutorPreferenceTaskOptionRecordTy;
+  llvm::StructType  *SwiftInitialTaskExecutorUnownedPreferenceTaskOptionRecordTy;
+  llvm::StructType  *SwiftInitialTaskExecutorOwnedPreferenceTaskOptionRecordTy;
   llvm::StructType  *SwiftResultTypeInfoTaskOptionRecordTy;
   llvm::PointerType *SwiftJobPtrTy;
   llvm::IntegerType *ExecutorFirstTy;
@@ -1113,8 +1119,10 @@ public:
 
   TypeExpansionContext getMaximalTypeExpansionContext() const;
 
-  bool isResilientConformance(const NormalProtocolConformance *conformance);
-  bool isResilientConformance(const RootProtocolConformance *root);
+  bool isResilientConformance(const NormalProtocolConformance *conformance,
+                              bool disableOptimizations = false);
+  bool isResilientConformance(const RootProtocolConformance *root,
+                              bool disableOptimizations = false);
   bool isDependentConformance(const RootProtocolConformance *conformance);
 
   Alignment getCappedAlignment(Alignment alignment);
@@ -1198,10 +1206,10 @@ public:
 
   llvm::Constant *getConstantSignedCFunctionPointer(llvm::Constant *fn);
 
-  llvm::Constant *getConstantSignedPointer(llvm::Constant *pointer,
-                                           unsigned key,
-                                           llvm::Constant *addrDiscriminator,
-                                           llvm::Constant *otherDiscriminator);
+  llvm::Constant *
+  getConstantSignedPointer(llvm::Constant *pointer, unsigned key,
+                           llvm::Constant *storageAddress,
+                           llvm::ConstantInt *otherDiscriminator);
   llvm::Constant *getConstantSignedPointer(llvm::Constant *pointer,
                                            const clang::PointerAuthSchema &schema,
                                            const PointerAuthEntity &entity,
@@ -1362,7 +1370,7 @@ private:
     unsigned numExtraInhabitants;
     unsigned align: 16;
     unsigned pod: 1;
-    unsigned bitwiseTakable: 1;
+    unsigned bitwiseTakable: 2;
   };
   friend struct ::llvm::DenseMapInfo<swift::irgen::IRGenModule::FixedLayoutKey>;
   llvm::DenseMap<FixedLayoutKey, llvm::Constant *> PrivateFixedLayouts;
@@ -1562,6 +1570,8 @@ public:
 
   void emitSourceFile(SourceFile &SF);
   void emitSynthesizedFileUnit(SynthesizedFileUnit &SFU);
+
+  void addLinkLibraries();
   void addLinkLibrary(const LinkLibrary &linkLib);
 
   /// Attempt to finalize the module.
@@ -1576,6 +1586,7 @@ public:
       StackProtectorMode stackProtect = StackProtectorMode::NoStackProtector);
   void setHasNoFramePointer(llvm::AttrBuilder &Attrs);
   void setHasNoFramePointer(llvm::Function *F);
+  void setMustHaveFramePointer(llvm::Function *F);
   llvm::AttributeList constructInitialAttributes();
   StackProtectorMode shouldEmitStackProtector(SILFunction *f);
 
@@ -1615,6 +1626,9 @@ public:
                                       ForeignFunctionInfo *foreignInfo=nullptr);
   ForeignFunctionInfo getForeignFunctionInfo(CanSILFunctionType type);
 
+  void
+  ensureImplicitCXXDestructorBodyIsDefined(clang::CXXDestructorDecl *cxxDtor);
+
   llvm::ConstantInt *getInt32(uint32_t value);
   llvm::ConstantInt *getSize(Size size);
   llvm::Constant *getAlignment(Alignment align);
@@ -1647,7 +1661,8 @@ public:
   llvm::Constant *getAddrOfMethodDescriptor(SILDeclRef declRef,
                                             ForDefinition_t forDefinition);
   void emitNonoverriddenMethodDescriptor(const SILVTable *VTable,
-                                         SILDeclRef declRef);
+                                         SILDeclRef declRef,
+                                         ClassDecl *classDecl);
 
   Address getAddrOfEnumCase(EnumElementDecl *Case,
                             ForDefinition_t forDefinition);
@@ -1808,6 +1823,16 @@ public:
                        bool isDynamicallyReplaceableImplementation = false,
                        bool shouldCallPreviousImplementation = false);
 
+  llvm::Function *
+  getAddrOfWitnessTableProfilingThunk(llvm::Function *witness,
+                                      const NormalProtocolConformance &C);
+
+  llvm::Function *
+  getAddrOfVTableProfilingThunk(llvm::Function *f, ClassDecl *decl);
+
+  llvm::Function *getOrCreateProfilingThunk(llvm::Function *f,
+                                            StringRef prefix);
+
   void emitDynamicReplacementOriginalFunctionThunk(SILFunction *f);
 
   llvm::Function *getAddrOfContinuationPrototype(CanSILFunctionType fnType);
@@ -1826,7 +1851,7 @@ public:
                                                const NormalProtocolConformance *C,
                                                CanType conformingType,
                                                ForDefinition_t forDefinition);
-  llvm::Constant *getAddrOfWitnessTable(const RootProtocolConformance *C,
+  llvm::Constant *getAddrOfWitnessTable(const ProtocolConformance *C,
                                       ConstantInit definition = ConstantInit());
   llvm::Constant *getAddrOfWitnessTablePattern(
                                       const NormalProtocolConformance *C,

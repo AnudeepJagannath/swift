@@ -1,8 +1,7 @@
 // RUN: %target-swift-emit-silgen -enable-experimental-feature ThenStatements %s | %FileCheck %s
 // RUN: %target-swift-emit-ir -enable-experimental-feature ThenStatements %s
 
-// Needed for experimental features
-// REQUIRES: asserts
+// REQUIRES: swift_feature_ThenStatements
 
 func foo() -> Int {
   if .random() { 1 } else { 2 }
@@ -658,4 +657,37 @@ struct LazyProp {
   } else {
     0
   }
+}
+
+func testNestedFallthrough1() throws -> Int {
+  let x = if .random() {
+    switch Bool.random() {
+    case true:
+      fallthrough
+    case false:
+      break
+    }
+    throw Err()
+  } else {
+    0
+  }
+  return x
+}
+
+func testNestedFallthrough2() throws -> Int {
+  let x = if .random() {
+    switch Bool.random() {
+    case true:
+      if .random() {
+        fallthrough
+      }
+      break
+    case false:
+      break
+    }
+    throw Err()
+  } else {
+    0
+  }
+  return x
 }

@@ -50,7 +50,7 @@ class ContinueStmt;
 class DefaultArgumentExpr;
 class DefaultArgumentType;
 class DoCatchStmt;
-struct ExternalMacroDefinition;
+class ExternalMacroDefinition;
 class ClosureExpr;
 class GenericParamList;
 class InverseTypeRepr;
@@ -754,6 +754,27 @@ public:
 
 void simple_display(llvm::raw_ostream &out, const KnownProtocolKind);
 
+/// Pretty-print the given declaration into a buffer and return a source
+/// location that refers to the declaration in that buffer.
+class PrettyPrintDeclRequest
+   : public SimpleRequest<PrettyPrintDeclRequest,
+                          SourceLoc(const Decl *),
+                          RequestFlags::Cached>
+{
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  SourceLoc evaluate(Evaluator &eval, const Decl *d) const;
+
+public:
+  // Caching
+  bool isCached() const { return true; }
+};
+
 // Find the type in the cache or look it up
 class DefaultTypeRequest
     : public SimpleRequest<DefaultTypeRequest,
@@ -800,7 +821,8 @@ public:
 class AttachedPropertyWrappersRequest :
     public SimpleRequest<AttachedPropertyWrappersRequest,
                          llvm::TinyPtrVector<CustomAttr *>(VarDecl *),
-                         RequestFlags::Cached> {
+                         RequestFlags::SeparatelyCached |
+                         RequestFlags::SplitCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -812,8 +834,10 @@ private:
   evaluate(Evaluator &evaluator, VarDecl *) const;
 
 public:
-  // Caching
+  // Separate caching.
   bool isCached() const { return true; }
+  std::optional<llvm::TinyPtrVector<CustomAttr *>> getCachedResult() const;
+  void cacheResult(llvm::TinyPtrVector<CustomAttr *> result) const;
 };
 
 /// Request the raw (possibly unbound generic) type of the property wrapper
@@ -902,7 +926,8 @@ public:
 class PropertyWrapperAuxiliaryVariablesRequest :
     public SimpleRequest<PropertyWrapperAuxiliaryVariablesRequest,
                          PropertyWrapperAuxiliaryVariables(VarDecl *),
-                         RequestFlags::Cached> {
+                         RequestFlags::SeparatelyCached |
+                         RequestFlags::SplitCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -914,8 +939,10 @@ private:
   evaluate(Evaluator &evaluator, VarDecl *var) const;
 
 public:
-  // Caching
+  // Separate caching.
   bool isCached() const { return true; }
+  std::optional<PropertyWrapperAuxiliaryVariables> getCachedResult() const;
+  void cacheResult(PropertyWrapperAuxiliaryVariables value) const;
 };
 
 /// Request information about initialization of the backing property
@@ -1134,6 +1161,25 @@ private:
     bool evaluate(Evaluator &evaluator, NominalTypeDecl *nominal) const;
 
 public:
+    // Caching
+    bool isCached() const { return true; }
+};
+
+/// Get a special conformance of the DistributedActor protocol to the Actor protocol.
+class GetDistributedActorAsActorConformanceRequest
+    : public SimpleRequest<GetDistributedActorAsActorConformanceRequest,
+                           NormalProtocolConformance *(ProtocolDecl *),
+                           RequestFlags::Cached> {
+  public:
+    using SimpleRequest::SimpleRequest;
+
+private:
+    friend SimpleRequest;
+
+    NormalProtocolConformance *
+    evaluate(Evaluator &evaluator, ProtocolDecl *distributedActorProto) const;
+
+  public:
     // Caching
     bool isCached() const { return true; }
 };
@@ -1488,7 +1534,8 @@ class GlobalActorAttributeRequest
     : public SimpleRequest<GlobalActorAttributeRequest,
                            std::optional<CustomAttrNominalPair>(
                                llvm::PointerUnion<Decl *, ClosureExpr *>),
-                           RequestFlags::Cached> {
+                           RequestFlags::SeparatelyCached |
+                           RequestFlags::SplitCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -1496,19 +1543,21 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  std::optional<std::pair<CustomAttr *, NominalTypeDecl *>>
+  std::optional<CustomAttrNominalPair>
   evaluate(Evaluator &evaluator,
            llvm::PointerUnion<Decl *, ClosureExpr *>) const;
 
 public:
-  // Caching
+  // Separate caching.
   bool isCached() const { return true; }
+  std::optional<std::optional<CustomAttrNominalPair>> getCachedResult() const;
+  void cacheResult(std::optional<CustomAttrNominalPair> value) const;
 };
 
 /// Determine the actor isolation for the given declaration.
 class ActorIsolationRequest :
     public SimpleRequest<ActorIsolationRequest,
-                         ActorIsolation(ValueDecl *),
+                         InferredActorIsolation(ValueDecl *),
                          RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -1516,7 +1565,8 @@ public:
 private:
   friend SimpleRequest;
 
-  ActorIsolation evaluate(Evaluator &evaluator, ValueDecl *value) const;
+  InferredActorIsolation evaluate(Evaluator &evaluator,
+                                  ValueDecl *value) const;
 
 public:
   // Caching
@@ -1887,10 +1937,10 @@ public:
   void cacheResult(bool value) const;
 };
 
-class RequiresOpaqueModifyCoroutineRequest :
-    public SimpleRequest<RequiresOpaqueModifyCoroutineRequest,
-                         bool(AbstractStorageDecl *),
-                         RequestFlags::SeparatelyCached> {
+class RequiresOpaqueModifyCoroutineRequest
+    : public SimpleRequest<RequiresOpaqueModifyCoroutineRequest,
+                           bool(AbstractStorageDecl *, bool isUnderscored),
+                           RequestFlags::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -1898,8 +1948,8 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  bool
-  evaluate(Evaluator &evaluator, AbstractStorageDecl *decl) const;
+  bool evaluate(Evaluator &evaluator, AbstractStorageDecl *decl,
+                bool isUnderscored) const;
 
 public:
   // Separate caching.
@@ -2508,6 +2558,33 @@ public:
   bool isCached() const { return true; }
 };
 
+/// Perform top-down syntactic disambiguation of a pattern. Where ambiguous
+/// expr/pattern productions occur (tuples, function calls, etc.), favor the
+/// pattern interpretation if it forms a valid pattern; otherwise, leave it as
+/// an expression. This does no type-checking except for the bare minimum to
+/// disambiguate semantics-dependent pattern forms.
+///
+/// Currently cached to ensure the constraint system does not resolve the same
+/// pattern multiple times along different solver paths. Once we move pattern
+/// resolution into pre-checking, we could make this uncached.
+class ResolvePatternRequest
+    : public SimpleRequest<ResolvePatternRequest,
+                           Pattern *(Pattern *, DeclContext *, bool),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  Pattern *evaluate(Evaluator &evaluator, Pattern *P, DeclContext *DC,
+                    bool isStmtCondition) const;
+public:
+  // Cached.
+  bool isCached() const { return true; }
+};
+
 class InterfaceTypeRequest :
     public SimpleRequest<InterfaceTypeRequest,
                          Type (ValueDecl *),
@@ -2973,62 +3050,9 @@ public:
   void cacheResult(ProtocolConformanceRef value) const;
 };
 
-struct PreCheckResultBuilderDescriptor {
-  AnyFunctionRef Fn;
-  bool SuppressDiagnostics;
-
-private:
-  // NOTE: Since source tooling (e.g. code completion) might replace the body,
-  // we need to take the body into account to calculate 'hash_value' and '=='.
-  // Also, we cannot 'getBody()' inside 'hash_value' and '==' because it invokes
-  // another request (even if it's cached).
-  BraceStmt *Body;
-
-public:
-  PreCheckResultBuilderDescriptor(AnyFunctionRef Fn, bool suppressDiagnostics)
-      : Fn(Fn), SuppressDiagnostics(suppressDiagnostics), Body(Fn.getBody()) {}
-
-  friend llvm::hash_code
-  hash_value(const PreCheckResultBuilderDescriptor &owner) {
-    return llvm::hash_combine(owner.Fn, owner.Body);
-  }
-
-  friend bool operator==(const PreCheckResultBuilderDescriptor &lhs,
-                         const PreCheckResultBuilderDescriptor &rhs) {
-    return lhs.Fn == rhs.Fn && lhs.Body == rhs.Body;
-  }
-
-  friend bool operator!=(const PreCheckResultBuilderDescriptor &lhs,
-                         const PreCheckResultBuilderDescriptor &rhs) {
-    return !(lhs == rhs);
-  }
-
-  friend SourceLoc extractNearestSourceLoc(PreCheckResultBuilderDescriptor d) {
-    return extractNearestSourceLoc(d.Fn);
-  }
-
-  friend void simple_display(llvm::raw_ostream &out,
-                             const PreCheckResultBuilderDescriptor &d) {
-    simple_display(out, d.Fn);
-  }
-};
-
-enum class ResultBuilderBodyPreCheck : uint8_t {
-  /// There were no problems pre-checking the closure.
-  Okay,
-
-  /// There was an error pre-checking the closure.
-  Error,
-
-  /// The closure has a return statement.
-  HasReturnStmt,
-};
-
-class PreCheckResultBuilderRequest
-    : public SimpleRequest<PreCheckResultBuilderRequest,
-                           ResultBuilderBodyPreCheck(
-                               PreCheckResultBuilderDescriptor),
-                           RequestFlags::Cached> {
+class BraceHasExplicitReturnStmtRequest
+    : public SimpleRequest<BraceHasExplicitReturnStmtRequest,
+                           bool(const BraceStmt *), RequestFlags::Cached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -3036,8 +3060,7 @@ private:
   friend SimpleRequest;
 
   // Evaluation.
-  ResultBuilderBodyPreCheck
-  evaluate(Evaluator &evaluator, PreCheckResultBuilderDescriptor owner) const;
+  bool evaluate(Evaluator &evaluator, const BraceStmt *BS) const;
 
 public:
   // Separate caching.
@@ -3215,7 +3238,9 @@ public:
 
 class DynamicallyReplacedDeclRequest
     : public SimpleRequest<DynamicallyReplacedDeclRequest,
-                           ValueDecl *(ValueDecl *), RequestFlags::Cached> {
+                           ValueDecl *(ValueDecl *),
+                           RequestFlags::SeparatelyCached |
+                           RequestFlags::SplitCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -3226,8 +3251,11 @@ private:
   ValueDecl * evaluate(Evaluator &evaluator, ValueDecl *VD) const;
 
 public:
-  // Caching.
+  // Separate caching.
   bool isCached() const { return true; }
+  std::optional<ValueDecl *> getCachedResult() const;
+  void cacheResult(ValueDecl *result) const;
+
 };
 
 class SpecializeAttrTargetDeclRequest
@@ -3253,7 +3281,7 @@ public:
 class ApplyAccessNoteRequest
     : public SimpleRequest<ApplyAccessNoteRequest,
                            evaluator::SideEffect(ValueDecl *),
-                           RequestFlags::Cached> {
+                           RequestFlags::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -3263,10 +3291,11 @@ private:
   evaluator::SideEffect evaluate(Evaluator &evaluator, ValueDecl *VD) const;
 
 public:
-  // Cached.
+  // Separate caching.
   bool isCached() const { return true; }
+  std::optional<evaluator::SideEffect> getCachedResult() const;
+  void cacheResult(evaluator::SideEffect value) const;
 };
-
 
 class TypeCheckSourceFileRequest
     : public SimpleRequest<
@@ -3322,7 +3351,8 @@ public:
 class SPIGroupsRequest :
     public SimpleRequest<SPIGroupsRequest,
                          llvm::ArrayRef<Identifier>(const Decl *),
-                         RequestFlags::Cached> {
+                         RequestFlags::SeparatelyCached |
+                         RequestFlags::SplitCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -3335,6 +3365,8 @@ private:
 
 public:
   bool isCached() const { return true; }
+  std::optional<llvm::ArrayRef<Identifier>> getCachedResult() const;
+  void cacheResult(llvm::ArrayRef<Identifier> result) const;
 };
 
 
@@ -3660,9 +3692,9 @@ public:
   void cacheResult(Type value) const;
 };
 
-class ResolveRawLayoutLikeTypeRequest
-    : public SimpleRequest<ResolveRawLayoutLikeTypeRequest,
-                           Type (StructDecl*, RawLayoutAttr *),
+class ResolveRawLayoutTypeRequest
+    : public SimpleRequest<ResolveRawLayoutTypeRequest,
+                           Type (StructDecl*, RawLayoutAttr *, bool),
                            RequestFlags::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -3673,7 +3705,8 @@ private:
   // Evaluation.
   Type evaluate(Evaluator &evaluator,
                 StructDecl *sd,
-                RawLayoutAttr *attr) const;
+                RawLayoutAttr *attr,
+                bool isLikeType) const;
 
 public:
   // Separate caching.
@@ -3893,6 +3926,25 @@ private:
 
 public:
   // Cached.
+  bool isCached() const { return true; }
+};
+
+/// Run effects checking for an initializer expression.
+class CheckInitEffectsRequest
+    : public SimpleRequest<CheckInitEffectsRequest,
+                           evaluator::SideEffect(Initializer *, Expr *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  evaluator::SideEffect evaluate(Evaluator &evaluator,
+                                 Initializer *initCtx,
+                                 Expr *init) const;
+
+public:
   bool isCached() const { return true; }
 };
 
@@ -4146,6 +4198,29 @@ private:
   friend SimpleRequest;
 
   LabeledStmt *evaluate(Evaluator &evaluator, const ContinueStmt *CS) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+struct FallthroughSourceAndDest {
+  CaseStmt *Source;
+  CaseStmt *Dest;
+};
+
+/// Lookup the source and destination of a 'fallthrough'.
+class FallthroughSourceAndDestRequest
+    : public SimpleRequest<FallthroughSourceAndDestRequest,
+                           FallthroughSourceAndDest(const FallthroughStmt *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  FallthroughSourceAndDest evaluate(Evaluator &evaluator,
+                                    const FallthroughStmt *FS) const;
 
 public:
   bool isCached() const { return true; }
@@ -4457,7 +4532,8 @@ public:
 class ExpandMemberAttributeMacros
     : public SimpleRequest<ExpandMemberAttributeMacros,
                            ArrayRef<unsigned>(Decl *),
-                           RequestFlags::Cached> {
+                           RequestFlags::SeparatelyCached |
+                           RequestFlags::SplitCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -4468,6 +4544,9 @@ private:
 
 public:
   bool isCached() const { return true; }
+  std::optional<ArrayRef<unsigned>> getCachedResult() const;
+  void cacheResult(ArrayRef<unsigned> result) const;
+
   void diagnoseCycle(DiagnosticEngine &diags) const;
   void noteCycleStep(DiagnosticEngine &diags) const;
 };
@@ -4495,38 +4574,30 @@ public:
 
 /// Represent a loaded plugin either an in-process library or an executable.
 class CompilerPluginLoadResult {
-  enum class PluginKind : uint8_t {
-    Error = 0,
-    Library,
-    Executable,
+  enum class Status : uint8_t {
+    Success = 0,
+    Error,
   };
-  PluginKind Kind;
+  Status status;
   void *opaqueHandle;
 
-  CompilerPluginLoadResult(PluginKind K, void *opaque)
-      : Kind(K), opaqueHandle(opaque) {}
+  CompilerPluginLoadResult(Status status, void *opaque)
+      : status(status), opaqueHandle(opaque) {}
 
 public:
-  CompilerPluginLoadResult(LoadedLibraryPlugin *ptr)
-      : CompilerPluginLoadResult(PluginKind::Library, ptr){};
-  CompilerPluginLoadResult(LoadedExecutablePlugin *ptr)
-      : CompilerPluginLoadResult(PluginKind::Executable, ptr){};
+  CompilerPluginLoadResult(CompilerPlugin *ptr)
+      : CompilerPluginLoadResult(Status::Success, ptr){};
   static CompilerPluginLoadResult error(NullTerminatedStringRef message) {
-    return CompilerPluginLoadResult(PluginKind::Error,
+    return CompilerPluginLoadResult(Status::Error,
                                     const_cast<char *>(message.data()));
   }
 
-  LoadedLibraryPlugin *getAsLibraryPlugin() const {
-    if (Kind != PluginKind::Library)
+  CompilerPlugin *get() const {
+    if (status != Status::Success)
       return nullptr;
-    return static_cast<LoadedLibraryPlugin *>(opaqueHandle);
+    return static_cast<CompilerPlugin *>(opaqueHandle);
   }
-  LoadedExecutablePlugin *getAsExecutablePlugin() const {
-    if (Kind != PluginKind::Executable)
-      return nullptr;
-    return static_cast<LoadedExecutablePlugin *>(opaqueHandle);
-  }
-  bool isError() const { return Kind == PluginKind::Error; }
+  bool isError() const { return status == Status::Error; }
   NullTerminatedStringRef getErrorMessage() const {
     assert(isError());
     return static_cast<const char *>(opaqueHandle);
@@ -4557,7 +4628,8 @@ public:
 class ExpandPeerMacroRequest
     : public SimpleRequest<ExpandPeerMacroRequest,
                            ArrayRef<unsigned>(Decl *),
-                           RequestFlags::Cached> {
+                           RequestFlags::SeparatelyCached |
+                           RequestFlags::SplitCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
@@ -4567,7 +4639,11 @@ private:
   ArrayRef<unsigned> evaluate(Evaluator &evaluator, Decl *decl) const;
 
 public:
+  // Separate caching.
   bool isCached() const { return true; }
+  std::optional<ArrayRef<unsigned>> getCachedResult() const;
+  void cacheResult(ArrayRef<unsigned> result) const;
+
   void diagnoseCycle(DiagnosticEngine &diags) const;
   void noteCycleStep(DiagnosticEngine &diags) const;
 };
@@ -4672,6 +4748,24 @@ public:
   bool isCached() const { return true; }
 };
 
+/// Get the declaration that actually provides a doc comment for another.
+class DocCommentProvidingDeclRequest
+    : public SimpleRequest<DocCommentProvidingDeclRequest,
+                           const Decl *(const Decl *), RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  // Evaluation.
+  const Decl *evaluate(Evaluator &evaluator, const Decl *D) const;
+
+public:
+  // Separate caching.
+  bool isCached() const { return true; }
+};
+
 /// Retrieve the brief portion of a declaration's document comment, potentially
 /// walking to find the comment providing decl if needed.
 class SemanticBriefCommentRequest
@@ -4718,11 +4812,11 @@ void simple_display(llvm::raw_ostream &out, ASTNode node);
 void simple_display(llvm::raw_ostream &out, Type value);
 void simple_display(llvm::raw_ostream &out, const TypeRepr *TyR);
 void simple_display(llvm::raw_ostream &out, ImplicitMemberAction action);
-void simple_display(llvm::raw_ostream &out, ResultBuilderBodyPreCheck pck);
 
 /// Computes whether a module is part of the stdlib or contained within the
-/// SDK. If no SDK was specified, falls back to whether the module was
-/// specified as a system module (ie. it's on the system search path).
+/// SDK or the platform directory. If no SDK was specified, falls back to
+/// whether the module was specified as a system module (ie. it's on the system
+/// search path).
 class IsNonUserModuleRequest
     : public SimpleRequest<IsNonUserModuleRequest,
                            bool(ModuleDecl *),
@@ -4777,8 +4871,7 @@ public:
 /// Expand the children of the given type refinement context.
 class ExpandChildTypeRefinementContextsRequest
     : public SimpleRequest<ExpandChildTypeRefinementContextsRequest,
-                           std::vector<TypeRefinementContext *>(
-                               TypeRefinementContext *),
+                           evaluator::SideEffect(TypeRefinementContext *),
                            RequestFlags::SeparatelyCached> {
 public:
   using SimpleRequest::SimpleRequest;
@@ -4786,14 +4879,14 @@ public:
 private:
   friend SimpleRequest;
 
-  std::vector<TypeRefinementContext *>
-  evaluate(Evaluator &evaluator, TypeRefinementContext *parentTRC) const;
+  evaluator::SideEffect evaluate(Evaluator &evaluator,
+                                 TypeRefinementContext *parentTRC) const;
 
 public:
   // Separate caching.
   bool isCached() const { return true; }
-  std::optional<std::vector<TypeRefinementContext *>> getCachedResult() const;
-  void cacheResult(std::vector<TypeRefinementContext *> children) const;
+  std::optional<evaluator::SideEffect> getCachedResult() const;
+  void cacheResult(evaluator::SideEffect) const;
 };
 
 class SerializeAttrGenericSignatureRequest
@@ -4933,23 +5026,27 @@ public:
 };
 
 class LifetimeDependenceInfoRequest
-    : public SimpleRequest<LifetimeDependenceInfoRequest,
-                           std::optional<LifetimeDependenceInfo>(
-                               AbstractFunctionDecl *),
-                           RequestFlags::Cached> {
+    : public SimpleRequest<
+          LifetimeDependenceInfoRequest,
+          std::optional<llvm::ArrayRef<LifetimeDependenceInfo>>(
+              AbstractFunctionDecl *),
+          RequestFlags::SeparatelyCached | RequestFlags::SplitCached> {
 public:
   using SimpleRequest::SimpleRequest;
 
 private:
   friend SimpleRequest;
 
-  std::optional<LifetimeDependenceInfo>
+  std::optional<llvm::ArrayRef<LifetimeDependenceInfo>>
   evaluate(Evaluator &evaluator, AbstractFunctionDecl *AFD) const;
 
 public:
-  // Caching.
+  // Separate caching.
   bool isCached() const { return true; }
-
+  std::optional<std::optional<llvm::ArrayRef<LifetimeDependenceInfo>>>
+  getCachedResult() const;
+  void cacheResult(
+      std::optional<llvm::ArrayRef<LifetimeDependenceInfo>> value) const;
 };
 
 class CaptureInfoRequest :
@@ -5004,6 +5101,107 @@ private:
 
   bool evaluate(Evaluator &evaluator, NominalTypeDecl *decl,
                 KnownProtocolKind kp) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+struct RegexLiteralPatternInfo {
+  StringRef RegexToEmit;
+  Type RegexType;
+  size_t Version;
+  ArrayRef<RegexLiteralPatternFeature> Features;
+};
+
+/// Parses the regex pattern for a given regex literal using the
+/// compiler's regex parsing library, and returns the resulting info.
+class RegexLiteralPatternInfoRequest
+    : public SimpleRequest<RegexLiteralPatternInfoRequest,
+                           RegexLiteralPatternInfo(const RegexLiteralExpr *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  RegexLiteralPatternInfo evaluate(Evaluator &evaluator,
+                                   const RegexLiteralExpr *regex) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+/// The description for a given regex pattern feature. This is cached since
+/// the resulting string is allocated in the ASTContext for ease of bridging.
+class RegexLiteralFeatureDescriptionRequest
+    : public SimpleRequest<RegexLiteralFeatureDescriptionRequest,
+                           StringRef(RegexLiteralPatternFeatureKind,
+                                     ASTContext *),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  StringRef evaluate(Evaluator &evaluator, RegexLiteralPatternFeatureKind kind,
+                     ASTContext *ctx) const;
+
+public:
+  bool isCached() const { return true; }
+};
+
+/// The availability range for a given regex pattern feature.
+class RegexLiteralFeatureAvailabilityRequest
+    : public SimpleRequest<RegexLiteralFeatureAvailabilityRequest,
+                           AvailabilityRange(RegexLiteralPatternFeatureKind,
+                                             ASTContext *),
+                           RequestFlags::Uncached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  AvailabilityRange evaluate(Evaluator &evaluator,
+                             RegexLiteralPatternFeatureKind kind,
+                             ASTContext *ctx) const;
+};
+
+void simple_display(llvm::raw_ostream &out,
+                    RegexLiteralPatternFeatureKind kind);
+SourceLoc extractNearestSourceLoc(RegexLiteralPatternFeatureKind kind);
+
+class IsUnsafeRequest
+    : public SimpleRequest<IsUnsafeRequest,
+                           bool(Decl *decl),
+                           RequestFlags::SeparatelyCached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  bool evaluate(Evaluator &evaluator, Decl *decl) const;
+
+public:
+  bool isCached() const { return true; }
+  std::optional<bool> getCachedResult() const;
+  void cacheResult(bool value) const;
+};
+
+class GenericTypeParamDeclGetValueTypeRequest
+    : public SimpleRequest<GenericTypeParamDeclGetValueTypeRequest,
+                           Type(GenericTypeParamDecl *decl),
+                           RequestFlags::Cached> {
+public:
+  using SimpleRequest::SimpleRequest;
+
+private:
+  friend SimpleRequest;
+
+  Type evaluate(Evaluator &evaluator, GenericTypeParamDecl *decl) const;
 
 public:
   bool isCached() const { return true; }

@@ -24,6 +24,7 @@
 #include "swift/AST/ASTMangler.h"
 #include "swift/AST/ASTScope.h"
 #include "swift/AST/ClangModuleLoader.h"
+#include "swift/AST/ConformanceLookup.h"
 #include "swift/AST/DiagnosticsSIL.h"
 #include "swift/AST/FileUnit.h"
 #include "swift/AST/GenericEnvironment.h"
@@ -32,6 +33,7 @@
 #include "swift/AST/PropertyWrappers.h"
 #include "swift/AST/SourceFile.h"
 #include "swift/AST/Types.h"
+#include "swift/Basic/Assertions.h"
 #include "swift/Basic/Defer.h"
 #include "swift/SIL/SILArgument.h"
 #include "swift/SIL/SILProfiler.h"
@@ -178,6 +180,7 @@ DeclName SILGenModule::getMagicFunctionName(SILDeclRef ref) {
   case SILDeclRef::Kind::Allocator:
     return getMagicFunctionName(cast<ConstructorDecl>(ref.getDecl()));
   case SILDeclRef::Kind::Deallocator:
+  case SILDeclRef::Kind::IsolatedDeallocator:
   case SILDeclRef::Kind::Destroyer:
     return getMagicFunctionName(cast<DestructorDecl>(ref.getDecl()));
   case SILDeclRef::Kind::GlobalAccessor:
@@ -284,7 +287,7 @@ static DeclContext *getInnermostFunctionContext(DeclContext *DC) {
 }
 
 /// Return location of the macro expansion and the macro name.
-static MacroInfo getMacroInfo(GeneratedSourceInfo &Info,
+static MacroInfo getMacroInfo(const GeneratedSourceInfo &Info,
                               DeclContext *FunctionDC) {
   MacroInfo Result(Info.generatedSourceRange.getStart(),
                    Info.originalSourceRange.getStart());
@@ -372,7 +375,7 @@ const SILDebugScope *SILGenFunction::getMacroScope(SourceLoc SLoc) {
     TopLevelScope = It->second;
   else {
     // Recursively create one inlined function + scope per layer of generated
-    // sources.  Chains of Macro expansions are representad as flat
+    // sources.  Chains of Macro expansions are represented as flat
     // function-level scopes.
     SILGenFunctionBuilder B(SGM);
     auto &ASTContext = SGM.M.getASTContext();
@@ -569,10 +572,9 @@ void SILGenFunction::emitCaptures(SILLocation loc,
       continue;
     }
 
-    if (capture.isOpaqueValue()) {
-      OpaqueValueExpr *opaqueValue = capture.getOpaqueValue();
+    if (capture.isOpaqueValue() || capture.isPackElement()) {
       capturedArgs.push_back(
-          emitRValueAsSingleValue(opaqueValue).ensurePlusOne(*this, loc));
+          emitRValueAsSingleValue(capture.getExpr()).ensurePlusOne(*this, loc));
       continue;
     }
 
@@ -988,7 +990,13 @@ SILGenFunction::emitClosureValue(SILLocation loc, SILDeclRef constant,
         constant, loweredCaptureInfo, subs);
   }
 
-  if (subs) {
+  // We completely drop the generic signature if all generic parameters were
+  // concrete.
+  if (!pft->isPolymorphic()) {
+    subs = SubstitutionMap();
+  } else {
+    assert(!subs.getGenericSignature()->areAllParamsConcrete());
+
     auto specialized =
         pft->substGenericArgs(F.getModule(), subs, getTypeExpansionContext());
     functionTy = SILType::getPrimitiveObjectType(specialized);
@@ -1032,10 +1040,9 @@ SILGenFunction::emitClosureValue(SILLocation loc, SILDeclRef constant,
 
     auto calleeConvention = ParameterConvention::Direct_Guaranteed;
 
-    auto resultIsolation = (hasErasedIsolation
-                              ? SILFunctionTypeIsolation::Erased
-                              : SILFunctionTypeIsolation::Unknown);
-
+    auto resultIsolation =
+        (hasErasedIsolation ? SILFunctionTypeIsolation::Erased
+                            : SILFunctionTypeIsolation::Unknown);
     auto toClosure =
       B.createPartialApply(loc, functionRef, subs, forwardedArgs,
                            calleeConvention, resultIsolation);
@@ -1050,6 +1057,69 @@ SILGenFunction::emitClosureValue(SILLocation loc, SILDeclRef constant,
                                   typeContext.OrigType,
                                   typeContext.FormalType,
               SILType::getPrimitiveObjectType(typeContext.ExpectedLoweredType));
+
+    auto resultType = cast<SILFunctionType>(result.getType().getASTType());
+
+    // Check if we performed Sendable/sending type compensation in
+    // emitTransformedValue for a closure. If we did, insert some fixup code to
+    // convert from an @Sendable to a not-@Sendable value.
+    //
+    // DISCUSSION: We cannot do this internally to emitTransformedValue since it
+    // does not have access to our SILDeclRef.
+    if (auto *e = constant.getClosureExpr()) {
+      auto actualType = cast<AnyFunctionType>(e->getType()->getCanonicalType());
+      if (e->inheritsActorContext() &&
+          e->getActorIsolation().isActorIsolated() && actualType->isAsync() &&
+          !actualType->isSendable() && resultType->isSendable()) {
+        auto extInfo = resultType->getExtInfo().withSendable(false);
+        resultType = resultType->getWithExtInfo(extInfo);
+        result = B.createConvertFunction(
+            loc, result, SILType::getPrimitiveObjectType(resultType));
+      }
+    }
+  }
+
+  // If GenerateForceToMainActorThunks and Dynamic Actor Isolation Checking is
+  // enabled and we have a synchronous function...
+  if (F.getASTContext().LangOpts.hasFeature(
+          Feature::GenerateForceToMainActorThunks) &&
+      F.getASTContext().LangOpts.isDynamicActorIsolationCheckingEnabled() &&
+      !functionTy.castTo<SILFunctionType>()->isAsync()) {
+
+    // See if that function is a closure which requires dynamic isolation
+    // checking that doesn't take any parameters or results. In such a case, we
+    // create a hop to main actor if needed thunk.
+    if (auto *closureExpr = constant.getClosureExpr()) {
+      if (closureExpr->requiresDynamicIsolationChecking()) {
+        auto actorIsolation = closureExpr->getActorIsolation();
+        switch (actorIsolation) {
+        case ActorIsolation::Unspecified:
+        case ActorIsolation::Nonisolated:
+        case ActorIsolation::NonisolatedUnsafe:
+        case ActorIsolation::ActorInstance:
+          break;
+
+        case ActorIsolation::Erased:
+          llvm_unreachable("closure cannot have erased isolation");
+
+        case ActorIsolation::GlobalActor:
+          // For now only do this if we are using the main actor and are calling
+          // a function that doesn't depend on its result and doesn't have any
+          // parameters.
+          //
+          // NOTE: Since errors are results, this means that we cannot do this
+          // for throwing functions.
+          if (auto *args = closureExpr->getArgs();
+              (!args || args->empty()) && actorIsolation.isMainActor() &&
+              closureExpr->getResultType()->getCanonicalType() ==
+                  B.getASTContext().TheEmptyTupleType &&
+              !result.getType().castTo<SILFunctionType>()->hasErrorResult()) {
+            result = B.createHopToMainActorIfNeededThunk(loc, result, subs);
+          }
+          break;
+        }
+      }
+    }
   }
 
   return result;
@@ -1191,9 +1261,8 @@ void SILGenFunction::emitArtificialTopLevel(Decl *mainDecl) {
     CanType anyObjectMetaTy = CanExistentialMetatypeType::get(anyObjectTy,
                                                   MetatypeRepresentation::ObjC);
 
-    auto conformances =
-        SGM.SwiftModule->collectExistentialConformances(mainClassMetaty,
-                                                        anyObjectMetaTy);
+    auto conformances = collectExistentialConformances(mainClassMetaty,
+                                                       anyObjectMetaTy);
 
     auto paramConvention = ParameterConvention::Direct_Unowned;
     auto params = {SILParameterInfo(anyObjectMetaTy, paramConvention)};

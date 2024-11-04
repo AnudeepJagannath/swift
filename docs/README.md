@@ -270,11 +270,11 @@ documentation, please create a thread on the Swift forums under the
 ### Proposals
 
 Old proposals are present in the [/docs/proposals](/docs/proposals) directory.
-More recent proposals are located in the [apple/swift-evolution][] repository.
+More recent proposals are located in the [swiftlang/swift-evolution][] repository.
 You can see the status of different proposals at
 <https://apple.github.io/swift-evolution/>.
 
-[apple/swift-evolution]: https://github.com/apple/swift-evolution
+[swiftlang/swift-evolution]: https://github.com/swiftlang/swift-evolution
 
 ### Surveys
 
@@ -356,8 +356,6 @@ provide greater clarity to contributors wanting to add new documentation.
 - [Testing.md](/docs/Testing.md):
   TODO: Consider splitting into a how-to guide on writing a new test case
   and an explanation for how the compiler is tested.
-- [SwiftIndent.md](/docs/SwiftIndent.md):
-  TODO: Unclear if this is intended to be an explanation or a reference guide.
 - [Random.md](/docs/Random.md): Stub.
 
 ### Archive

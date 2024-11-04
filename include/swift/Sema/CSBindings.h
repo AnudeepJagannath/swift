@@ -94,7 +94,7 @@ protected:
 public:
   PotentialBinding(Type type, AllowedBindingKind kind, Constraint *source)
       : PotentialBinding(
-            type->getWithoutParens(), kind,
+            type, kind,
             PointerUnion<Constraint *, ConstraintLocator *>(source)) {}
 
   bool isDefaultableBinding() const {
@@ -222,6 +222,9 @@ struct PotentialBindings {
   ConstraintSystem &CS;
 
   TypeVariableType *TypeVar;
+
+  /// The set of all constraints that have been added via infer().
+  llvm::SmallPtrSet<Constraint *, 2> Constraints;
 
   /// The set of potential bindings.
   llvm::SmallVector<PotentialBinding, 4> Bindings;
